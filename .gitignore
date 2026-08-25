@@ -1,0 +1,25 @@
+# ESP-IDF build output
+**/build/
+**/managed_components/
+**/sdkconfig.old
+
+# Python
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# VS Code and local IDE state
+.vscode/
+.idea/
+*.code-workspace
+
+# OS and temporary files
+.DS_Store
+Thumbs.db
+*.tmp
+*.log
+~$*
+
+# Local camera captures
+**/camera_capture.jpg
