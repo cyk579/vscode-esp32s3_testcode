@@ -50,7 +50,7 @@
 #define START_KICK_CYCLES 3U
 #define MOTOR_A_SIGN 1
 #define MOTOR_B_SIGN 1
-#define MOTOR_D_SIGN -1
+#define MOTOR_D_SIGN 1
 
 typedef struct {
     gpio_num_t in1, in2;
