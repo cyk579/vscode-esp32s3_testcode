@@ -32,8 +32,24 @@ static const int weights[4] = {-3, -1, 1, 3};
 #define STRAIGHT_SPEED 18 /* 零误差时的前进幅值 */
 #define CURVE_SPEED 16    /* 有误差时的前进幅值 */
 #define TURN_KP 3         /* turn = -error * TURN_KP / 10 */
-#define TURN_MAX 12       /* 转向分量上限，也是丢线搜索的幅值 */
+#define TURN_MAX 12       /* 普通比例转向上限 */
+#define RECOVERY_TURN 18  /* 锐角锁向和持续丢线搜索幅值 */
+#define TURN_SLEW_STEP 3  /* 每 10 ms 最多改变的转向量 */
 #define MAX_OUTPUT 28     /* 任一电机的输出上限 */
+
+#define LOST_CONFIRM_CYCLES 3U
+#define CORNER_CONFIRM_CYCLES 3U
+#define CORNER_ADVANCE_CYCLES 6U
+#define CORNER_MIN_TURN_CYCLES 8U
+#define CENTER_CONFIRM_CYCLES 3U
+#define FINISH_MARK_CYCLES 5U
+#define FINISH_BLANK_CYCLES 12U
+#define FINISH_WINDOW_CYCLES 30U
+
+#define CENTER_MASK 0x06U      /* ACTIVE=0110 */
+#define LEFT_CORNER_MASK 0x07U /* ACTIVE=1110 */
+#define RIGHT_CORNER_MASK 0x0EU /* ACTIVE=0111 */
+#define FULL_LINE_MASK 0x0FU   /* ACTIVE=1111 */
 
 #define LOOP_MS 10U
 #define LOG_MS 100U
@@ -45,6 +61,29 @@ typedef struct {
     ledc_channel_t channel;
     int last_direction;
 } motor_t;
+
+typedef enum {
+    FOLLOW_LINE,
+    CORNER_ADVANCE,
+    CORNER_TURN,
+    STOPPED
+} control_state_t;
+
+typedef struct {
+    control_state_t state;
+    int turn;
+    int direction;
+    uint8_t state_cycles;
+    uint8_t finish_cycles;
+    uint8_t last_mask;
+    uint8_t same_mask_cycles;
+    bool line_seen;
+    bool finish_armed;
+} controller_t;
+
+static const char *const state_names[] = {
+    "FOLLOW", "ADVANCE", "CORNER", "STOPPED"
+};
 
 /* 顺序固定为 A、B、D，与 drive() 的混控一致。
    IN1/IN2 宏始终按驱动板接线表，电机极性只在 drive() 中校准。 */
@@ -105,6 +144,142 @@ static int line_error(uint8_t mask)
     return count ? sum * 10 / count : 0;
 }
 
+static int move_towards(int value, int target, int step)
+{
+    if (value < target) return value + clamp(target - value, step);
+    if (value > target) return value - clamp(value - target, step);
+    return value;
+}
+
+static void enter_state(controller_t *control, control_state_t state)
+{
+    control->state = state;
+    control->state_cycles = 0;
+}
+
+static void observe_mask(controller_t *control, uint8_t mask)
+{
+    if (mask != control->last_mask) {
+        control->last_mask = mask;
+        control->same_mask_cycles = 1;
+    } else if (control->same_mask_cycles < UINT8_MAX) {
+        ++control->same_mask_cycles;
+    }
+}
+
+static void follow_targets(controller_t *control, uint8_t mask,
+                           int *forward, int *target_turn)
+{
+    int error = line_error(mask);
+    if (mask == 0) {
+        if (!control->line_seen) {
+            *forward = 0;
+            *target_turn = 0;
+        } else if (control->same_mask_cycles < LOST_CONFIRM_CYCLES) {
+            /* 短暂漏读保持当前动作，不因一个采样点突然刹停或反转。 */
+            *forward = CURVE_SPEED;
+            *target_turn = control->turn;
+        } else {
+            *forward = 0;
+            *target_turn = control->direction;
+        }
+        return;
+    }
+
+    control->line_seen = true;
+    *forward = error ? CURVE_SPEED : STRAIGHT_SPEED;
+    *target_turn = clamp(-error * TURN_KP / 10, TURN_MAX);
+    if (error) control->direction = error < 0 ? RECOVERY_TURN : -RECOVERY_TURN;
+}
+
+static void control_step(controller_t *control, uint8_t mask,
+                         int *forward, int *turn)
+{
+    int target_turn = 0;
+    if (control->state == STOPPED) {
+        control->turn = 0;
+        *forward = 0;
+        *turn = 0;
+        return;
+    }
+
+    observe_mask(control, mask);
+    if (mask == FULL_LINE_MASK &&
+        control->same_mask_cycles >= FINISH_MARK_CYCLES) {
+        control->finish_armed = true;
+        control->finish_cycles = 0;
+        enter_state(control, FOLLOW_LINE);
+    } else if (control->finish_armed && control->finish_cycles < UINT8_MAX) {
+        ++control->finish_cycles;
+    }
+
+    if (control->finish_armed && mask == 0) {
+        /* 只有先见到 T 型横杠，持续全白才是终点。 */
+        if (control->same_mask_cycles >= FINISH_BLANK_CYCLES) {
+            enter_state(control, STOPPED);
+            control->turn = 0;
+            *forward = 0;
+            *turn = 0;
+            return;
+        }
+        if (control->finish_cycles < FINISH_WINDOW_CYCLES) {
+            *forward = STRAIGHT_SPEED;
+            control->turn = move_towards(control->turn, 0, TURN_SLEW_STEP);
+            *turn = control->turn;
+            return;
+        }
+    }
+    if (control->finish_armed && control->finish_cycles >= FINISH_WINDOW_CYCLES)
+        control->finish_armed = false;
+
+    switch (control->state) {
+    case FOLLOW_LINE:
+        follow_targets(control, mask, forward, &target_turn);
+        if (!control->finish_armed &&
+            (mask == LEFT_CORNER_MASK || mask == RIGHT_CORNER_MASK) &&
+            control->same_mask_cycles >= CORNER_CONFIRM_CYCLES) {
+            control->direction = mask == LEFT_CORNER_MASK
+                               ? RECOVERY_TURN : -RECOVERY_TURN;
+            enter_state(control, CORNER_ADVANCE);
+            *forward = STRAIGHT_SPEED;
+            target_turn = 0;
+        }
+        break;
+
+    case CORNER_ADVANCE:
+        *forward = STRAIGHT_SPEED;
+        target_turn = 0;
+        if (mask != FULL_LINE_MASK &&
+            ++control->state_cycles >= CORNER_ADVANCE_CYCLES) {
+            enter_state(control, CORNER_TURN);
+        }
+        break;
+
+    case CORNER_TURN:
+        /* 保持前进基量，用锁存转向量形成平滑锐角弧线。 */
+        *forward = STRAIGHT_SPEED;
+        if (mask == FULL_LINE_MASK) {
+            target_turn = 0;
+        } else {
+            target_turn = control->direction;
+            if (control->state_cycles < UINT8_MAX) ++control->state_cycles;
+            if (control->state_cycles >= CORNER_MIN_TURN_CYCLES &&
+                mask == CENTER_MASK &&
+                control->same_mask_cycles >= CENTER_CONFIRM_CYCLES) {
+                enter_state(control, FOLLOW_LINE);
+                follow_targets(control, mask, forward, &target_turn);
+            }
+        }
+        break;
+
+    case STOPPED:
+        break; /* 已在函数开头处理。 */
+    }
+
+    control->turn = move_towards(control->turn, target_turn, TURN_SLEW_STEP);
+    *turn = control->turn;
+}
+
 static void hardware_init(void)
 {
     for (int i = 0; i < 4; ++i) {
@@ -143,8 +318,10 @@ void app_main(void)
 {
     hardware_init();
     int out[3] = {0};
-    int search_turn = TURN_MAX; /* 丢线沿最后一次偏差方向搜索；无偏差时默认左转 */
-    bool line_seen = false;
+    controller_t control = {
+        .state = FOLLOW_LINE,
+        .direction = RECOVERY_TURN /* 无历史偏差时默认向左搜索 */
+    };
     uint32_t log_elapsed = LOG_MS;
 
     drive(0, 0, out);
@@ -153,23 +330,15 @@ void app_main(void)
     while (true) {
         uint8_t mask = read_sensors();
         int error = line_error(mask);
-        int forward, turn;
-
-        if (mask == 0) {
-            forward = 0;
-            turn = line_seen ? search_turn : 0; /* 上电首次见线前不动 */
-        } else {
-            line_seen = true;
-            forward = error ? CURVE_SPEED : STRAIGHT_SPEED;
-            turn = clamp(-error * TURN_KP / 10, TURN_MAX);
-            if (error) search_turn = error < 0 ? TURN_MAX : -TURN_MAX;
-        }
+        int forward = 0, turn = 0;
+        control_step(&control, mask, &forward, &turn);
         drive(forward, turn, out);
 
         if (log_elapsed >= LOG_MS) {
-            ESP_LOGI(TAG, "ACTIVE=%u%u%u%u err=%d turn=%d motor[A,B,D]=[%d,%d,%d]",
+            ESP_LOGI(TAG, "ACTIVE=%u%u%u%u state=%s finish=%u err=%d turn=%d motor[A,B,D]=[%d,%d,%d]",
                      (unsigned)(mask & 1U), (unsigned)((mask >> 1) & 1U),
                      (unsigned)((mask >> 2) & 1U), (unsigned)((mask >> 3) & 1U),
+                     state_names[control.state], (unsigned)control.finish_armed,
                      error, turn, out[0], out[1], out[2]);
             log_elapsed = 0;
         }
