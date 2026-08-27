@@ -71,7 +71,7 @@
 #define MIN_DISTANCE_CM 2.0f                              // 小于 2 cm 判无效。
 #define MAX_DISTANCE_CM 400.0f                            // 大于 400 cm 判无效。
 #define OBSTACLE_DETECT_CM 7.0f                           // <=7 cm 触发停车/避障。
-#define OBSTACLE_CLEAR_CM 15.0f                           // 左移后 >=15 cm 认为正前方已清障。
+#define OBSTACLE_CLEAR_CM 20.0f                           // 左移后 >=20 cm 认为正前方已清障。
 
 /* ======================== 避障 ======================== */
 
