@@ -28,17 +28,18 @@
 #define STBY_GPIO GPIO_NUM_8
 
 /* OUT2/OUT3 on black: equal A/D magnitude, B stopped. */
-#define STRAIGHT_A_SPEED 30
-#define STRAIGHT_D_SPEED 30
-#define CURVE_A_SPEED 20
-#define CURVE_D_SPEED 20
+#define STRAIGHT_A_SPEED 24
+#define STRAIGHT_D_SPEED 24
+#define CURVE_A_SPEED 14
+#define CURVE_D_SPEED 14
 #define LOST_LINE_FORWARD_MS 100U
-#define LOST_LINE_A_SPEED 28
-#define LOST_LINE_D_SPEED 28
-#define SEARCH_A_SPEED 20
-#define SEARCH_D_SPEED 20
-#define TURN_MAX 12
-#define MAX_OUTPUT 30
+#define LOST_LINE_A_SPEED 20
+#define LOST_LINE_D_SPEED 20
+#define SEARCH_A_SPEED 16
+#define SEARCH_D_SPEED 16
+#define TURN_MAX 9
+#define TURN_B_GAIN 2
+#define MAX_OUTPUT 26
 #define TURN_SIGN 1
 #define FILTER_SAMPLES 5U
 #define FILTER_STABLE_CYCLES 2U
@@ -49,7 +50,7 @@
 #define PID_DEADBAND 3
 #define PID_INTEGRAL_LIMIT 30
 #define ERROR_FILTER_DIVISOR 2
-#define TURN_SLEW_STEP 3
+#define TURN_SLEW_STEP 2
 #define LOOP_MS 10U
 #define LOG_MS 100U
 #define START_DELAY_MS 2000U
@@ -63,11 +64,12 @@
 #define ULTRASONIC_TRIG GPIO_NUM_18
 #define ULTRASONIC_ECHO GPIO_NUM_11
 #define OBSTACLE_DETECT_CM 7.0f
-#define OBSTACLE_CLEAR_CM 10.0f
-#define AVOID_SHIFT_SPEED 20
-#define AVOID_FORWARD_SPEED 20
+#define OBSTACLE_CLEAR_CM 15.0f
+#define AVOID_SHIFT_B_SPEED 18
+#define AVOID_SHIFT_AD_SPEED 8
+#define AVOID_FORWARD_SPEED 16
 #define AVOID_FORWARD_MS 1000U
-#define AVOID_SHIFT_TIMEOUT_MS 2500U
+#define AVOID_SHIFT_TIMEOUT_MS 3500U
 #define ULTRASONIC_PERIOD_MS 100U
 #define DISPLAY_PERIOD_MS 100U
 #define ULTRASONIC_WARN_SAMPLES 10U
@@ -141,19 +143,19 @@ static void drive(int forward_a, int forward_d, int turn, int *a, int *b, int *d
     /* 若所有左右纠偏都与实车相反，仅把 TURN_SIGN 改为 -1。 */
     turn *= TURN_SIGN;
     *a = clamp(-forward_a - turn, MAX_OUTPUT);
-    *b = clamp(turn, MAX_OUTPUT);
+    *b = clamp(turn * TURN_B_GAIN, MAX_OUTPUT);
     *d = clamp(forward_d - turn, MAX_OUTPUT);
     motor_set(&motor_a, *a);
     motor_set(&motor_b, *b);
     motor_set(&motor_d, *d);
 }
 
-/* 全向底盘横移混控：如实车左右相反，只需交换两个 lateral 符号。 */
-static void drive_vector(int forward, int lateral, int turn, int *a, int *b, int *d)
+/* 横移沿用原有正负方向，但由后轮 B 主导，A/D 仅作辅助。 */
+static void drive_lateral(int direction, int *a, int *b, int *d)
 {
-    *a = clamp(-forward - turn + lateral, MAX_OUTPUT);
-    *b = clamp(turn - lateral, MAX_OUTPUT);
-    *d = clamp(forward - turn + lateral, MAX_OUTPUT);
+    *a = direction * AVOID_SHIFT_AD_SPEED;
+    *b = -direction * AVOID_SHIFT_B_SPEED;
+    *d = direction * AVOID_SHIFT_AD_SPEED;
     motor_set(&motor_a, *a);
     motor_set(&motor_b, *b);
     motor_set(&motor_d, *d);
@@ -360,7 +362,7 @@ void app_main(void)
 
         if (avoid_state == AVOID_LINE) {
             if (ultrasonic_updated) {
-                if (ultrasonic_valid && distance > 0.0f && distance < OBSTACLE_DETECT_CM) {
+                if (ultrasonic_valid && distance > 0.0f && distance <= OBSTACLE_DETECT_CM) {
                     if (obstacle_close_samples < UINT8_MAX) ++obstacle_close_samples;
                 } else {
                     obstacle_close_samples = 0;
@@ -375,7 +377,7 @@ void app_main(void)
             }
         } else if (avoid_state == AVOID_LEFT) {
             bool obstacle_cleared = ultrasonic_updated && ultrasonic_valid &&
-                                    distance > OBSTACLE_CLEAR_CM;
+                                    distance >= OBSTACLE_CLEAR_CM;
             bool shift_timed_out = avoid_elapsed >= AVOID_SHIFT_TIMEOUT_MS;
             if (obstacle_cleared || shift_timed_out) {
                 left_shift_ms = avoid_elapsed;
@@ -432,11 +434,11 @@ void app_main(void)
             drive(0, 0, 0, &a, &b, &d);
             turn = 0;
         } else if (avoid_state == AVOID_LEFT) {
-            drive_vector(0, AVOID_SHIFT_SPEED, 0, &a, &b, &d);
+            drive_lateral(1, &a, &b, &d);
         } else if (avoid_state == AVOID_FORWARD) {
-            drive_vector(AVOID_FORWARD_SPEED, 0, 0, &a, &b, &d);
+            drive(AVOID_FORWARD_SPEED, AVOID_FORWARD_SPEED, 0, &a, &b, &d);
         } else if (avoid_state == AVOID_RIGHT) {
-            drive_vector(0, -AVOID_SHIFT_SPEED, 0, &a, &b, &d);
+            drive_lateral(-1, &a, &b, &d);
         } else if (!line_seen) {
             turn = pid_steering(0);
             drive(0, 0, 0, &a, &b, &d);
