@@ -28,17 +28,17 @@
 #define STBY_GPIO GPIO_NUM_8
 
 /* OUT2/OUT3 on black: equal A/D magnitude, B stopped. */
-#define STRAIGHT_A_SPEED 32
-#define STRAIGHT_D_SPEED 32
-#define CURVE_A_SPEED 22
-#define CURVE_D_SPEED 22
+#define STRAIGHT_A_SPEED 30
+#define STRAIGHT_D_SPEED 30
+#define CURVE_A_SPEED 20
+#define CURVE_D_SPEED 20
 #define LOST_LINE_FORWARD_MS 100U
 #define LOST_LINE_A_SPEED 28
 #define LOST_LINE_D_SPEED 28
 #define SEARCH_A_SPEED 20
 #define SEARCH_D_SPEED 20
-#define TURN_MAX 14
-#define MAX_OUTPUT 35
+#define TURN_MAX 12
+#define MAX_OUTPUT 30
 #define TURN_SIGN 1
 #define FILTER_SAMPLES 5U
 #define FILTER_STABLE_CYCLES 2U
@@ -62,17 +62,16 @@
 
 #define ULTRASONIC_TRIG GPIO_NUM_18
 #define ULTRASONIC_ECHO GPIO_NUM_11
-#define OBSTACLE_DETECT_CM 5.0f
-#define OBSTACLE_CLEAR_CM 15.0f
-#define AVOID_SHIFT_SPEED 22
-#define AVOID_FORWARD_SPEED 22
-#define AVOID_FORWARD_MS 500U
+#define OBSTACLE_DETECT_CM 7.0f
+#define OBSTACLE_CLEAR_CM 10.0f
+#define AVOID_SHIFT_SPEED 20
+#define AVOID_FORWARD_SPEED 20
+#define AVOID_FORWARD_MS 1000U
 #define AVOID_SHIFT_TIMEOUT_MS 2500U
-#define AVOID_RIGHT_TIMEOUT_MS 3000U
 #define ULTRASONIC_PERIOD_MS 100U
 #define DISPLAY_PERIOD_MS 100U
 #define ULTRASONIC_WARN_SAMPLES 10U
-#define OBSTACLE_CONFIRM_SAMPLES 3U
+#define OBSTACLE_CONFIRM_SAMPLES 1U
 #define END_ARM_MS 80U
 #define END_TURN_MAX 8
 #define END_BRAKE_DELAY_MS 20U
@@ -337,6 +336,7 @@ void app_main(void)
     int a = 0, b = 0, d = 0, turn = 0, last_turn = 1;
     uint32_t log_elapsed = LOG_MS;
     uint32_t avoid_elapsed = 0;
+    uint32_t left_shift_ms = 0;
     uint32_t line_lost_ms = 0;
     uint32_t end_active_ms = 0;
     uint32_t end_straight_ms = 0;
@@ -353,12 +353,14 @@ void app_main(void)
         float distance = display_status.distance_cm;
         bool raw_end_line = raw_all_sensors_on_black();
         bool ultrasonic_valid = ultrasonic_status == ULTRASONIC_OK;
+        bool ultrasonic_updated = ultrasonic_sequence != last_ultrasonic_sequence;
         bool end_braking = false;
 
+        if (ultrasonic_updated) last_ultrasonic_sequence = ultrasonic_sequence;
+
         if (avoid_state == AVOID_LINE) {
-            if (ultrasonic_sequence != last_ultrasonic_sequence) {
-                last_ultrasonic_sequence = ultrasonic_sequence;
-                if (ultrasonic_valid && distance > 0.0f && distance <= OBSTACLE_DETECT_CM) {
+            if (ultrasonic_updated) {
+                if (ultrasonic_valid && distance > 0.0f && distance < OBSTACLE_DETECT_CM) {
                     if (obstacle_close_samples < UINT8_MAX) ++obstacle_close_samples;
                 } else {
                     obstacle_close_samples = 0;
@@ -367,19 +369,40 @@ void app_main(void)
             if (obstacle_close_samples >= OBSTACLE_CONFIRM_SAMPLES) {
                 avoid_state = AVOID_LEFT;
                 avoid_elapsed = 0;
+                left_shift_ms = 0;
                 obstacle_close_samples = 0;
+                ESP_LOGI(TAG, "Obstacle %.1fcm: stop line following and shift left", (double)distance);
             }
-        } else if (avoid_state == AVOID_LEFT &&
-                   ((ultrasonic_valid && distance >= OBSTACLE_CLEAR_CM) || avoid_elapsed >= AVOID_SHIFT_TIMEOUT_MS)) {
-            avoid_state = AVOID_FORWARD;
-            avoid_elapsed = 0;
+        } else if (avoid_state == AVOID_LEFT) {
+            bool obstacle_cleared = ultrasonic_updated && ultrasonic_valid &&
+                                    distance > OBSTACLE_CLEAR_CM;
+            bool shift_timed_out = avoid_elapsed >= AVOID_SHIFT_TIMEOUT_MS;
+            if (obstacle_cleared || shift_timed_out) {
+                left_shift_ms = avoid_elapsed;
+                avoid_state = AVOID_FORWARD;
+                avoid_elapsed = 0;
+                if (shift_timed_out && !obstacle_cleared) {
+                    ESP_LOGW(TAG, "Left shift timed out after %lums; using that duration for right shift",
+                             (unsigned long)left_shift_ms);
+                } else {
+                    ESP_LOGI(TAG, "Obstacle cleared at %.1fcm; recorded left shift=%lums",
+                             (double)distance, (unsigned long)left_shift_ms);
+                }
+            }
         } else if (avoid_state == AVOID_FORWARD && avoid_elapsed >= AVOID_FORWARD_MS) {
             avoid_state = AVOID_RIGHT;
             avoid_elapsed = 0;
-        } else if (avoid_state == AVOID_RIGHT &&
-                   ((avoid_elapsed >= 200U && mask != 0) || avoid_elapsed >= AVOID_RIGHT_TIMEOUT_MS)) {
-            avoid_state = AVOID_LINE;
-            avoid_elapsed = 0;
+            ESP_LOGI(TAG, "Forward complete; shift right for %lums", (unsigned long)left_shift_ms);
+        } else if (avoid_state == AVOID_RIGHT) {
+            bool line_centered = mask == CENTER_MASK;
+            bool matched_left_time = avoid_elapsed >= left_shift_ms;
+            if (line_centered || matched_left_time) {
+                avoid_state = AVOID_LINE;
+                ESP_LOGI(TAG, "Right shift complete after %lums (%s); resume line following",
+                         (unsigned long)avoid_elapsed,
+                         line_centered ? "line centered" : "matched left time");
+                avoid_elapsed = 0;
+            }
         }
 
         /*
@@ -452,7 +475,7 @@ void app_main(void)
             log_elapsed = 0;
         }
         log_elapsed += LOOP_MS;
-        avoid_elapsed += LOOP_MS;
+        if (avoid_state != AVOID_LINE) avoid_elapsed += LOOP_MS;
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(LOOP_MS));
     }
 }
