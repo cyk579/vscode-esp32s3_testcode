@@ -39,6 +39,7 @@
 #define SEARCH_D_SPEED 16
 #define TURN_MAX 9
 #define TURN_B_GAIN 2
+#define TURN_B_MIN_OUTPUT 10
 #define MAX_OUTPUT 26
 #define TURN_SIGN 1
 #define FILTER_SAMPLES 5U
@@ -65,8 +66,7 @@
 #define ULTRASONIC_ECHO GPIO_NUM_11
 #define OBSTACLE_DETECT_CM 7.0f
 #define OBSTACLE_CLEAR_CM 15.0f
-#define AVOID_SHIFT_B_SPEED 18
-#define AVOID_SHIFT_AD_SPEED 8
+#define AVOID_SHIFT_SPEED 18
 #define AVOID_FORWARD_SPEED 16
 #define AVOID_FORWARD_MS 1000U
 #define AVOID_SHIFT_TIMEOUT_MS 3500U
@@ -115,6 +115,14 @@ static int move_towards(int value, int target, int step)
     return value;
 }
 
+static int b_turn_output(int turn)
+{
+    int output = turn * TURN_B_GAIN;
+    if (output && abs(output) < TURN_B_MIN_OUTPUT)
+        output = output < 0 ? -TURN_B_MIN_OUTPUT : TURN_B_MIN_OUTPUT;
+    return clamp(output, MAX_OUTPUT);
+}
+
 static void motor_set(const motor_t *motor, int speed)
 {
     static int last_direction[3] = {0};
@@ -145,19 +153,21 @@ static void drive(int forward_a, int forward_d, int turn, int *a, int *b, int *d
     /* 若所有左右纠偏都与实车相反，仅把 TURN_SIGN 改为 -1。 */
     turn *= TURN_SIGN;
     *a = clamp(-forward_a - turn, MAX_OUTPUT);
-    *b = clamp(turn * TURN_B_GAIN, MAX_OUTPUT);
+    *b = b_turn_output(turn);
     *d = clamp(forward_d - turn, MAX_OUTPUT);
     motor_set(&motor_a, *a);
     motor_set(&motor_b, *b);
     motor_set(&motor_d, *d);
 }
 
-/* 横移沿用原有正负方向，但由后轮 B 主导，A/D 仅作辅助。 */
-static void drive_lateral(int direction, int *a, int *b, int *d)
+/* 三轮全向横移分解：B 承担完整横移分量，前轮 A/D 各承担一半。 */
+static void drive_vector(int forward, int lateral, int turn, int *a, int *b, int *d)
 {
-    *a = direction * AVOID_SHIFT_AD_SPEED;
-    *b = -direction * AVOID_SHIFT_B_SPEED;
-    *d = direction * AVOID_SHIFT_AD_SPEED;
+    turn *= TURN_SIGN;
+    int lateral_assist = lateral / 2;
+    *a = clamp(-forward - turn + lateral_assist, MAX_OUTPUT);
+    *b = clamp(b_turn_output(turn) - lateral, MAX_OUTPUT);
+    *d = clamp(forward - turn + lateral_assist, MAX_OUTPUT);
     motor_set(&motor_a, *a);
     motor_set(&motor_b, *b);
     motor_set(&motor_d, *d);
@@ -436,11 +446,11 @@ void app_main(void)
             drive(0, 0, 0, &a, &b, &d);
             turn = 0;
         } else if (avoid_state == AVOID_LEFT) {
-            drive_lateral(1, &a, &b, &d);
+            drive_vector(0, AVOID_SHIFT_SPEED, 0, &a, &b, &d);
         } else if (avoid_state == AVOID_FORWARD) {
-            drive(AVOID_FORWARD_SPEED, AVOID_FORWARD_SPEED, 0, &a, &b, &d);
+            drive_vector(AVOID_FORWARD_SPEED, 0, 0, &a, &b, &d);
         } else if (avoid_state == AVOID_RIGHT) {
-            drive_lateral(-1, &a, &b, &d);
+            drive_vector(0, -AVOID_SHIFT_SPEED, 0, &a, &b, &d);
         } else if (!line_seen) {
             turn = pid_steering(0);
             drive(0, 0, 0, &a, &b, &d);
