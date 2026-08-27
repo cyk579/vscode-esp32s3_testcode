@@ -6,6 +6,8 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "ultrasonic.h"
+#include "tft_st7735.h"
 #define OUT1_GPIO GPIO_NUM_41
 #define OUT2_GPIO GPIO_NUM_42
 #define OUT3_GPIO GPIO_NUM_2
@@ -51,6 +53,19 @@
 #define MOTOR_B_SIGN 1
 #define MOTOR_D_SIGN -1
 
+#define ULTRASONIC_TRIG GPIO_NUM_40
+#define ULTRASONIC_ECHO GPIO_NUM_39
+#define OBSTACLE_DETECT_CM 5.0f
+#define OBSTACLE_CLEAR_CM 15.0f
+#define AVOID_SHIFT_SPEED 22
+#define AVOID_FORWARD_SPEED 22
+#define AVOID_FORWARD_MS 500U
+#define AVOID_SHIFT_TIMEOUT_MS 2500U
+#define AVOID_RIGHT_TIMEOUT_MS 3000U
+#define ULTRASONIC_PERIOD_MS 100U
+#define DISPLAY_PERIOD_MS 100U
+#define END_CONFIRM_MS 300U
+
 typedef struct {
     gpio_num_t in1, in2;
     ledc_channel_t channel;
@@ -63,6 +78,10 @@ static const int weights[4] = {-3, -1, 1, 3};
 static const motor_t motor_a = {A_IN1, A_IN2, LEDC_CHANNEL_0, MOTOR_A_SIGN};
 static const motor_t motor_b = {B_IN1, B_IN2, LEDC_CHANNEL_1, MOTOR_B_SIGN};
 static const motor_t motor_d = {D_IN1, D_IN2, LEDC_CHANNEL_2, MOTOR_D_SIGN};
+
+typedef enum { AVOID_LINE, AVOID_LEFT, AVOID_FORWARD, AVOID_RIGHT } avoid_state_t;
+static volatile tft_status_t display_status = { -1.0f, 0, 0, 0, 0, 0, 0, "LINE" };
+static volatile avoid_state_t avoid_state = AVOID_LINE;
 
 static int clamp(int value, int limit)
 {
@@ -103,6 +122,17 @@ static void drive(int forward_a, int forward_d, int turn, int *a, int *b, int *d
     motor_set(&motor_d, *d);
 }
 
+/* 全向底盘横移混控：如实车左右相反，只需交换两个 lateral 符号。 */
+static void drive_vector(int forward, int lateral, int turn, int *a, int *b, int *d)
+{
+    *a = clamp(-forward - turn + lateral, MAX_OUTPUT);
+    *b = clamp(turn - lateral, MAX_OUTPUT);
+    *d = clamp(forward - turn + lateral, MAX_OUTPUT);
+    motor_set(&motor_a, *a);
+    motor_set(&motor_b, *b);
+    motor_set(&motor_d, *d);
+}
+
 static void hardware_init(void)
 {
     const gpio_num_t outputs[] = {A_IN1, A_IN2, B_IN1, B_IN2, D_IN1, D_IN2, STBY_GPIO};
@@ -128,6 +158,32 @@ static void hardware_init(void)
         ESP_ERROR_CHECK(ledc_channel_config(&channel));
     }
     gpio_set_level(STBY_GPIO, 1);
+    ultrasonic_init(ULTRASONIC_TRIG, ULTRASONIC_ECHO);
+}
+
+static const char *avoid_mode_name(void)
+{
+    switch (avoid_state) {
+    case AVOID_LEFT: return "AVOID-L";
+    case AVOID_FORWARD: return "AVOID-F";
+    case AVOID_RIGHT: return "AVOID-R";
+    default: return "LINE";
+    }
+}
+
+static void display_task(void *arg)
+{
+    (void)arg;
+    if (!tft_st7735_init()) vTaskDelete(NULL);
+    while (true) {
+        tft_status_t snapshot = {
+            display_status.distance_cm, display_status.ir_mask, display_status.error,
+            display_status.turn, display_status.motor_a, display_status.motor_b,
+            display_status.motor_d, display_status.mode
+        };
+        tft_st7735_show(&snapshot);
+        vTaskDelay(pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
+    }
 }
 
 static uint8_t sample_active_mask(void)
@@ -213,16 +269,57 @@ static uint8_t raw_levels(void)
 void app_main(void)
 {
     hardware_init();
+    xTaskCreate(display_task, "tft", 4096, NULL, 1, NULL);
     int a = 0, b = 0, d = 0, turn = 0, last_turn = 1;
     uint32_t log_elapsed = LOG_MS;
+    uint32_t ultrasonic_elapsed = ULTRASONIC_PERIOD_MS;
+    uint32_t avoid_elapsed = 0;
+    uint32_t end_active_ms = 0;
     bool line_seen = false;
+    bool finished = false;
     drive(0, 0, 0, &a, &b, &d);
     vTaskDelay(pdMS_TO_TICKS(START_DELAY_MS));
     while (true) {
         uint8_t mask = control_mask();
         int error = line_error(mask);
-        if (mask) line_seen = true;
-        if (!line_seen) {
+        if (ultrasonic_elapsed >= ULTRASONIC_PERIOD_MS) {
+            display_status.distance_cm = ultrasonic_read_cm();
+            ultrasonic_elapsed = 0;
+        }
+        float distance = display_status.distance_cm;
+        if (!finished && avoid_state == AVOID_LINE && mask == 0x0FU) {
+            end_active_ms += LOOP_MS;
+            if (end_active_ms >= END_CONFIRM_MS) finished = true;
+        } else if (mask != 0x0FU) {
+            end_active_ms = 0;
+        }
+        if (avoid_state == AVOID_LINE && distance > 0.0f && distance <= OBSTACLE_DETECT_CM) {
+            avoid_state = AVOID_LEFT;
+            avoid_elapsed = 0;
+        } else if (avoid_state == AVOID_LEFT &&
+                   ((distance < 0.0f || distance >= OBSTACLE_CLEAR_CM) || avoid_elapsed >= AVOID_SHIFT_TIMEOUT_MS)) {
+            avoid_state = AVOID_FORWARD;
+            avoid_elapsed = 0;
+        } else if (avoid_state == AVOID_FORWARD && avoid_elapsed >= AVOID_FORWARD_MS) {
+            avoid_state = AVOID_RIGHT;
+            avoid_elapsed = 0;
+        } else if (avoid_state == AVOID_RIGHT &&
+                   ((avoid_elapsed >= 200U && mask != 0) || avoid_elapsed >= AVOID_RIGHT_TIMEOUT_MS)) {
+            avoid_state = AVOID_LINE;
+            avoid_elapsed = 0;
+        }
+
+        if (finished) {
+            avoid_state = AVOID_LINE;
+            drive(0, 0, 0, &a, &b, &d);
+            turn = 0;
+        } else if (avoid_state == AVOID_LEFT) {
+            drive_vector(0, AVOID_SHIFT_SPEED, 0, &a, &b, &d);
+        } else if (avoid_state == AVOID_FORWARD) {
+            drive_vector(AVOID_FORWARD_SPEED, 0, 0, &a, &b, &d);
+        } else if (avoid_state == AVOID_RIGHT) {
+            drive_vector(0, -AVOID_SHIFT_SPEED, 0, &a, &b, &d);
+        } else if (!line_seen) {
             turn = pid_steering(0);
             drive(0, 0, 0, &a, &b, &d);
         } else if (mask == CENTER_MASK || mask == 0x0FU || (mask && error == 0)) {
@@ -232,21 +329,30 @@ void app_main(void)
             pid_steering(0);
             turn = last_turn * TURN_MAX;
             drive(0, 0, turn, &a, &b, &d);
-        }
-        else {
+        } else {
             last_turn = error < 0 ? 1 : -1;
             turn = pid_steering(error);
             drive(CURVE_A_SPEED, CURVE_D_SPEED, turn, &a, &b, &d);
         }
+        if (mask) line_seen = true;
+        display_status.ir_mask = mask;
+        display_status.error = error;
+        display_status.turn = turn;
+        display_status.motor_a = a;
+        display_status.motor_b = b;
+        display_status.motor_d = d;
+        display_status.mode = finished ? "END" : avoid_mode_name();
         if (log_elapsed >= LOG_MS) {
             uint8_t raw = raw_levels();
-            ESP_LOGI(TAG, "RAW=%u%u%u%u ACTIVE=%u%u%u%u err=%d turn=%d motor[A,B,D]=[%d,%d,%d]",
+            ESP_LOGI(TAG, "RAW=%u%u%u%u ACTIVE=%u%u%u%u dist=%.1fcm mode=%s err=%d turn=%d motor[A,B,D]=[%d,%d,%d]",
                      raw & 1, raw >> 1 & 1, raw >> 2 & 1, raw >> 3 & 1,
                      mask & 1, mask >> 1 & 1, mask >> 2 & 1, mask >> 3 & 1,
-                     error, turn, a, b, d);
+                     (double)distance, avoid_mode_name(), error, turn, a, b, d);
             log_elapsed = 0;
         }
         log_elapsed += LOOP_MS;
+        ultrasonic_elapsed += LOOP_MS;
+        avoid_elapsed += LOOP_MS;
         vTaskDelay(pdMS_TO_TICKS(LOOP_MS));
     }
 }
