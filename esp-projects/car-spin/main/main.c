@@ -43,12 +43,14 @@
 #define PID_SCALE 10
 #define PID_DEADBAND 3
 #define PID_INTEGRAL_LIMIT 30
+#define ERROR_FILTER_DIVISOR 2
+#define TURN_SLEW_STEP 2
 #define LOOP_MS 10U
 #define LOG_MS 100U
 #define START_DELAY_MS 2000U
 #define PWM_MAX 1023U
 #define START_KICK_OUTPUT 30
-#define START_KICK_CYCLES 8U
+#define START_KICK_CYCLES 2U
 #define MOTOR_A_SIGN 1
 #define MOTOR_B_SIGN 1
 #define MOTOR_D_SIGN -1
@@ -64,20 +66,24 @@
 #define AVOID_RIGHT_TIMEOUT_MS 3000U
 #define ULTRASONIC_PERIOD_MS 100U
 #define DISPLAY_PERIOD_MS 100U
+#define ULTRASONIC_WARN_SAMPLES 10U
+#define END_ARM_MS 150U
+#define END_TURN_MAX 4
 #define END_CONFIRM_MS 300U
 
 typedef struct {
     gpio_num_t in1, in2;
     ledc_channel_t channel;
     int sign;
+    bool use_start_kick;
 } motor_t;
 
 static const char *TAG = "line_follow";
 static const gpio_num_t sensors[4] = {OUT1_GPIO, OUT2_GPIO, OUT3_GPIO, OUT4_GPIO};
 static const int weights[4] = {-3, -1, 1, 3};
-static const motor_t motor_a = {A_IN1, A_IN2, LEDC_CHANNEL_0, MOTOR_A_SIGN};
-static const motor_t motor_b = {B_IN1, B_IN2, LEDC_CHANNEL_1, MOTOR_B_SIGN};
-static const motor_t motor_d = {D_IN1, D_IN2, LEDC_CHANNEL_2, MOTOR_D_SIGN};
+static const motor_t motor_a = {A_IN1, A_IN2, LEDC_CHANNEL_0, MOTOR_A_SIGN, true};
+static const motor_t motor_b = {B_IN1, B_IN2, LEDC_CHANNEL_1, MOTOR_B_SIGN, false};
+static const motor_t motor_d = {D_IN1, D_IN2, LEDC_CHANNEL_2, MOTOR_D_SIGN, true};
 
 typedef enum { AVOID_LINE, AVOID_LEFT, AVOID_FORWARD, AVOID_RIGHT } avoid_state_t;
 static volatile tft_status_t display_status = { -1.0f, 0, 0, 0, 0, 0, 0, "LINE" };
@@ -90,6 +96,13 @@ static int clamp(int value, int limit)
     return value;
 }
 
+static int move_towards(int value, int target, int step)
+{
+    if (value < target) return value + clamp(target - value, step);
+    if (value > target) return value - clamp(value - target, step);
+    return value;
+}
+
 static void motor_set(const motor_t *motor, int speed)
 {
     static int last_direction[3] = {0};
@@ -97,15 +110,18 @@ static void motor_set(const motor_t *motor, int speed)
     speed = clamp(speed * motor->sign, MAX_OUTPUT);
     int index = (int)motor->channel;
     int direction = (speed > 0) - (speed < 0);
-    if (direction == 0) kick_cycles[index] = 0;
-    else if (direction != last_direction[index]) kick_cycles[index] = START_KICK_CYCLES;
-    last_direction[index] = direction;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, motor->channel, 0);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, motor->channel);
-    gpio_set_level(motor->in1, speed > 0);
-    gpio_set_level(motor->in2, speed < 0);
+    if (direction != last_direction[index]) {
+        /* 仅在真正换向时撤掉 PWM，避免每 10 ms 产生一次制动脉冲。 */
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, motor->channel, 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, motor->channel);
+        gpio_set_level(motor->in1, speed > 0);
+        gpio_set_level(motor->in2, speed < 0);
+        kick_cycles[index] = motor->use_start_kick && direction != 0 ? START_KICK_CYCLES : 0;
+        last_direction[index] = direction;
+    }
     int output = abs(speed);
-    if (kick_cycles[index] && output < START_KICK_OUTPUT) output = START_KICK_OUTPUT;
+    if (motor->use_start_kick && kick_cycles[index] && output < START_KICK_OUTPUT)
+        output = START_KICK_OUTPUT;
     if (kick_cycles[index]) --kick_cycles[index];
     uint32_t duty = PWM_MAX * (uint32_t)output / 100U;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, motor->channel, duty);
@@ -186,6 +202,25 @@ static void display_task(void *arg)
     }
 }
 
+static void ultrasonic_task(void *arg)
+{
+    (void)arg;
+    uint8_t failed_samples = 0;
+    while (true) {
+        float distance = ultrasonic_read_cm();
+        display_status.distance_cm = distance;
+        if (distance < 0.0f) {
+            if (failed_samples < UINT8_MAX) ++failed_samples;
+            if (failed_samples == ULTRASONIC_WARN_SAMPLES) {
+                ESP_LOGW(TAG, "No ultrasonic echo; check TRIG/ECHO GPIO and HC-SR04 power/level shifting");
+            }
+        } else {
+            failed_samples = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(ULTRASONIC_PERIOD_MS));
+    }
+}
+
 static uint8_t sample_active_mask(void)
 {
     uint8_t votes[4] = {0};
@@ -246,16 +281,20 @@ static uint8_t control_mask(void)
 
 static int pid_steering(int error)
 {
-    static int integral = 0, previous = 0, derivative_filtered = 0;
+    static int integral = 0, filtered_error = 0;
+    static int previous = 0, derivative_filtered = 0;
     if (abs(error) <= PID_DEADBAND) {
-        integral = previous = derivative_filtered = 0;
+        integral = filtered_error = previous = derivative_filtered = 0;
         return 0;
     }
-    integral = clamp(integral + error, PID_INTEGRAL_LIMIT);
-    int derivative = error - previous;
+
+    /* 四路数字传感器的误差只有少数几个离散值，先低通再送入 PID。 */
+    filtered_error += (error - filtered_error) / ERROR_FILTER_DIVISOR;
+    integral = clamp(integral + filtered_error, PID_INTEGRAL_LIMIT);
+    int derivative = filtered_error - previous;
     derivative_filtered = (derivative_filtered + derivative) / 2;
-    previous = error;
-    int output = -(PID_KP * error + PID_KI * integral + PID_KD * derivative_filtered) / PID_SCALE;
+    previous = filtered_error;
+    int output = -(PID_KP * filtered_error + PID_KI * integral + PID_KD * derivative_filtered) / PID_SCALE;
     return clamp(output, TURN_MAX);
 }
 
@@ -266,33 +305,41 @@ static uint8_t raw_levels(void)
     return raw;
 }
 
+/* IR_ACTIVE_LEVEL 为 0 时，此条件正是接口原始电平 RAW=0000。 */
+static bool raw_all_sensors_on_black(void)
+{
+    for (size_t i = 0; i < 4; ++i)
+        if (gpio_get_level(sensors[i]) != IR_ACTIVE_LEVEL) return false;
+    return true;
+}
+
+static int follow_speed(int straight_speed, int curve_speed, int turn)
+{
+    int speed = straight_speed - abs(turn);
+    return speed < curve_speed ? curve_speed : speed;
+}
+
 void app_main(void)
 {
     hardware_init();
+    xTaskCreate(ultrasonic_task, "ultrasonic", 2048, NULL, 1, NULL);
     xTaskCreate(display_task, "tft", 4096, NULL, 1, NULL);
     int a = 0, b = 0, d = 0, turn = 0, last_turn = 1;
     uint32_t log_elapsed = LOG_MS;
-    uint32_t ultrasonic_elapsed = ULTRASONIC_PERIOD_MS;
     uint32_t avoid_elapsed = 0;
     uint32_t end_active_ms = 0;
+    uint32_t end_straight_ms = 0;
     bool line_seen = false;
     bool finished = false;
     drive(0, 0, 0, &a, &b, &d);
     vTaskDelay(pdMS_TO_TICKS(START_DELAY_MS));
+    TickType_t last_wake = xTaskGetTickCount();
     while (true) {
         uint8_t mask = control_mask();
         int error = line_error(mask);
-        if (ultrasonic_elapsed >= ULTRASONIC_PERIOD_MS) {
-            display_status.distance_cm = ultrasonic_read_cm();
-            ultrasonic_elapsed = 0;
-        }
         float distance = display_status.distance_cm;
-        if (!finished && avoid_state == AVOID_LINE && mask == 0x0FU) {
-            end_active_ms += LOOP_MS;
-            if (end_active_ms >= END_CONFIRM_MS) finished = true;
-        } else if (mask != 0x0FU) {
-            end_active_ms = 0;
-        }
+        bool raw_end_line = raw_all_sensors_on_black();
+
         if (avoid_state == AVOID_LINE && distance > 0.0f && distance <= OBSTACLE_DETECT_CM) {
             avoid_state = AVOID_LEFT;
             avoid_elapsed = 0;
@@ -309,6 +356,27 @@ void app_main(void)
             avoid_elapsed = 0;
         }
 
+        /*
+         * 终点只看未经控制滤波的四路读数：IR_ACTIVE_LEVEL=0 时即 RAW=0000。
+         * 先要求小车已稳定直行，转弯或丢线状态会取消预备；随后再连续确认，
+         * 因而转弯时短暂扫过横线不会触发停车。
+         */
+        if (finished || avoid_state != AVOID_LINE || !line_seen) {
+            end_active_ms = 0;
+            end_straight_ms = 0;
+        } else if (!raw_end_line) {
+            bool straight = mask != 0 && mask != 0x0FU &&
+                            abs(error) <= 10 && abs(turn) <= END_TURN_MAX;
+            end_straight_ms = straight ? end_straight_ms + LOOP_MS : 0;
+            end_active_ms = 0;
+        } else if (abs(turn) > END_TURN_MAX || end_straight_ms < END_ARM_MS) {
+            if (abs(turn) > END_TURN_MAX) end_straight_ms = 0;
+            end_active_ms = 0;
+        } else {
+            end_active_ms += LOOP_MS;
+            if (end_active_ms >= END_CONFIRM_MS) finished = true;
+        }
+
         if (finished) {
             avoid_state = AVOID_LINE;
             drive(0, 0, 0, &a, &b, &d);
@@ -322,17 +390,15 @@ void app_main(void)
         } else if (!line_seen) {
             turn = pid_steering(0);
             drive(0, 0, 0, &a, &b, &d);
-        } else if (mask == CENTER_MASK || mask == 0x0FU || (mask && error == 0)) {
-            turn = pid_steering(0);
-            drive(STRAIGHT_A_SPEED, STRAIGHT_D_SPEED, 0, &a, &b, &d);
         } else if (mask == 0) {
             pid_steering(0);
-            turn = last_turn * TURN_MAX;
+            turn = move_towards(turn, last_turn * TURN_MAX, TURN_SLEW_STEP);
             drive(0, 0, turn, &a, &b, &d);
         } else {
-            last_turn = error < 0 ? 1 : -1;
-            turn = pid_steering(error);
-            drive(CURVE_A_SPEED, CURVE_D_SPEED, turn, &a, &b, &d);
+            if (error != 0) last_turn = error < 0 ? 1 : -1;
+            turn = move_towards(turn, pid_steering(error), TURN_SLEW_STEP);
+            drive(follow_speed(STRAIGHT_A_SPEED, CURVE_A_SPEED, turn),
+                  follow_speed(STRAIGHT_D_SPEED, CURVE_D_SPEED, turn), turn, &a, &b, &d);
         }
         if (mask) line_seen = true;
         display_status.ir_mask = mask;
@@ -341,18 +407,18 @@ void app_main(void)
         display_status.motor_a = a;
         display_status.motor_b = b;
         display_status.motor_d = d;
-        display_status.mode = finished ? "END" : avoid_mode_name();
+        const char *mode = finished ? "END" : avoid_mode_name();
+        display_status.mode = mode;
         if (log_elapsed >= LOG_MS) {
             uint8_t raw = raw_levels();
-            ESP_LOGI(TAG, "RAW=%u%u%u%u ACTIVE=%u%u%u%u dist=%.1fcm mode=%s err=%d turn=%d motor[A,B,D]=[%d,%d,%d]",
+            ESP_LOGI(TAG, "RAW=%u%u%u%u ACTIVE=%u%u%u%u dist=%.1fcm mode=%s err=%d turn=%d end=%lums motor[A,B,D]=[%d,%d,%d]",
                      raw & 1, raw >> 1 & 1, raw >> 2 & 1, raw >> 3 & 1,
                      mask & 1, mask >> 1 & 1, mask >> 2 & 1, mask >> 3 & 1,
-                     (double)distance, avoid_mode_name(), error, turn, a, b, d);
+                     (double)distance, mode, error, turn, (unsigned long)end_active_ms, a, b, d);
             log_elapsed = 0;
         }
         log_elapsed += LOOP_MS;
-        ultrasonic_elapsed += LOOP_MS;
         avoid_elapsed += LOOP_MS;
-        vTaskDelay(pdMS_TO_TICKS(LOOP_MS));
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(LOOP_MS));
     }
 }
