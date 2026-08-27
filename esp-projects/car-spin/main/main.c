@@ -74,10 +74,12 @@
 #define DISPLAY_PERIOD_MS 100U
 #define ULTRASONIC_WARN_SAMPLES 10U
 #define OBSTACLE_CONFIRM_SAMPLES 1U
-#define END_ARM_MS 80U
-#define END_TURN_MAX 8
-#define END_BRAKE_DELAY_MS 20U
-#define END_CONFIRM_MS 80U
+#define END_ARM_MS 40U
+#define END_ARM_ERROR_MAX 20
+#define END_TURN_MAX TURN_MAX
+#define END_CONFIRM_SAMPLES 2U
+#define END_CONFIRM_MS (END_CONFIRM_SAMPLES * LOOP_MS)
+#define END_BRAKE_DELAY_MS END_CONFIRM_MS
 
 typedef struct {
     gpio_num_t in1, in2;
@@ -409,15 +411,15 @@ void app_main(void)
 
         /*
          * 终点只看未经控制滤波的四路读数：IR_ACTIVE_LEVEL=0 时即 RAW=0000。
-         * 先要求小车已稳定直行，转弯或丢线状态会取消预备；随后再连续确认，
-         * 因而转弯时短暂扫过横线不会触发停车。
+         * T 型终点前可能先扫到四路黑线，因此只要求此前仍在跟线；
+         * 随后 RAW=0000 持续确认，短暂扫过横线会自行取消。
          */
         if (finished || avoid_state != AVOID_LINE || !line_seen) {
             end_active_ms = 0;
             end_straight_ms = 0;
         } else if (!raw_end_line) {
-            bool straight = mask != 0 && mask != 0x0FU &&
-                            abs(error) <= 10 && abs(turn) <= END_TURN_MAX;
+            bool straight = mask != 0 && abs(error) <= END_ARM_ERROR_MAX &&
+                            abs(turn) <= END_TURN_MAX;
             end_straight_ms = straight ? end_straight_ms + LOOP_MS : 0;
             end_active_ms = 0;
         } else if (abs(turn) > END_TURN_MAX || end_straight_ms < END_ARM_MS) {
