@@ -6,13 +6,17 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#define OUT1_GPIO GPIO_NUM_41
-#define OUT2_GPIO GPIO_NUM_42
-#define OUT3_GPIO GPIO_NUM_2
-#define OUT4_GPIO GPIO_NUM_1
-#define IR_ACTIVE_LEVEL 0
-#define REVERSE_SENSOR_ORDER 1
-#define CENTER_MASK 0x06U
+
+/* 四路红外，按车体从左到右排列：OUT4、OUT3、OUT2、OUT1。
+   若左右方向装反，把这一行的四个引脚顺序颠倒即可。 */
+static const gpio_num_t sensors[4] = {
+    GPIO_NUM_1,  /* OUT4，车体最左 */
+    GPIO_NUM_2,  /* OUT3 */
+    GPIO_NUM_42, /* OUT2 */
+    GPIO_NUM_41  /* OUT1，车体最右 */
+};
+static const int weights[4] = {-3, -1, 1, 3};
+#define IR_ACTIVE_LEVEL 0 /* LQ_R4CHVB：黑线低电平 */
 
 #define A_PWM GPIO_NUM_9
 #define A_IN1 GPIO_NUM_12
@@ -52,7 +56,7 @@
 #define MOTOR_D_SIGN -1
 
 typedef struct {
-    gpio_num_t in1, in2;
+    gpio_num_t pwm, in1, in2;
     ledc_channel_t channel;
     int sign;
 } motor_t;
@@ -71,12 +75,9 @@ static int clamp(int value, int limit)
     return value;
 }
 
-static void motor_set(const motor_t *motor, int speed)
+static void motor_set(motor_t *motor, int speed)
 {
-    static int last_direction[3] = {0};
-    static uint8_t kick_cycles[3] = {0};
-    speed = clamp(speed * motor->sign, MAX_OUTPUT);
-    int index = (int)motor->channel;
+    speed = clamp(speed, MAX_OUTPUT);
     int direction = (speed > 0) - (speed < 0);
     if (direction == 0) kick_cycles[index] = 0;
     else if (direction != last_direction[index]) kick_cycles[index] = START_KICK_CYCLES;
@@ -93,37 +94,60 @@ static void motor_set(const motor_t *motor, int speed)
     ledc_update_duty(LEDC_LOW_SPEED_MODE, motor->channel);
 }
 
-static void drive(int forward_a, int forward_d, int turn, int *a, int *b, int *d)
+/* A 镜像安装所以取负；B 只提供旋转分量；正 turn 为左转。 */
+static void drive(int forward, int turn, int out[3])
 {
-    *a = clamp(-forward_a - turn, MAX_OUTPUT);
-    *b = clamp(turn, MAX_OUTPUT);
-    *d = clamp(forward_d - turn, MAX_OUTPUT);
-    motor_set(&motor_a, *a);
-    motor_set(&motor_b, *b);
-    motor_set(&motor_d, *d);
+    out[0] = clamp(-forward - turn, MAX_OUTPUT);
+    out[1] = clamp(turn, MAX_OUTPUT);
+    out[2] = clamp(forward - turn, MAX_OUTPUT);
+    for (int i = 0; i < 3; ++i) motor_set(&motors[i], out[i]);
+}
+
+static uint8_t read_sensors(void)
+{
+    uint8_t mask = 0;
+    for (int i = 0; i < 4; ++i)
+        if (gpio_get_level(sensors[i]) == IR_ACTIVE_LEVEL) mask |= 1U << i;
+    return mask;
+}
+
+/* 负值表示线在左侧，正值表示线在右侧，范围约 ±30。 */
+static int line_error(uint8_t mask)
+{
+    int sum = 0, count = 0;
+    for (int i = 0; i < 4; ++i)
+        if (mask & (1U << i)) { sum += weights[i]; ++count; }
+    return count ? sum * 10 / count : 0;
 }
 
 static void hardware_init(void)
 {
-    const gpio_num_t outputs[] = {A_IN1, A_IN2, B_IN1, B_IN2, D_IN1, D_IN2, STBY_GPIO};
-    for (size_t i = 0; i < sizeof(outputs) / sizeof(outputs[0]); ++i) {
-        gpio_reset_pin(outputs[i]);
-        gpio_set_direction(outputs[i], GPIO_MODE_OUTPUT);
-    }
-    for (size_t i = 0; i < 4; ++i) {
+    for (int i = 0; i < 4; ++i) {
         gpio_reset_pin(sensors[i]);
         gpio_set_direction(sensors[i], GPIO_MODE_INPUT);
     }
+    gpio_reset_pin(STBY_GPIO);
+    gpio_set_direction(STBY_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(STBY_GPIO, 0);
+
     const ledc_timer_config_t timer = {
         .speed_mode = LEDC_LOW_SPEED_MODE, .duty_resolution = LEDC_TIMER_10_BIT,
         .timer_num = LEDC_TIMER_0, .freq_hz = 2000, .clk_cfg = LEDC_AUTO_CLK
     };
     ESP_ERROR_CHECK(ledc_timer_config(&timer));
-    const gpio_num_t pwm[3] = {A_PWM, B_PWM, D_PWM};
+
     for (int i = 0; i < 3; ++i) {
+        gpio_reset_pin(motors[i].in1);
+        gpio_set_direction(motors[i].in1, GPIO_MODE_OUTPUT);
+        gpio_set_level(motors[i].in1, 0);
+        gpio_reset_pin(motors[i].in2);
+        gpio_set_direction(motors[i].in2, GPIO_MODE_OUTPUT);
+        gpio_set_level(motors[i].in2, 0);
+        motors[i].last_direction = 0;
         const ledc_channel_config_t channel = {
-            .gpio_num = pwm[i], .speed_mode = LEDC_LOW_SPEED_MODE, .channel = i,
-            .intr_type = LEDC_INTR_DISABLE, .timer_sel = LEDC_TIMER_0, .duty = 0
+            .gpio_num = motors[i].pwm, .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel = motors[i].channel, .intr_type = LEDC_INTR_DISABLE,
+            .timer_sel = LEDC_TIMER_0, .duty = 0
         };
         ESP_ERROR_CHECK(ledc_channel_config(&channel));
     }
@@ -211,40 +235,39 @@ static uint8_t raw_levels(void)
 void app_main(void)
 {
     hardware_init();
-    int a = 0, b = 0, d = 0, turn = 0, last_turn = 1;
-    uint32_t log_elapsed = LOG_MS;
+    int out[3] = {0};
+    int search_turn = TURN_MAX; /* 丢线沿最后一次偏差方向搜索；无偏差时默认左转 */
     bool line_seen = false;
-    drive(0, 0, 0, &a, &b, &d);
+    uint32_t log_elapsed = LOG_MS;
+
+    drive(0, 0, out);
     vTaskDelay(pdMS_TO_TICKS(START_DELAY_MS));
+
     while (true) {
-        uint8_t mask = control_mask();
+        uint8_t mask = read_sensors();
         int error = line_error(mask);
-        if (mask) line_seen = true;
-        if (!line_seen) {
-            turn = pid_steering(0);
-            drive(0, 0, 0, &a, &b, &d);
-        } else if (mask == CENTER_MASK || mask == 0x0FU || (mask && error == 0)) {
-            turn = pid_steering(0);
-            drive(STRAIGHT_A_SPEED, STRAIGHT_D_SPEED, 0, &a, &b, &d);
-        } else if (mask == 0) {
-            pid_steering(0);
-            turn = last_turn * TURN_MAX;
-            drive(0, 0, turn, &a, &b, &d);
+        int forward, turn;
+
+        if (mask == 0) {
+            forward = 0;
+            turn = line_seen ? search_turn : 0; /* 上电首次见线前不动 */
+        } else {
+            line_seen = true;
+            forward = error ? CURVE_SPEED : STRAIGHT_SPEED;
+            turn = clamp(-error * TURN_KP / 10, TURN_MAX);
+            if (error) search_turn = error < 0 ? TURN_MAX : -TURN_MAX;
         }
-        else {
-            last_turn = error < 0 ? 1 : -1;
-            turn = pid_steering(error);
-            drive(CURVE_A_SPEED, CURVE_D_SPEED, turn, &a, &b, &d);
-        }
+        drive(forward, turn, out);
+
         if (log_elapsed >= LOG_MS) {
-            uint8_t raw = raw_levels();
-            ESP_LOGI(TAG, "RAW=%u%u%u%u ACTIVE=%u%u%u%u err=%d turn=%d motor[A,B,D]=[%d,%d,%d]",
-                     raw & 1, raw >> 1 & 1, raw >> 2 & 1, raw >> 3 & 1,
-                     mask & 1, mask >> 1 & 1, mask >> 2 & 1, mask >> 3 & 1,
-                     error, turn, a, b, d);
+            ESP_LOGI(TAG, "ACTIVE=%u%u%u%u err=%d turn=%d motor[A,B,D]=[%d,%d,%d]",
+                     (unsigned)(mask & 1U), (unsigned)((mask >> 1) & 1U),
+                     (unsigned)((mask >> 2) & 1U), (unsigned)((mask >> 3) & 1U),
+                     error, turn, out[0], out[1], out[2]);
             log_elapsed = 0;
         }
         log_elapsed += LOOP_MS;
+        /* 不依赖额外的 FreeRTOS DelayUntil 配置；控制周期约为 10 ms。 */
         vTaskDelay(pdMS_TO_TICKS(LOOP_MS));
     }
 }
