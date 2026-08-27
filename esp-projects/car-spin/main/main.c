@@ -47,7 +47,7 @@ typedef struct {
 } motor_t;
 
 /* 顺序固定为 A、B、D，与 drive() 的混控一致。
-   某个电机转向相反时交换它的 IN1/IN2 宏。 */
+   IN1/IN2 宏始终按驱动板接线表，电机极性只在 drive() 中校准。 */
 static motor_t motors[3] = {
     {A_PWM, A_IN1, A_IN2, LEDC_CHANNEL_0, 0}, /* 右前 */
     {B_PWM, B_IN1, B_IN2, LEDC_CHANNEL_1, 0}, /* 后轮 */
@@ -79,12 +79,12 @@ static void motor_set(motor_t *motor, int speed)
     ledc_update_duty(LEDC_LOW_SPEED_MODE, motor->channel);
 }
 
-/* A 镜像安装所以取负；B 只提供旋转分量；正 turn 为左转。 */
+/* 按实车电机极性混控；B 只提供旋转分量；正 turn 为左转。 */
 static void drive(int forward, int turn, int out[3])
 {
     out[0] = clamp(-forward - turn, MAX_OUTPUT);
     out[1] = clamp(turn, MAX_OUTPUT);
-    out[2] = clamp(forward - turn, MAX_OUTPUT);
+    out[2] = clamp(-forward + turn, MAX_OUTPUT);
     for (int i = 0; i < 3; ++i) motor_set(&motors[i], out[i]);
 }
 
