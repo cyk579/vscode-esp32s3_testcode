@@ -38,37 +38,31 @@
 #define PID_KP 4
 #define PID_KI 1
 #define PID_KD 2
-#define PID_SCALE 12
+#define PID_SCALE 10
 #define PID_DEADBAND 3
-#define PID_INTEGRAL_LIMIT 24
-#define PID_OUTPUT_STEP 2
+#define PID_INTEGRAL_LIMIT 30
 #define LOOP_MS 10U
 #define LOG_MS 100U
 #define START_DELAY_MS 2000U
 #define PWM_MAX 1023U
-#define START_KICK_OUTPUT 20
-#define START_KICK_CYCLES 3U
+#define START_KICK_OUTPUT 30
+#define START_KICK_CYCLES 8U
 #define MOTOR_A_SIGN 1
 #define MOTOR_B_SIGN 1
-#define MOTOR_D_SIGN 1
+#define MOTOR_D_SIGN -1
 
 typedef struct {
     gpio_num_t in1, in2;
     ledc_channel_t channel;
     int sign;
-    bool startup_boost;
 } motor_t;
-
-typedef struct {
-    int error, previous, integral, derivative, output, sign;
-} steering_pid_t;
 
 static const char *TAG = "line_follow";
 static const gpio_num_t sensors[4] = {OUT1_GPIO, OUT2_GPIO, OUT3_GPIO, OUT4_GPIO};
 static const int weights[4] = {-3, -1, 1, 3};
-static const motor_t motor_a = {A_IN1, A_IN2, LEDC_CHANNEL_0, MOTOR_A_SIGN, true};
-static const motor_t motor_b = {B_IN1, B_IN2, LEDC_CHANNEL_1, MOTOR_B_SIGN, false};
-static const motor_t motor_d = {D_IN1, D_IN2, LEDC_CHANNEL_2, MOTOR_D_SIGN, true};
+static const motor_t motor_a = {A_IN1, A_IN2, LEDC_CHANNEL_0, MOTOR_A_SIGN};
+static const motor_t motor_b = {B_IN1, B_IN2, LEDC_CHANNEL_1, MOTOR_B_SIGN};
+static const motor_t motor_d = {D_IN1, D_IN2, LEDC_CHANNEL_2, MOTOR_D_SIGN};
 
 static int clamp(int value, int limit)
 {
@@ -84,14 +78,13 @@ static void motor_set(const motor_t *motor, int speed)
     speed = clamp(speed * motor->sign, MAX_OUTPUT);
     int index = (int)motor->channel;
     int direction = (speed > 0) - (speed < 0);
-    if (direction != last_direction[index]) {
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, motor->channel, 0);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, motor->channel);
-        gpio_set_level(motor->in1, speed > 0);
-        gpio_set_level(motor->in2, speed < 0);
-        kick_cycles[index] = direction && motor->startup_boost ? START_KICK_CYCLES : 0;
-        last_direction[index] = direction;
-    }
+    if (direction == 0) kick_cycles[index] = 0;
+    else if (direction != last_direction[index]) kick_cycles[index] = START_KICK_CYCLES;
+    last_direction[index] = direction;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, motor->channel, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, motor->channel);
+    gpio_set_level(motor->in1, speed > 0);
+    gpio_set_level(motor->in2, speed < 0);
     int output = abs(speed);
     if (kick_cycles[index] && output < START_KICK_OUTPUT) output = START_KICK_OUTPUT;
     if (kick_cycles[index]) --kick_cycles[index];
@@ -123,7 +116,7 @@ static void hardware_init(void)
     }
     const ledc_timer_config_t timer = {
         .speed_mode = LEDC_LOW_SPEED_MODE, .duty_resolution = LEDC_TIMER_10_BIT,
-        .timer_num = LEDC_TIMER_0, .freq_hz = 10000, .clk_cfg = LEDC_AUTO_CLK
+        .timer_num = LEDC_TIMER_0, .freq_hz = 2000, .clk_cfg = LEDC_AUTO_CLK
     };
     ESP_ERROR_CHECK(ledc_timer_config(&timer));
     const gpio_num_t pwm[3] = {A_PWM, B_PWM, D_PWM};
@@ -195,25 +188,17 @@ static uint8_t control_mask(void)
 
 static int pid_steering(int error)
 {
-    static steering_pid_t pid = {0};
+    static int integral = 0, previous = 0, derivative_filtered = 0;
     if (abs(error) <= PID_DEADBAND) {
-        pid = (steering_pid_t){0};
+        integral = previous = derivative_filtered = 0;
         return 0;
     }
-    int sign = (error > 0) - (error < 0);
-    if (pid.sign && sign != pid.sign) pid = (steering_pid_t){0};
-    pid.sign = sign;
-    pid.error = (3 * pid.error + error) / 4;
-    pid.integral = clamp(7 * pid.integral / 8 + pid.error, PID_INTEGRAL_LIMIT);
-    int delta = pid.error - pid.previous;
-    pid.derivative = (3 * pid.derivative + delta) / 4;
-    pid.previous = pid.error;
-    int target = -(PID_KP * pid.error + PID_KI * pid.integral + PID_KD * pid.derivative) / PID_SCALE;
-    target = clamp(target, TURN_MAX);
-    if (target * error > 0) target = 0;
-    if (pid.output < target) pid.output += clamp(target - pid.output, PID_OUTPUT_STEP);
-    else if (pid.output > target) pid.output -= clamp(pid.output - target, PID_OUTPUT_STEP);
-    return pid.output;
+    integral = clamp(integral + error, PID_INTEGRAL_LIMIT);
+    int derivative = error - previous;
+    derivative_filtered = (derivative_filtered + derivative) / 2;
+    previous = error;
+    int output = -(PID_KP * error + PID_KI * integral + PID_KD * derivative_filtered) / PID_SCALE;
+    return clamp(output, TURN_MAX);
 }
 
 static uint8_t raw_levels(void)
