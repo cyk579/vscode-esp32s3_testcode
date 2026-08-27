@@ -12,14 +12,17 @@ static float history[3];
 static uint8_t history_count;
 static uint8_t history_index;
 
-static float one_read_cm(void)
+static float one_read_cm(ultrasonic_status_t *status)
 {
     gpio_set_level(trig_pin, 0);
 
     /* 上一轮回波尚未结束时不重触发，避免把旧回波当作新测距结果。 */
     int64_t wait_start = esp_timer_get_time();
     while (gpio_get_level(echo_pin)) {
-        if (esp_timer_get_time() - wait_start > ECHO_TIMEOUT_US) return -1.0f;
+        if (esp_timer_get_time() - wait_start > ECHO_TIMEOUT_US) {
+            *status = ULTRASONIC_ECHO_STUCK_HIGH;
+            return -1.0f;
+        }
     }
     esp_rom_delay_us(2);
     gpio_set_level(trig_pin, 1);
@@ -28,12 +31,19 @@ static float one_read_cm(void)
 
     wait_start = esp_timer_get_time();
     while (!gpio_get_level(echo_pin)) {
-        if (esp_timer_get_time() - wait_start > ECHO_TIMEOUT_US) return -1.0f;
+        if (esp_timer_get_time() - wait_start > ECHO_TIMEOUT_US) {
+            *status = ULTRASONIC_NO_ECHO;
+            return -1.0f;
+        }
     }
     int64_t pulse_start = esp_timer_get_time();
     while (gpio_get_level(echo_pin)) {
-        if (esp_timer_get_time() - pulse_start > ECHO_TIMEOUT_US) return -1.0f;
+        if (esp_timer_get_time() - pulse_start > ECHO_TIMEOUT_US) {
+            *status = ULTRASONIC_ECHO_STUCK_HIGH;
+            return -1.0f;
+        }
     }
+    *status = ULTRASONIC_OK;
     return (float)(esp_timer_get_time() - pulse_start) / 58.0f;
 }
 
@@ -59,14 +69,28 @@ void ultrasonic_init(gpio_num_t trig_gpio, gpio_num_t echo_gpio)
     history_index = 0;
 }
 
-float ultrasonic_read_cm(void)
+float ultrasonic_read_cm(ultrasonic_status_t *status)
 {
-    float distance = one_read_cm();
-    if (distance < MIN_DISTANCE_CM || distance > MAX_DISTANCE_CM) return -1.0f;
+    float distance = one_read_cm(status);
+    if (*status != ULTRASONIC_OK) return -1.0f;
+    if (distance < MIN_DISTANCE_CM || distance > MAX_DISTANCE_CM) {
+        *status = ULTRASONIC_OUT_OF_RANGE;
+        return -1.0f;
+    }
 
     history[history_index] = distance;
     history_index = (history_index + 1U) % 3U;
     if (history_count < 3U) ++history_count;
     if (history_count < 3U) return distance;
     return median(history[0], history[1], history[2]);
+}
+
+const char *ultrasonic_status_name(ultrasonic_status_t status)
+{
+    switch (status) {
+    case ULTRASONIC_NO_ECHO: return "NO_ECHO";
+    case ULTRASONIC_ECHO_STUCK_HIGH: return "ECHO_HIGH";
+    case ULTRASONIC_OUT_OF_RANGE: return "OUT_OF_RANGE";
+    default: return "OK";
+    }
 }

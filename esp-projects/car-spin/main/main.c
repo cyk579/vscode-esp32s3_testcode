@@ -28,15 +28,20 @@
 #define STBY_GPIO GPIO_NUM_8
 
 /* OUT2/OUT3 on black: equal A/D magnitude, B stopped. */
-#define STRAIGHT_A_SPEED 30
-#define STRAIGHT_D_SPEED 30
-#define CURVE_A_SPEED 20
-#define CURVE_D_SPEED 20
-#define TURN_MAX 12
-#define MAX_OUTPUT 30
+#define STRAIGHT_A_SPEED 36
+#define STRAIGHT_D_SPEED 36
+#define CURVE_A_SPEED 28
+#define CURVE_D_SPEED 28
+#define LOST_LINE_FORWARD_MS 100U
+#define LOST_LINE_A_SPEED 30
+#define LOST_LINE_D_SPEED 30
+#define SEARCH_A_SPEED 22
+#define SEARCH_D_SPEED 22
+#define TURN_MAX 16
+#define MAX_OUTPUT 45
+#define TURN_SIGN 1
 #define FILTER_SAMPLES 5U
 #define FILTER_STABLE_CYCLES 2U
-#define TURN_DELAY_CYCLES 3U
 #define PID_KP 4
 #define PID_KI 1
 #define PID_KD 2
@@ -44,7 +49,7 @@
 #define PID_DEADBAND 3
 #define PID_INTEGRAL_LIMIT 30
 #define ERROR_FILTER_DIVISOR 2
-#define TURN_SLEW_STEP 2
+#define TURN_SLEW_STEP 3
 #define LOOP_MS 10U
 #define LOG_MS 100U
 #define START_DELAY_MS 2000U
@@ -67,9 +72,11 @@
 #define ULTRASONIC_PERIOD_MS 100U
 #define DISPLAY_PERIOD_MS 100U
 #define ULTRASONIC_WARN_SAMPLES 10U
-#define END_ARM_MS 150U
-#define END_TURN_MAX 4
-#define END_CONFIRM_MS 300U
+#define OBSTACLE_CONFIRM_SAMPLES 3U
+#define END_ARM_MS 80U
+#define END_TURN_MAX 8
+#define END_BRAKE_DELAY_MS 20U
+#define END_CONFIRM_MS 80U
 
 typedef struct {
     gpio_num_t in1, in2;
@@ -88,6 +95,8 @@ static const motor_t motor_d = {D_IN1, D_IN2, LEDC_CHANNEL_2, MOTOR_D_SIGN, true
 typedef enum { AVOID_LINE, AVOID_LEFT, AVOID_FORWARD, AVOID_RIGHT } avoid_state_t;
 static volatile tft_status_t display_status = { -1.0f, 0, 0, 0, 0, 0, 0, "LINE" };
 static volatile avoid_state_t avoid_state = AVOID_LINE;
+static volatile ultrasonic_status_t ultrasonic_status = ULTRASONIC_NO_ECHO;
+static volatile uint32_t ultrasonic_sequence = 0;
 
 static int clamp(int value, int limit)
 {
@@ -130,6 +139,8 @@ static void motor_set(const motor_t *motor, int speed)
 
 static void drive(int forward_a, int forward_d, int turn, int *a, int *b, int *d)
 {
+    /* 若所有左右纠偏都与实车相反，仅把 TURN_SIGN 改为 -1。 */
+    turn *= TURN_SIGN;
     *a = clamp(-forward_a - turn, MAX_OUTPUT);
     *b = clamp(turn, MAX_OUTPUT);
     *d = clamp(forward_d - turn, MAX_OUTPUT);
@@ -206,13 +217,26 @@ static void ultrasonic_task(void *arg)
 {
     (void)arg;
     uint8_t failed_samples = 0;
+    ultrasonic_status_t last_status = ULTRASONIC_OK;
+    bool status_reported = false;
     while (true) {
-        float distance = ultrasonic_read_cm();
+        ultrasonic_status_t status;
+        float distance = ultrasonic_read_cm(&status);
+        ultrasonic_status = status;
         display_status.distance_cm = distance;
+        ++ultrasonic_sequence;
+        if (!status_reported || status != last_status) {
+            ESP_LOGI(TAG, "US %s trig=GPIO%d echo=GPIO%d dist=%.1fcm",
+                     ultrasonic_status_name(status), (int)ULTRASONIC_TRIG,
+                     (int)ULTRASONIC_ECHO, (double)distance);
+            last_status = status;
+            status_reported = true;
+        }
         if (distance < 0.0f) {
             if (failed_samples < UINT8_MAX) ++failed_samples;
             if (failed_samples == ULTRASONIC_WARN_SAMPLES) {
-                ESP_LOGW(TAG, "No ultrasonic echo; check TRIG/ECHO GPIO and HC-SR04 power/level shifting");
+                ESP_LOGW(TAG, "US %s: NO_ECHO=power/TRIG/ECHO/pin mapping; ECHO_HIGH=level wiring; OUT_OF_RANGE=echo received but invalid",
+                         ultrasonic_status_name(status));
             }
         } else {
             failed_samples = 0;
@@ -261,22 +285,8 @@ static uint8_t filtered_mask(void)
 
 static uint8_t control_mask(void)
 {
-    static uint8_t history[TURN_DELAY_CYCLES] = {0};
-    static size_t index = 0;
-    uint8_t mask = filtered_mask();
-    int current_error = line_error(mask);
-    /* 强偏差通常是急弯，直接采用当前稳定读数，避免前探队列把弯道拖过。 */
-    if (abs(current_error) >= 20) return mask;
-    if (mask && current_error == 0) {
-        for (size_t i = 0; i < TURN_DELAY_CYCLES; ++i) history[i] = mask;
-        index = 0;
-        return mask;
-    }
-    uint8_t delayed = history[index];
-    history[index] = mask;
-    index = (index + 1U) % TURN_DELAY_CYCLES;
-    if (current_error * line_error(delayed) < 0) return CENTER_MASK;
-    return delayed;
+    /* filtered_mask 已做多数投票和方向确认，不再回放旧方向的历史输入。 */
+    return filtered_mask();
 }
 
 static int pid_steering(int error)
@@ -327,8 +337,11 @@ void app_main(void)
     int a = 0, b = 0, d = 0, turn = 0, last_turn = 1;
     uint32_t log_elapsed = LOG_MS;
     uint32_t avoid_elapsed = 0;
+    uint32_t line_lost_ms = 0;
     uint32_t end_active_ms = 0;
     uint32_t end_straight_ms = 0;
+    uint32_t last_ultrasonic_sequence = 0;
+    uint8_t obstacle_close_samples = 0;
     bool line_seen = false;
     bool finished = false;
     drive(0, 0, 0, &a, &b, &d);
@@ -339,12 +352,25 @@ void app_main(void)
         int error = line_error(mask);
         float distance = display_status.distance_cm;
         bool raw_end_line = raw_all_sensors_on_black();
+        bool ultrasonic_valid = ultrasonic_status == ULTRASONIC_OK;
+        bool end_braking = false;
 
-        if (avoid_state == AVOID_LINE && distance > 0.0f && distance <= OBSTACLE_DETECT_CM) {
-            avoid_state = AVOID_LEFT;
-            avoid_elapsed = 0;
+        if (avoid_state == AVOID_LINE) {
+            if (ultrasonic_sequence != last_ultrasonic_sequence) {
+                last_ultrasonic_sequence = ultrasonic_sequence;
+                if (ultrasonic_valid && distance > 0.0f && distance <= OBSTACLE_DETECT_CM) {
+                    if (obstacle_close_samples < UINT8_MAX) ++obstacle_close_samples;
+                } else {
+                    obstacle_close_samples = 0;
+                }
+            }
+            if (obstacle_close_samples >= OBSTACLE_CONFIRM_SAMPLES) {
+                avoid_state = AVOID_LEFT;
+                avoid_elapsed = 0;
+                obstacle_close_samples = 0;
+            }
         } else if (avoid_state == AVOID_LEFT &&
-                   ((distance < 0.0f || distance >= OBSTACLE_CLEAR_CM) || avoid_elapsed >= AVOID_SHIFT_TIMEOUT_MS)) {
+                   ((ultrasonic_valid && distance >= OBSTACLE_CLEAR_CM) || avoid_elapsed >= AVOID_SHIFT_TIMEOUT_MS)) {
             avoid_state = AVOID_FORWARD;
             avoid_elapsed = 0;
         } else if (avoid_state == AVOID_FORWARD && avoid_elapsed >= AVOID_FORWARD_MS) {
@@ -374,10 +400,11 @@ void app_main(void)
             end_active_ms = 0;
         } else {
             end_active_ms += LOOP_MS;
+            end_braking = end_active_ms >= END_BRAKE_DELAY_MS;
             if (end_active_ms >= END_CONFIRM_MS) finished = true;
         }
 
-        if (finished) {
+        if (finished || end_braking) {
             avoid_state = AVOID_LINE;
             drive(0, 0, 0, &a, &b, &d);
             turn = 0;
@@ -392,9 +419,16 @@ void app_main(void)
             drive(0, 0, 0, &a, &b, &d);
         } else if (mask == 0) {
             pid_steering(0);
-            turn = move_towards(turn, last_turn * TURN_MAX, TURN_SLEW_STEP);
-            drive(0, 0, turn, &a, &b, &d);
+            line_lost_ms += LOOP_MS;
+            if (line_lost_ms <= LOST_LINE_FORWARD_MS) {
+                turn = move_towards(turn, last_turn * (TURN_MAX / 2), TURN_SLEW_STEP);
+                drive(LOST_LINE_A_SPEED, LOST_LINE_D_SPEED, turn, &a, &b, &d);
+            } else {
+                turn = move_towards(turn, last_turn * TURN_MAX, TURN_SLEW_STEP);
+                drive(SEARCH_A_SPEED, SEARCH_D_SPEED, turn, &a, &b, &d);
+            }
         } else {
+            line_lost_ms = 0;
             if (error != 0) last_turn = error < 0 ? 1 : -1;
             turn = move_towards(turn, pid_steering(error), TURN_SLEW_STEP);
             drive(follow_speed(STRAIGHT_A_SPEED, CURVE_A_SPEED, turn),
@@ -407,7 +441,7 @@ void app_main(void)
         display_status.motor_a = a;
         display_status.motor_b = b;
         display_status.motor_d = d;
-        const char *mode = finished ? "END" : avoid_mode_name();
+        const char *mode = (finished || end_braking) ? "END" : avoid_mode_name();
         display_status.mode = mode;
         if (log_elapsed >= LOG_MS) {
             uint8_t raw = raw_levels();
