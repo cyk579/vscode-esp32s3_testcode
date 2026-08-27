@@ -26,12 +26,12 @@
 #define STBY_GPIO GPIO_NUM_8
 
 /* OUT2/OUT3 on black: equal A/D magnitude, B stopped. */
-#define STRAIGHT_A_SPEED 18
-#define STRAIGHT_D_SPEED 18
-#define CURVE_A_SPEED 16
-#define CURVE_D_SPEED 16
+#define STRAIGHT_A_SPEED 30
+#define STRAIGHT_D_SPEED 30
+#define CURVE_A_SPEED 20
+#define CURVE_D_SPEED 20
 #define TURN_MAX 12
-#define MAX_OUTPUT 28
+#define MAX_OUTPUT 30
 #define FILTER_SAMPLES 5U
 #define FILTER_STABLE_CYCLES 2U
 #define TURN_DELAY_CYCLES 3U
@@ -174,6 +174,8 @@ static uint8_t control_mask(void)
     static size_t index = 0;
     uint8_t mask = filtered_mask();
     int current_error = line_error(mask);
+    /* 强偏差通常是急弯，直接采用当前稳定读数，避免前探队列把弯道拖过。 */
+    if (abs(current_error) >= 20) return mask;
     if (mask && current_error == 0) {
         for (size_t i = 0; i < TURN_DELAY_CYCLES; ++i) history[i] = mask;
         index = 0;
