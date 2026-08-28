@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "tcp_server.c"
+idf_component_register(SRCS "main.c" "tcp_server.c" "camera_display.c" "tft_st7735.c"
                     INCLUDE_DIRS ""
                     PRIV_REQUIRES
                         nvs_flash
@@ -9,4 +9,7 @@ idf_component_register(SRCS "main.c" "tcp_server.c"
                         esp_wifi
                         esp_driver_gpio
                         esp_driver_ledc
+                        esp_driver_spi
+                        esp_jpeg
+                        heap
                     )

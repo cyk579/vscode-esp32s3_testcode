@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Unlicense OR CC0-1.0
  */
 #include <stdbool.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
@@ -23,6 +24,8 @@
 #define PORT 2222
 #define CAMERA_AP_SSID "ESP32-CAMERA-TEST"
 #define CAMERA_AP_PASSWORD "camera123"
+#define STREAM_RING_BUFFER_BYTES (128 * 1024)
+#define STREAM_SEND_CHUNK_BYTES 20000
 
 typedef struct {
     int sock;
@@ -67,6 +70,20 @@ static bool accept_client(tcp_server_t *server)
     return true;
 }
 
+static bool send_all(tcp_server_t *server, const char *payload, size_t size)
+{
+    while (size > 0) {
+        int sent = send(server->sock, payload, size, 0);
+        if (sent <= 0) {
+            ESP_LOGE(TAG, "Send failed: errno %d", errno);
+            return false;
+        }
+        payload += sent;
+        size -= (size_t)sent;
+    }
+    return true;
+}
+
 static void sender_task(void *arg)
 {
     tcp_server_t *server = (tcp_server_t *)arg;
@@ -81,13 +98,11 @@ static void sender_task(void *arg)
 
         size_t bytes_received = 0;
         char *payload = (char *)xRingbufferReceiveUpTo(
-            server->buffer, &bytes_received, pdMS_TO_TICKS(2500), 20000);
+            server->buffer, &bytes_received, pdMS_TO_TICKS(2500), STREAM_SEND_CHUNK_BYTES);
 
         if (payload != NULL) {
             if (server->is_active) {
-                const int sent = send(server->sock, payload, bytes_received, 0);
-                if (sent < 0) {
-                    ESP_LOGE(TAG, "Send failed: errno %d", errno);
+                if (!send_all(server, payload, bytes_received)) {
                     server->is_active = false;
                     shutdown(server->sock, 0);
                     close(server->sock);
@@ -192,7 +207,7 @@ esp_err_t tcp_server_wait_for_connection(void)
     if (server == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    server->buffer = xRingbufferCreate(100000, RINGBUF_TYPE_BYTEBUF);
+    server->buffer = xRingbufferCreate(STREAM_RING_BUFFER_BYTES, RINGBUF_TYPE_BYTEBUF);
     if (server->buffer == NULL) {
         free(server);
         return ESP_ERR_NO_MEM;

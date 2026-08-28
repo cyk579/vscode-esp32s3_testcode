@@ -5,6 +5,7 @@
  */
 #include <stdio.h>
 #include <unistd.h>
+#include "camera_display.h"
 #include "esp_log.h"
 #include "tcp_server.h"
 #include "libuvc/libuvc.h"
@@ -106,9 +107,9 @@ typedef struct {
 } uvc_stream_profile_t;
 
 uvc_stream_profile_t uvc_stream_profiles[EXAMPLE_UVC_PROTOCOL_AUTO_COUNT] = {
-    {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, "640x480, fps 15"},
     {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, "320x240, fps 30"},
-    {UVC_FRAME_FORMAT_MJPEG, 320, 240,  0, "320x240, any fps"}
+    {UVC_FRAME_FORMAT_MJPEG, 320, 240,  0, "320x240, any fps"},
+    {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, "640x480, fps 15"}
 };
 #endif // CONFIG_EXAMPLE_UVC_PROTOCOL_MODE_AUTO
 
@@ -218,7 +219,11 @@ void frame_callback(uvc_frame_t *frame, void *ptr)
         fps = 0;
     }
 
-    // Stream received frame to client, if enabled
+    // The display task copies only the newest frame and decodes it outside this
+    // UVC callback, so a slow TFT refresh cannot stall USB reception.
+    camera_display_submit(frame->data, frame->data_bytes);
+
+    // Stream received frame to the PC client, if enabled.
     tcp_server_send(frame->data, frame->data_bytes);
 }
 
@@ -309,6 +314,14 @@ void app_main(void)
     ESP_LOGI(TAG, "Camera test starting");
     ESP_LOGI(TAG, "USB wiring under test: GPIO19=D-, GPIO20=D+");
     ESP_LOGI(TAG, "Camera must also have 5 V VBUS and common GND");
+
+    esp_err_t display_err = camera_display_start();
+    if (display_err == ESP_OK) {
+        ESP_LOGI(TAG, "ST7735 preview ready (160x128 landscape)");
+    } else {
+        ESP_LOGW(TAG, "ST7735 preview unavailable: %s; PC streaming remains available",
+                 esp_err_to_name(display_err));
+    }
 
     // Start the AP first so its presence proves that app_main reached Wi-Fi.
     tcp_server_start_ap();
