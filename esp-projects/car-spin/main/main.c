@@ -69,12 +69,12 @@
 #define OBSTACLE_CLEAR_CM 15.0f
 #define AVOID_BRAKE_MS 180U
 #define AVOID_LATERAL_SPEED 25
-#define AVOID_D_REVERSE_SPEED 8
+#define AVOID_REVERSE_ASSIST_SPEED 8
 #define AVOID_LEFT_MIN_MS 250U
 #define AVOID_LEFT_NO_ECHO_CLEAR_MS 450U
 #define AVOID_LEFT_TIMEOUT_MS 8000U
 #define AVOID_FORWARD_SPEED 21
-#define AVOID_FORWARD_MS 1500U
+#define AVOID_FORWARD_MS 2000U
 #define AVOID_RIGHT_MIN_MS 200U
 #define AVOID_RIGHT_TIMEOUT_MS 8000U
 #define ULTRASONIC_PERIOD_MS 60U
@@ -188,10 +188,18 @@ static void drive_spin(int turn, int *a, int *b, int *d)
 
 static void drive_lateral(int lateral, int *a, int *b, int *d)
 {
-    *a = 0;
     *b = clamp(-lateral, MAX_OUTPUT);
-    *d = -AVOID_D_REVERSE_SPEED;
-    motor_set(&motor_a, *a);
+    if (lateral > 0) {
+        *a = 0;
+        *d = -AVOID_REVERSE_ASSIST_SPEED;
+    } else if (lateral < 0) {
+        *a = AVOID_REVERSE_ASSIST_SPEED;
+        *d = 0;
+    } else {
+        *a = 0;
+        *d = 0;
+    }
+    motor_set_direct(&motor_a, *a);
     motor_set(&motor_b, *b);
     motor_set_direct(&motor_d, *d);
 }
