@@ -49,8 +49,8 @@
 #define PID_SCALE 10
 #define PID_DEADBAND 3
 #define PID_INTEGRAL_LIMIT 30
-#define PID_SMOOTH_NEW_WEIGHT 1  /* PID 输出保留 50% 旧值、50% 新值。 */
-#define PID_SMOOTH_WEIGHT_SUM 2
+#define PID_SMOOTH_NEW_WEIGHT 3  /* PID 输出保留 40% 旧值、60% 新值。 */
+#define PID_SMOOTH_WEIGHT_SUM 5
 #define PID_SMOOTH_BYPASS_ERROR 20
 #define LOOP_MS 10U
 #define LOG_MS 100U
@@ -502,7 +502,7 @@ void app_main(void)
         } else {
             lost_elapsed_ms = 0;
             end_active_ms = 0;
-            last_turn = error < 0 ? 1 : -1;
+            if (abs(error) >= 20) last_turn = error < 0 ? 1 : -1;
             turn = pid_steering(error);
             drive(CURVE_A_SPEED, CURVE_D_SPEED, turn, &a, &b, &d);
         }
