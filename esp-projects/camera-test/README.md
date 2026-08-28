@@ -5,7 +5,7 @@
 1. 判断摄像头 USB `D-`/`D+` 是否连接正确；
 2. 从 UVC 摄像头采集 MJPEG 图像，实时显示在 1.8 英寸 ST7735 屏幕上；
 3. 通过 Wi-Fi 回传到电脑，实时预览并保存第一张有效照片；
-4. 测试 GPIO11、GPIO18 对应的水平和垂直舵机信号。
+4. 测试 GPIO1、GPIO2 对应的水平和垂直舵机信号。
 
 该工程与 `car-spin` 相互独立，不控制电机。
 
@@ -19,8 +19,8 @@ ESP32-S3 原生 USB OTG 的引脚固定如下：
 | GPIO20 | USB D+ | 固定的原生 USB D+ |
 | 5V | VBUS/5V | 摄像头 USB 供电，必须确认电源能力 |
 | GND | GND | 摄像头与 ESP32 共地 |
-| GPIO11 | PAN_SIG | 水平舵机 PWM |
-| GPIO18 | TILT_SIG | 垂直舵机 PWM |
+| GPIO1 | PAN_SIG | 水平舵机 PWM |
+| GPIO2 | TILT_SIG | 垂直舵机 PWM |
 
 摄像头只接 D+/D- 而没有 5 V 和 GND，不会被枚举。MG90S 舵机不要直接由 ESP32 的 3V3 供电；应使用电流足够的 5 V 电源，并与 ESP32 共地。
 

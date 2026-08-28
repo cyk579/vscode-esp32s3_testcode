@@ -25,8 +25,8 @@
 static const char *TAG = "example";
 
 #define USB_DISCONNECT_PIN  GPIO_NUM_0
-#define PAN_SERVO_PIN       GPIO_NUM_11
-#define TILT_SERVO_PIN      GPIO_NUM_18
+#define PAN_SERVO_PIN       GPIO_NUM_1
+#define TILT_SERVO_PIN      GPIO_NUM_2
 #define SERVO_TIMER         LEDC_TIMER_1
 #define SERVO_RESOLUTION    LEDC_TIMER_14_BIT
 #define SERVO_MAX_DUTY      ((1U << 14) - 1U)
