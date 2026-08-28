@@ -38,7 +38,8 @@
 #define LOST_REVERSE_SPEED 13
 #define LOST_TURN 13
 #define LOST_SPIN_MS 320U
-#define MAX_OUTPUT 28
+#define LINE_MAX_OUTPUT 28
+#define MAX_OUTPUT 30
 #define FILTER_SAMPLES 5U
 #define FILTER_STABLE_CYCLES 2U
 #define TURN_DELAY_CYCLES 3U
@@ -66,12 +67,11 @@
 #define ULTRASONIC_MIN_CM 2.0f
 #define ULTRASONIC_MAX_CM 400.0f
 #define OBSTACLE_DETECT_CM 8.0f
-#define OBSTACLE_CLEAR_CM 15.0f
+#define OBSTACLE_CLEAR_CM 100.0f
 #define AVOID_BRAKE_MS 180U
-#define AVOID_LATERAL_SPEED 25
-#define AVOID_REVERSE_ASSIST_SPEED 8
+#define AVOID_LATERAL_SIDE_SPEED 15
+#define AVOID_LATERAL_B_SPEED 30
 #define AVOID_LEFT_MIN_MS 250U
-#define AVOID_LEFT_NO_ECHO_CLEAR_MS 450U
 #define AVOID_LEFT_TIMEOUT_MS 8000U
 #define AVOID_FORWARD_SPEED 21
 #define AVOID_FORWARD_MS 2000U
@@ -110,6 +110,7 @@ static volatile float ultrasonic_distance_cm = -1.0f;
 static volatile ultrasonic_status_t ultrasonic_status = US_NO_ECHO;
 static volatile uint32_t ultrasonic_sequence = 0;
 static volatile avoid_state_t avoid_state = AVOID_LINE;
+static uint8_t latest_sampled_mask = 0;
 
 static int clamp(int value, int limit)
 {
@@ -156,9 +157,9 @@ static void motor_set_direct(const motor_t *motor, int speed)
 
 static void drive(int forward_a, int forward_d, int turn, int *a, int *b, int *d)
 {
-    *a = clamp(-forward_a - turn, MAX_OUTPUT);
-    *b = clamp(turn, MAX_OUTPUT);
-    *d = clamp(forward_d - turn, MAX_OUTPUT);
+    *a = clamp(-forward_a - turn, LINE_MAX_OUTPUT);
+    *b = clamp(turn, LINE_MAX_OUTPUT);
+    *d = clamp(forward_d - turn, LINE_MAX_OUTPUT);
     motor_set(&motor_a, *a);
     motor_set(&motor_b, *b);
     motor_set(&motor_d, *d);
@@ -178,29 +179,27 @@ static void drive_vector(int forward, int lateral, int turn, int *a, int *b, int
 
 static void drive_spin(int turn, int *a, int *b, int *d)
 {
-    *a = clamp(-turn, MAX_OUTPUT);
-    *b = clamp(turn, MAX_OUTPUT);
-    *d = clamp(-turn, MAX_OUTPUT);
+    *a = clamp(-turn, LINE_MAX_OUTPUT);
+    *b = clamp(turn, LINE_MAX_OUTPUT);
+    *d = clamp(-turn, LINE_MAX_OUTPUT);
     motor_set_direct(&motor_a, *a);
     motor_set_direct(&motor_b, *b);
     motor_set_direct(&motor_d, *d);
 }
 
-static void drive_lateral(int lateral, int *a, int *b, int *d)
+static void drive_lateral(bool left, int *a, int *b, int *d)
 {
-    *b = clamp(-lateral, MAX_OUTPUT);
-    if (lateral > 0) {
-        *a = 0;
-        *d = -AVOID_REVERSE_ASSIST_SPEED;
-    } else if (lateral < 0) {
-        *a = AVOID_REVERSE_ASSIST_SPEED;
-        *d = 0;
+    if (left) {
+        *a = -AVOID_LATERAL_SIDE_SPEED;
+        *b = AVOID_LATERAL_B_SPEED;
+        *d = AVOID_LATERAL_SIDE_SPEED;
     } else {
-        *a = 0;
-        *d = 0;
+        *a = AVOID_LATERAL_SIDE_SPEED;
+        *b = AVOID_LATERAL_B_SPEED;
+        *d = -AVOID_LATERAL_SIDE_SPEED;
     }
     motor_set_direct(&motor_a, *a);
-    motor_set(&motor_b, *b);
+    motor_set_direct(&motor_b, *b);
     motor_set_direct(&motor_d, *d);
 }
 
@@ -307,6 +306,7 @@ static uint8_t filtered_mask(void)
 {
     static uint8_t stable = 0, pending = 0, count = 0;
     uint8_t mask = sample_active_mask();
+    latest_sampled_mask = mask;
     if (mask && line_error(mask) == 0) { count = 0; return stable = mask; }
     if (line_error(mask) * line_error(stable) < 0) {
         if (mask != pending) { pending = mask; count = 1; }
@@ -396,6 +396,10 @@ void app_main(void)
     while (true) {
         uint8_t mask = control_mask();
         int error = line_error(mask);
+        int immediate_error = line_error(latest_sampled_mask);
+        if (avoid_state == AVOID_LINE && abs(immediate_error) >= 20) {
+            last_turn = immediate_error < 0 ? 1 : -1;
+        }
         bool end_raw = raw_all_black();
         float distance = ultrasonic_distance_cm;
         ultrasonic_status_t current_ultrasonic_status = ultrasonic_status;
@@ -429,17 +433,15 @@ void app_main(void)
                 ESP_LOGI(TAG, "AVOID LEFT start");
             }
         } else if (avoid_state == AVOID_LEFT) {
-            drive_lateral(AVOID_LATERAL_SPEED, &a, &b, &d);
+            drive_lateral(true, &a, &b, &d);
             turn = pid_steering(0);
             bool far_clear = ultrasonic_new && ultrasonic_valid && distance >= OBSTACLE_CLEAR_CM;
-            bool no_echo_clear = ultrasonic_new && current_ultrasonic_status == US_NO_ECHO &&
-                                 avoid_elapsed >= AVOID_LEFT_NO_ECHO_CLEAR_MS;
-            if (avoid_elapsed >= AVOID_LEFT_MIN_MS && (far_clear || no_echo_clear)) {
+            if (avoid_elapsed >= AVOID_LEFT_MIN_MS && far_clear) {
                 left_shift_ms = avoid_elapsed;
                 avoid_state = AVOID_FORWARD;
                 avoid_elapsed = 0;
-                ESP_LOGI(TAG, "LEFT done time=%lums clear=%d noecho=%d",
-                         (unsigned long)left_shift_ms, far_clear, no_echo_clear);
+                ESP_LOGI(TAG, "LEFT done time=%lums clear=%d",
+                         (unsigned long)left_shift_ms, far_clear);
             } else if (avoid_elapsed >= AVOID_LEFT_TIMEOUT_MS) {
                 avoid_state = AVOID_FAIL_STOP;
                 ESP_LOGE(TAG, "LEFT timeout -> FAIL STOP");
@@ -453,7 +455,7 @@ void app_main(void)
                 ESP_LOGI(TAG, "AVOID RIGHT start left=%lums", (unsigned long)left_shift_ms);
             }
         } else if (avoid_state == AVOID_RIGHT) {
-            drive_lateral(-AVOID_LATERAL_SPEED, &a, &b, &d);
+            drive_lateral(false, &a, &b, &d);
             turn = pid_steering(0);
             bool centered = mask == CENTER_MASK;
             bool matched_time = left_shift_ms > 0U && avoid_elapsed >= left_shift_ms;
