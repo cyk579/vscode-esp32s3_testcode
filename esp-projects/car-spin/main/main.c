@@ -78,12 +78,13 @@
 #define AVOID_ALIGN_TIMEOUT_MS 2000U
 #define AVOID_LEFT_SIDE_SPEED 18
 #define AVOID_LEFT_B_SPEED 25
-#define AVOID_RIGHT_A_SPEED 25
+#define AVOID_RIGHT_A_SPEED 15
 #define AVOID_RIGHT_B_SPEED 25
-#define AVOID_RIGHT_D_SPEED 18
+#define AVOID_RIGHT_D_SPEED 20
 #define AVOID_LEFT_MIN_MS 250U
 #define AVOID_LEFT_TIMEOUT_MS 6000U
-#define AVOID_FORWARD_SPEED 25
+#define AVOID_FORWARD_A_SPEED 25
+#define AVOID_FORWARD_D_SPEED 20
 #define AVOID_FORWARD_MS 1800U
 #define AVOID_RIGHT_MIN_MS 200U
 #define AVOID_RIGHT_CENTER_CONFIRM_CYCLES 2U
@@ -183,18 +184,6 @@ static void drive(int forward_a, int forward_d, int turn, int *a, int *b, int *d
     motor_set(&motor_d, *d);
 }
 
-/* 三轮全向底盘横移混控：A/D 为半幅，B 为全幅。 */
-static void drive_vector(int forward, int lateral, int turn, int *a, int *b, int *d)
-{
-    int half_lateral = lateral / 2;
-    *a = clamp(-forward + half_lateral + turn, MAX_OUTPUT);
-    *b = clamp(-lateral + turn, MAX_OUTPUT);
-    *d = clamp(forward + half_lateral + turn, MAX_OUTPUT);
-    motor_set(&motor_a, *a);
-    motor_set(&motor_b, *b);
-    motor_set(&motor_d, *d);
-}
-
 static void drive_spin(int direction, int *a, int *b, int *d)
 {
     *a = clamp(-direction * LOST_TURN, LINE_MAX_OUTPUT);
@@ -226,6 +215,16 @@ static void drive_lateral(bool left, int *a, int *b, int *d)
         *b = AVOID_RIGHT_B_SPEED;
         *d = AVOID_RIGHT_D_SPEED;
     }
+    motor_set(&motor_a, *a);
+    motor_set(&motor_b, *b);
+    motor_set(&motor_d, *d);
+}
+
+static void drive_avoid_forward(int *a, int *b, int *d)
+{
+    *a = AVOID_FORWARD_A_SPEED;
+    *b = 0;
+    *d = AVOID_FORWARD_D_SPEED;
     motor_set(&motor_a, *a);
     motor_set(&motor_b, *b);
     motor_set(&motor_d, *d);
@@ -534,7 +533,7 @@ void app_main(void)
                 ESP_LOGE(TAG, "LEFT timeout -> FAIL STOP");
             }
         } else if (avoid_state == AVOID_FORWARD) {
-            drive_vector(AVOID_FORWARD_SPEED, 0, 0, &a, &b, &d);
+            drive_avoid_forward(&a, &b, &d);
             turn = pid_steering(0);
             if (avoid_elapsed >= AVOID_FORWARD_MS) {
                 avoid_state = AVOID_RIGHT;
