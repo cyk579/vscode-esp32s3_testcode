@@ -59,6 +59,8 @@
 #define LOG_MS 100U
 #define START_DELAY_MS 2000U
 #define PWM_MAX 1023U
+#define MOTOR_MIN_RUN_OUTPUT 8
+#define MOTOR_B_MIN_RUN_OUTPUT 10
 #define START_KICK_OUTPUT 29
 #define START_KICK_CYCLES 8U
 #define MOTOR_A_SIGN 1
@@ -74,9 +76,10 @@
 #define AVOID_BRAKE_MS 180U
 #define AVOID_LEFT_SIDE_SPEED 18
 #define AVOID_LEFT_B_SPEED 25
-#define AVOID_RIGHT_SPEED 20
+#define AVOID_RIGHT_A_SPEED 18
+#define AVOID_RIGHT_B_SPEED 20
+#define AVOID_RIGHT_D_SPEED 22
 #define AVOID_LEFT_MIN_MS 250U
-#define AVOID_LEFT_AFTER_CLEAR_MS 1000U
 #define AVOID_LEFT_TIMEOUT_MS 8000U
 #define AVOID_FORWARD_SPEED 22
 #define AVOID_FORWARD_MS 3000U
@@ -131,14 +134,20 @@ static void motor_set_impl(const motor_t *motor, int speed, bool enable_kick)
     speed = clamp(speed * motor->sign, MAX_OUTPUT);
     int index = (int)motor->channel;
     int direction = (speed > 0) - (speed < 0);
+    bool direction_changed = direction != last_direction[index];
     if (!enable_kick || direction == 0) kick_cycles[index] = 0;
-    else if (direction != last_direction[index]) kick_cycles[index] = START_KICK_CYCLES;
-    last_direction[index] = direction;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, motor->channel, 0);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, motor->channel);
-    gpio_set_level(motor->in1, speed > 0);
-    gpio_set_level(motor->in2, speed < 0);
+    else if (direction_changed) kick_cycles[index] = START_KICK_CYCLES;
+    if (direction_changed) {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, motor->channel, 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, motor->channel);
+        gpio_set_level(motor->in1, speed > 0);
+        gpio_set_level(motor->in2, speed < 0);
+        last_direction[index] = direction;
+    }
     int output = abs(speed);
+    int minimum_output = motor->channel == LEDC_CHANNEL_1 ?
+                         MOTOR_B_MIN_RUN_OUTPUT : MOTOR_MIN_RUN_OUTPUT;
+    if (output > 0 && output < minimum_output) output = minimum_output;
     if (enable_kick && kick_cycles[index] &&
         (motor->channel != LEDC_CHANNEL_1 || output > TURN_MAX) &&
         output < START_KICK_OUTPUT) {
@@ -199,9 +208,9 @@ static void drive_lateral(bool left, int *a, int *b, int *d)
         *b = -AVOID_LEFT_B_SPEED;
         *d = -AVOID_LEFT_SIDE_SPEED;
     } else {
-        *a = AVOID_RIGHT_SPEED;
-        *b = AVOID_RIGHT_SPEED;
-        *d = AVOID_RIGHT_SPEED;
+        *a = AVOID_RIGHT_A_SPEED;
+        *b = AVOID_RIGHT_B_SPEED;
+        *d = AVOID_RIGHT_D_SPEED;
     }
     motor_set_direct(&motor_a, *a);
     motor_set_direct(&motor_b, *b);
@@ -421,13 +430,11 @@ void app_main(void)
     uint32_t log_elapsed = LOG_MS;
     uint32_t avoid_elapsed = 0;
     uint32_t left_shift_ms = 0;
-    uint32_t left_clear_start_ms = 0;
     uint32_t end_active_ms = 0;
     uint32_t lost_elapsed_ms = 0;
     uint32_t last_ultrasonic_sequence = 0;
     bool line_seen = false;
     bool end_armed = false;
-    bool left_clear_started = false;
     drive(0, 0, 0, &a, &b, &d);
     vTaskDelay(pdMS_TO_TICKS(START_DELAY_MS));
     while (true) {
@@ -458,8 +465,6 @@ void app_main(void)
             turn = pid_steering(0);
             avoid_elapsed = 0;
             lost_elapsed_ms = 0;
-            left_clear_started = false;
-            left_clear_start_ms = 0;
             avoid_state = FULL_RUN_ENABLE ? AVOID_BRAKE : AVOID_DISTANCE_STOP;
             ESP_LOGW(TAG, "BREAKPOINT 10CM dist=%.1fcm FULL_RUN=%d",
                      (double)distance, FULL_RUN_ENABLE);
@@ -475,28 +480,19 @@ void app_main(void)
             if (avoid_elapsed >= AVOID_BRAKE_MS) {
                 avoid_state = AVOID_LEFT;
                 avoid_elapsed = 0;
-                left_clear_started = false;
-                left_clear_start_ms = 0;
                 ESP_LOGI(TAG, "AVOID LEFT start");
             }
         } else if (avoid_state == AVOID_LEFT) {
             drive_lateral(true, &a, &b, &d);
             turn = pid_steering(0);
             bool far_clear = ultrasonic_new && ultrasonic_valid && distance > OBSTACLE_CLEAR_CM;
-            if (!left_clear_started && avoid_elapsed >= AVOID_LEFT_MIN_MS && far_clear) {
-                left_clear_started = true;
-                left_clear_start_ms = avoid_elapsed;
-                ESP_LOGI(TAG, "LEFT clear; continue for %lums",
-                         (unsigned long)AVOID_LEFT_AFTER_CLEAR_MS);
-            }
-            if (left_clear_started &&
-                avoid_elapsed - left_clear_start_ms >= AVOID_LEFT_AFTER_CLEAR_MS) {
+            if (avoid_elapsed >= AVOID_LEFT_MIN_MS && far_clear) {
                 left_shift_ms = avoid_elapsed;
                 avoid_state = AVOID_FORWARD;
                 avoid_elapsed = 0;
-                ESP_LOGI(TAG, "LEFT done time=%lums",
-                         (unsigned long)left_shift_ms);
-            } else if (!left_clear_started && avoid_elapsed >= AVOID_LEFT_TIMEOUT_MS) {
+                ESP_LOGI(TAG, "LEFT done time=%lums clear=%d",
+                         (unsigned long)left_shift_ms, far_clear);
+            } else if (avoid_elapsed >= AVOID_LEFT_TIMEOUT_MS) {
                 avoid_state = AVOID_FAIL_STOP;
                 ESP_LOGE(TAG, "LEFT timeout -> FAIL STOP");
             }
