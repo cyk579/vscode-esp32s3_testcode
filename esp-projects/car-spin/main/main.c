@@ -30,17 +30,17 @@
 #define STBY_GPIO GPIO_NUM_8
 
 /* OUT2/OUT3 on black: equal A/D magnitude, B stopped. */
-#define STRAIGHT_A_SPEED 28
-#define STRAIGHT_D_SPEED 28
-#define CURVE_A_SPEED 18
-#define CURVE_D_SPEED 18
-#define TURN_MAX 15
-#define LOST_REVERSE_SPEED 13
-#define LOST_TURN 13
-#define LOST_SPIN_B_SPEED 12
+#define STRAIGHT_A_SPEED 29
+#define STRAIGHT_D_SPEED 29
+#define CURVE_A_SPEED 19
+#define CURVE_D_SPEED 19
+#define TURN_MAX 16
+#define LOST_REVERSE_SPEED 14
+#define LOST_TURN 14
+#define LOST_SPIN_B_SPEED 13
 #define LOST_SPIN_MS 320U
-#define LINE_MAX_OUTPUT 28
-#define MAX_OUTPUT 30
+#define LINE_MAX_OUTPUT 29
+#define MAX_OUTPUT 31
 #define FILTER_SAMPLES 5U
 #define FILTER_STABLE_CYCLES 2U
 #define TURN_DELAY_CYCLES 3U
@@ -50,8 +50,8 @@
 #define PID_SCALE 10
 #define PID_DEADBAND 3
 #define PID_INTEGRAL_LIMIT 30
-#define PID_SMOOTH_NEW_WEIGHT 7  /* PID 输出保留 30% 旧值、70% 新值。 */
-#define PID_SMOOTH_WEIGHT_SUM 10
+#define PID_SMOOTH_NEW_WEIGHT 3  /* PID 输出保留 40% 旧值、60% 新值。 */
+#define PID_SMOOTH_WEIGHT_SUM 5
 #define PID_SMOOTH_BYPASS_ERROR 20
 #define TURN_MEMORY_STRONG_ERROR 20
 #define TURN_MEMORY_CONFIRM_CYCLES 2U
@@ -59,7 +59,7 @@
 #define LOG_MS 100U
 #define START_DELAY_MS 2000U
 #define PWM_MAX 1023U
-#define START_KICK_OUTPUT 28
+#define START_KICK_OUTPUT 29
 #define START_KICK_CYCLES 8U
 #define MOTOR_A_SIGN 1
 #define MOTOR_B_SIGN 1
@@ -72,13 +72,12 @@
 #define OBSTACLE_DETECT_CM 10.0f
 #define OBSTACLE_CLEAR_CM 100.0f
 #define AVOID_BRAKE_MS 180U
-#define AVOID_LATERAL_HIGH_SPEED 18
-#define AVOID_LATERAL_LOW_SPEED 12
-#define AVOID_LATERAL_B_SPEED 30
+#define AVOID_LATERAL_SIDE_SPEED 18
+#define AVOID_LATERAL_B_SPEED 25
 #define AVOID_LEFT_MIN_MS 250U
 #define AVOID_LEFT_AFTER_CLEAR_MS 1000U
 #define AVOID_LEFT_TIMEOUT_MS 8000U
-#define AVOID_FORWARD_SPEED 21
+#define AVOID_FORWARD_SPEED 22
 #define AVOID_FORWARD_MS 3000U
 #define AVOID_RIGHT_MIN_MS 200U
 #define AVOID_RIGHT_TIMEOUT_MS 8000U
@@ -194,15 +193,10 @@ static void drive_spin(int direction, int *a, int *b, int *d)
 
 static void drive_lateral(bool left, int *a, int *b, int *d)
 {
-    if (left) {
-        *a = -AVOID_LATERAL_HIGH_SPEED;
-        *b = -AVOID_LATERAL_B_SPEED;
-        *d = -AVOID_LATERAL_LOW_SPEED;
-    } else {
-        *a = AVOID_LATERAL_LOW_SPEED;
-        *b = AVOID_LATERAL_B_SPEED;
-        *d = AVOID_LATERAL_HIGH_SPEED;
-    }
+    int direction = left ? -1 : 1;
+    *a = direction * AVOID_LATERAL_SIDE_SPEED;
+    *b = direction * AVOID_LATERAL_B_SPEED;
+    *d = direction * AVOID_LATERAL_SIDE_SPEED;
     motor_set_direct(&motor_a, *a);
     motor_set_direct(&motor_b, *b);
     motor_set_direct(&motor_d, *d);
