@@ -30,17 +30,17 @@
 #define STBY_GPIO GPIO_NUM_8
 
 /* OUT2/OUT3 on black: equal A/D magnitude, B stopped. */
-#define STRAIGHT_A_SPEED 30
-#define STRAIGHT_D_SPEED 30
-#define CURVE_A_SPEED 19
-#define CURVE_D_SPEED 19
-#define TURN_MAX 16
-#define LOST_REVERSE_SPEED 14
-#define LOST_TURN 14
-#define LOST_SPIN_B_SPEED 13
+#define STRAIGHT_A_SPEED 33
+#define STRAIGHT_D_SPEED 33
+#define CURVE_A_SPEED 22
+#define CURVE_D_SPEED 22
+#define TURN_MAX 19
+#define LOST_REVERSE_SPEED 17
+#define LOST_TURN 17
+#define LOST_SPIN_B_SPEED 16
 #define LOST_SPIN_MS 320U
-#define LINE_MAX_OUTPUT 29
-#define MAX_OUTPUT 31
+#define LINE_MAX_OUTPUT 33
+#define MAX_OUTPUT 34
 #define FILTER_SAMPLES 5U
 #define FILTER_STABLE_CYCLES 2U
 #define TURN_DELAY_CYCLES 3U
@@ -59,9 +59,9 @@
 #define LOG_MS 100U
 #define START_DELAY_MS 2000U
 #define PWM_MAX 1023U
-#define MOTOR_MIN_RUN_OUTPUT 8
-#define MOTOR_B_MIN_RUN_OUTPUT 10
-#define START_KICK_OUTPUT 29
+#define MOTOR_MIN_RUN_OUTPUT 11
+#define MOTOR_B_MIN_RUN_OUTPUT 13
+#define START_KICK_OUTPUT 32
 #define START_KICK_CYCLES 8U
 #define MOTOR_A_SIGN 1
 #define MOTOR_B_SIGN 1
@@ -73,15 +73,17 @@
 #define ULTRASONIC_MAX_CM 400.0f
 #define OBSTACLE_DETECT_CM 10.0f
 #define OBSTACLE_CLEAR_CM 100.0f
-#define AVOID_BRAKE_MS 180U
+#define AVOID_BRAKE_MS 500U
+#define AVOID_ALIGN_SPEED 13
+#define AVOID_ALIGN_TIMEOUT_MS 2500U
 #define AVOID_LEFT_SIDE_SPEED 18
 #define AVOID_LEFT_B_SPEED 25
 #define AVOID_RIGHT_A_SPEED 18
-#define AVOID_RIGHT_B_SPEED 20
-#define AVOID_RIGHT_D_SPEED 22
+#define AVOID_RIGHT_B_SPEED 25
+#define AVOID_RIGHT_D_SPEED 18
 #define AVOID_LEFT_MIN_MS 250U
 #define AVOID_LEFT_TIMEOUT_MS 8000U
-#define AVOID_FORWARD_SPEED 22
+#define AVOID_FORWARD_SPEED 25
 #define AVOID_FORWARD_MS 3000U
 #define AVOID_RIGHT_MIN_MS 200U
 #define AVOID_RIGHT_TIMEOUT_MS 8000U
@@ -106,6 +108,7 @@ typedef enum { US_OK, US_NO_ECHO, US_ECHO_HIGH, US_OUT_OF_RANGE } ultrasonic_sta
 typedef enum {
     AVOID_LINE,
     AVOID_BRAKE,
+    AVOID_ALIGN,
     AVOID_LEFT,
     AVOID_FORWARD,
     AVOID_RIGHT,
@@ -201,6 +204,16 @@ static void drive_spin(int direction, int *a, int *b, int *d)
     motor_set_direct(&motor_d, *d);
 }
 
+static void drive_align(int direction, int *a, int *b, int *d)
+{
+    *a = -direction * AVOID_ALIGN_SPEED;
+    *b = direction * AVOID_ALIGN_SPEED;
+    *d = -direction * AVOID_ALIGN_SPEED;
+    motor_set_direct(&motor_a, *a);
+    motor_set_direct(&motor_b, *b);
+    motor_set_direct(&motor_d, *d);
+}
+
 static void drive_lateral(bool left, int *a, int *b, int *d)
 {
     if (left) {
@@ -212,9 +225,9 @@ static void drive_lateral(bool left, int *a, int *b, int *d)
         *b = AVOID_RIGHT_B_SPEED;
         *d = AVOID_RIGHT_D_SPEED;
     }
-    motor_set_direct(&motor_a, *a);
-    motor_set_direct(&motor_b, *b);
-    motor_set_direct(&motor_d, *d);
+    motor_set(&motor_a, *a);
+    motor_set(&motor_b, *b);
+    motor_set(&motor_d, *d);
 }
 
 static void hardware_init(void)
@@ -248,7 +261,8 @@ static void hardware_init(void)
 static const char *avoid_mode_name(void)
 {
     switch (avoid_state) {
-    case AVOID_BRAKE:
+    case AVOID_BRAKE: return "WAIT";
+    case AVOID_ALIGN: return "ALIGN";
     case AVOID_LEFT: return "AVOID-L";
     case AVOID_FORWARD: return "AVOID-F";
     case AVOID_RIGHT: return "AVOID-R";
@@ -478,9 +492,30 @@ void app_main(void)
             drive(0, 0, 0, &a, &b, &d);
             turn = pid_steering(0);
             if (avoid_elapsed >= AVOID_BRAKE_MS) {
+                avoid_state = AVOID_ALIGN;
+                avoid_elapsed = 0;
+                ESP_LOGI(TAG, "WAIT done; align ACTIVE to 0110");
+            }
+        } else if (avoid_state == AVOID_ALIGN) {
+            uint8_t align_mask = latest_sampled_mask;
+            if (align_mask == CENTER_MASK) {
+                drive(0, 0, 0, &a, &b, &d);
+                turn = pid_steering(0);
                 avoid_state = AVOID_LEFT;
                 avoid_elapsed = 0;
-                ESP_LOGI(TAG, "AVOID LEFT start");
+                ESP_LOGI(TAG, "ALIGN 0110; AVOID LEFT start");
+            } else if (avoid_elapsed >= AVOID_ALIGN_TIMEOUT_MS) {
+                drive(0, 0, 0, &a, &b, &d);
+                turn = pid_steering(0);
+                avoid_state = AVOID_FAIL_STOP;
+                ESP_LOGE(TAG, "ALIGN timeout -> FAIL STOP");
+            } else {
+                int align_error = line_error(align_mask);
+                int align_direction = align_error < 0 ? 1 :
+                                      (align_error > 0 ? -1 : last_turn);
+                turn = align_direction * AVOID_ALIGN_SPEED;
+                pid_steering(0);
+                drive_align(align_direction, &a, &b, &d);
             }
         } else if (avoid_state == AVOID_LEFT) {
             drive_lateral(true, &a, &b, &d);
@@ -577,7 +612,8 @@ void app_main(void)
             log_elapsed = 0;
         }
         log_elapsed += LOOP_MS;
-        if (avoid_state == AVOID_BRAKE || avoid_state == AVOID_LEFT ||
+        if (avoid_state == AVOID_BRAKE || avoid_state == AVOID_ALIGN ||
+            avoid_state == AVOID_LEFT ||
             avoid_state == AVOID_FORWARD || avoid_state == AVOID_RIGHT) {
             avoid_elapsed += LOOP_MS;
         }
