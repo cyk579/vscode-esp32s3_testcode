@@ -71,20 +71,21 @@
 #define ULTRASONIC_ECHO GPIO_NUM_11
 #define ULTRASONIC_MIN_CM 2.0f
 #define ULTRASONIC_MAX_CM 400.0f
-#define OBSTACLE_DETECT_CM 10.0f
-#define OBSTACLE_CLEAR_CM 80.0f
+#define OBSTACLE_DETECT_CM 13.0f
+#define OBSTACLE_CLEAR_CM 70.0f
+#define AVOID_LEFT_CLEAR_HOLD_MS 500U
 #define AVOID_BRAKE_MS 500U
 #define AVOID_ALIGN_SPEED 13
 #define AVOID_ALIGN_TIMEOUT_MS 2000U
 #define AVOID_LEFT_SIDE_SPEED 18
 #define AVOID_LEFT_B_SPEED 25
-#define AVOID_RIGHT_A_SPEED 18
-#define AVOID_RIGHT_B_SPEED 25
+#define AVOID_RIGHT_A_SPEED 15
+#define AVOID_RIGHT_B_SPEED 30
 #define AVOID_RIGHT_D_SPEED 18
 #define AVOID_LEFT_MIN_MS 250U
-#define AVOID_LEFT_TIMEOUT_MS 6000U
-#define AVOID_FORWARD_A_SPEED 22
-#define AVOID_FORWARD_D_SPEED 25
+#define AVOID_LEFT_TIMEOUT_MS 2000U
+#define AVOID_FORWARD_A_SPEED 21
+#define AVOID_FORWARD_D_SPEED 26
 #define AVOID_FORWARD_MS 1800U
 #define AVOID_RIGHT_MIN_MS 200U
 #define AVOID_RIGHT_CENTER_CONFIRM_CYCLES 2U
@@ -445,6 +446,7 @@ void app_main(void)
     uint32_t log_elapsed = LOG_MS;
     uint32_t avoid_elapsed = 0;
     uint32_t left_shift_ms = 0;
+    uint32_t left_clear_start_ms = 0;
     uint32_t end_active_ms = 0;
     uint32_t lost_elapsed_ms = 0;
     uint32_t last_ultrasonic_sequence = 0;
@@ -504,6 +506,7 @@ void app_main(void)
                 turn = pid_steering(0);
                 avoid_state = AVOID_LEFT;
                 avoid_elapsed = 0;
+                left_clear_start_ms = UINT32_MAX;
                 ESP_LOGI(TAG, "ALIGN 0110; AVOID LEFT start");
             } else if (avoid_elapsed >= AVOID_ALIGN_TIMEOUT_MS) {
                 drive(0, 0, 0, &a, &b, &d);
@@ -522,15 +525,17 @@ void app_main(void)
             drive_lateral(true, &a, &b, &d);
             turn = pid_steering(0);
             bool far_clear = ultrasonic_new && ultrasonic_valid && distance > OBSTACLE_CLEAR_CM;
-            if (avoid_elapsed >= AVOID_LEFT_MIN_MS && far_clear) {
+            if (far_clear && left_clear_start_ms == UINT32_MAX) {
+                left_clear_start_ms = avoid_elapsed;
+            }
+            bool clear_hold_done = left_clear_start_ms != UINT32_MAX &&
+                                   avoid_elapsed - left_clear_start_ms >= AVOID_LEFT_CLEAR_HOLD_MS;
+            if (clear_hold_done || avoid_elapsed >= AVOID_LEFT_TIMEOUT_MS) {
                 left_shift_ms = avoid_elapsed;
                 avoid_state = AVOID_FORWARD;
                 avoid_elapsed = 0;
                 ESP_LOGI(TAG, "LEFT done time=%lums clear=%d",
                          (unsigned long)left_shift_ms, far_clear);
-            } else if (avoid_elapsed >= AVOID_LEFT_TIMEOUT_MS) {
-                avoid_state = AVOID_FAIL_STOP;
-                ESP_LOGE(TAG, "LEFT timeout -> FAIL STOP");
             }
         } else if (avoid_state == AVOID_FORWARD) {
             drive_avoid_forward(&a, &b, &d);
