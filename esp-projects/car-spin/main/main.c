@@ -30,15 +30,15 @@
 #define STBY_GPIO GPIO_NUM_8
 
 /* OUT2/OUT3 on black: equal A/D magnitude, B stopped. */
-#define STRAIGHT_A_SPEED 25
-#define STRAIGHT_D_SPEED 25
-#define CURVE_A_SPEED 15
-#define CURVE_D_SPEED 15
-#define TURN_MAX 12
-#define LOST_FORWARD_SPEED 10
-#define LOST_TURN 10
-#define LOST_SEARCH_MS 320U
-#define MAX_OUTPUT 25
+#define STRAIGHT_A_SPEED 28
+#define STRAIGHT_D_SPEED 28
+#define CURVE_A_SPEED 18
+#define CURVE_D_SPEED 18
+#define TURN_MAX 15
+#define LOST_FORWARD_SPEED 13
+#define LOST_TURN 13
+#define LOST_SWEEP_MS 320U
+#define MAX_OUTPUT 28
 #define FILTER_SAMPLES 5U
 #define FILTER_STABLE_CYCLES 2U
 #define TURN_DELAY_CYCLES 3U
@@ -48,14 +48,14 @@
 #define PID_SCALE 10
 #define PID_DEADBAND 3
 #define PID_INTEGRAL_LIMIT 30
-#define PID_SMOOTH_NEW_WEIGHT 1  /* PID 输出保留 75% 旧值、25% 新值。 */
-#define PID_SMOOTH_WEIGHT_SUM 4
+#define PID_SMOOTH_NEW_WEIGHT 3  /* PID 输出保留 40% 旧值、60% 新值。 */
+#define PID_SMOOTH_WEIGHT_SUM 5
 #define PID_SMOOTH_BYPASS_ERROR 20
 #define LOOP_MS 10U
 #define LOG_MS 100U
 #define START_DELAY_MS 2000U
 #define PWM_MAX 1023U
-#define START_KICK_OUTPUT 25
+#define START_KICK_OUTPUT 28
 #define START_KICK_CYCLES 8U
 #define MOTOR_A_SIGN 1
 #define MOTOR_B_SIGN 1
@@ -68,14 +68,15 @@
 #define OBSTACLE_DETECT_CM 7.0f
 #define OBSTACLE_CLEAR_CM 15.0f
 #define AVOID_BRAKE_MS 180U
-#define AVOID_LATERAL_SPEED 22
+#define AVOID_LATERAL_SPEED 25
+#define AVOID_D_LATERAL_BIAS 3
 #define AVOID_LEFT_MIN_MS 250U
 #define AVOID_LEFT_NO_ECHO_CLEAR_MS 450U
-#define AVOID_LEFT_TIMEOUT_MS 1800U
-#define AVOID_FORWARD_SPEED 18
-#define AVOID_FORWARD_MS 750U
+#define AVOID_LEFT_TIMEOUT_MS 4000U
+#define AVOID_FORWARD_SPEED 21
+#define AVOID_FORWARD_MS 1500U
 #define AVOID_RIGHT_MIN_MS 200U
-#define AVOID_RIGHT_TIMEOUT_MS 1800U
+#define AVOID_RIGHT_TIMEOUT_MS 4000U
 #define ULTRASONIC_PERIOD_MS 60U
 #define DISPLAY_PERIOD_MS 100U
 #define END_CONFIRM_MS 30U
@@ -156,9 +157,12 @@ static void drive(int forward_a, int forward_d, int turn, int *a, int *b, int *d
 static void drive_vector(int forward, int lateral, int turn, int *a, int *b, int *d)
 {
     int half_lateral = lateral / 2;
+    int d_lateral = half_lateral;
+    if (d_lateral > 0) d_lateral += AVOID_D_LATERAL_BIAS;
+    else if (d_lateral < 0) d_lateral -= AVOID_D_LATERAL_BIAS;
     *a = clamp(-forward + half_lateral + turn, MAX_OUTPUT);
     *b = clamp(-lateral + turn, MAX_OUTPUT);
-    *d = clamp(forward + half_lateral + turn, MAX_OUTPUT);
+    *d = clamp(forward + d_lateral + turn, MAX_OUTPUT);
     motor_set(&motor_a, *a);
     motor_set(&motor_b, *b);
     motor_set(&motor_d, *d);
@@ -451,13 +455,10 @@ void app_main(void)
             end_active_ms = 0;
             pid_steering(0);
             lost_elapsed_ms += LOOP_MS;
-            if (lost_elapsed_ms <= LOST_SEARCH_MS) {
-                turn = last_turn * LOST_TURN;
-                drive(LOST_FORWARD_SPEED, LOST_FORWARD_SPEED, turn, &a, &b, &d);
-            } else {
-                turn = 0;
-                drive(0, 0, 0, &a, &b, &d);
-            }
+            uint32_t sweep = (lost_elapsed_ms - LOOP_MS) / LOST_SWEEP_MS;
+            int search_direction = (sweep & 1U) ? -last_turn : last_turn;
+            turn = search_direction * LOST_TURN;
+            drive(LOST_FORWARD_SPEED, LOST_FORWARD_SPEED, turn, &a, &b, &d);
         } else {
             lost_elapsed_ms = 0;
             end_active_ms = 0;
