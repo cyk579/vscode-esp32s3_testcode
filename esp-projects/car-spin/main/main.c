@@ -30,15 +30,15 @@
 #define STBY_GPIO GPIO_NUM_8
 
 /* OUT2/OUT3 on black: equal A/D magnitude, B stopped. */
-#define STRAIGHT_A_SPEED 28
-#define STRAIGHT_D_SPEED 28
-#define CURVE_A_SPEED 18
-#define CURVE_D_SPEED 18
-#define TURN_MAX 15
-#define LOST_FORWARD_SPEED 13
-#define LOST_TURN 13
-#define LOST_SWEEP_MS 320U
-#define MAX_OUTPUT 28
+#define STRAIGHT_A_SPEED 27
+#define STRAIGHT_D_SPEED 27
+#define CURVE_A_SPEED 17
+#define CURVE_D_SPEED 17
+#define TURN_MAX 14
+#define LOST_REVERSE_SPEED 12
+#define LOST_TURN 12
+#define LOST_SPIN_MS 320U
+#define MAX_OUTPUT 27
 #define FILTER_SAMPLES 5U
 #define FILTER_STABLE_CYCLES 2U
 #define TURN_DELAY_CYCLES 3U
@@ -55,7 +55,7 @@
 #define LOG_MS 100U
 #define START_DELAY_MS 2000U
 #define PWM_MAX 1023U
-#define START_KICK_OUTPUT 28
+#define START_KICK_OUTPUT 27
 #define START_KICK_CYCLES 8U
 #define MOTOR_A_SIGN 1
 #define MOTOR_B_SIGN 1
@@ -68,12 +68,12 @@
 #define OBSTACLE_DETECT_CM 7.0f
 #define OBSTACLE_CLEAR_CM 15.0f
 #define AVOID_BRAKE_MS 180U
-#define AVOID_LATERAL_SPEED 25
-#define AVOID_D_LATERAL_BIAS 3
+#define AVOID_LATERAL_SPEED 24
+#define AVOID_D_LATERAL_BIAS 2
 #define AVOID_LEFT_MIN_MS 250U
 #define AVOID_LEFT_NO_ECHO_CLEAR_MS 450U
 #define AVOID_LEFT_TIMEOUT_MS 4000U
-#define AVOID_FORWARD_SPEED 21
+#define AVOID_FORWARD_SPEED 20
 #define AVOID_FORWARD_MS 1500U
 #define AVOID_RIGHT_MIN_MS 200U
 #define AVOID_RIGHT_TIMEOUT_MS 4000U
@@ -455,10 +455,12 @@ void app_main(void)
             end_active_ms = 0;
             pid_steering(0);
             lost_elapsed_ms += LOOP_MS;
-            uint32_t sweep = (lost_elapsed_ms - LOOP_MS) / LOST_SWEEP_MS;
-            int search_direction = (sweep & 1U) ? -last_turn : last_turn;
-            turn = search_direction * LOST_TURN;
-            drive(LOST_FORWARD_SPEED, LOST_FORWARD_SPEED, turn, &a, &b, &d);
+            turn = last_turn * LOST_TURN;
+            if (lost_elapsed_ms <= LOST_SPIN_MS) {
+                drive(0, 0, turn, &a, &b, &d);
+            } else {
+                drive(-LOST_REVERSE_SPEED, -LOST_REVERSE_SPEED, turn, &a, &b, &d);
+            }
         } else {
             lost_elapsed_ms = 0;
             end_active_ms = 0;
