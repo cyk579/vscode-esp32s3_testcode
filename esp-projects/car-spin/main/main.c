@@ -78,13 +78,13 @@
 #define AVOID_ALIGN_TIMEOUT_MS 2000U
 #define AVOID_LEFT_SIDE_SPEED 18
 #define AVOID_LEFT_B_SPEED 25
-#define AVOID_RIGHT_A_SPEED 15
+#define AVOID_RIGHT_A_SPEED 18
 #define AVOID_RIGHT_B_SPEED 25
-#define AVOID_RIGHT_D_SPEED 20
+#define AVOID_RIGHT_D_SPEED 18
 #define AVOID_LEFT_MIN_MS 250U
 #define AVOID_LEFT_TIMEOUT_MS 6000U
-#define AVOID_FORWARD_A_SPEED 25
-#define AVOID_FORWARD_D_SPEED 20
+#define AVOID_FORWARD_A_SPEED 22
+#define AVOID_FORWARD_D_SPEED 25
 #define AVOID_FORWARD_MS 1800U
 #define AVOID_RIGHT_MIN_MS 200U
 #define AVOID_RIGHT_CENTER_CONFIRM_CYCLES 2U
@@ -222,7 +222,7 @@ static void drive_lateral(bool left, int *a, int *b, int *d)
 
 static void drive_avoid_forward(int *a, int *b, int *d)
 {
-    *a = AVOID_FORWARD_A_SPEED;
+    *a = -AVOID_FORWARD_A_SPEED;
     *b = 0;
     *d = AVOID_FORWARD_D_SPEED;
     motor_set(&motor_a, *a);
