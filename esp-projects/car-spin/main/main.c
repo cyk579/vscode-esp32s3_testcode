@@ -16,7 +16,7 @@
 #define REVERSE_SENSOR_ORDER 1
 #define CENTER_MASK 0x06U
 
-#define FULL_RUN_ENABLE 1  /* 0: 8 cm 处停车测试；1: 执行完整避障并跑到 END。 */
+#define FULL_RUN_ENABLE 1  /* 0: 10 cm 处停车测试；1: 执行完整避障并跑到 END。 */
 
 #define A_PWM GPIO_NUM_9
 #define A_IN1 GPIO_NUM_12
@@ -37,6 +37,7 @@
 #define TURN_MAX 15
 #define LOST_REVERSE_SPEED 13
 #define LOST_TURN 13
+#define LOST_SPIN_B_SPEED 12
 #define LOST_SPIN_MS 320U
 #define LINE_MAX_OUTPUT 28
 #define MAX_OUTPUT 30
@@ -49,9 +50,11 @@
 #define PID_SCALE 10
 #define PID_DEADBAND 3
 #define PID_INTEGRAL_LIMIT 30
-#define PID_SMOOTH_NEW_WEIGHT 3  /* PID 输出保留 40% 旧值、60% 新值。 */
-#define PID_SMOOTH_WEIGHT_SUM 5
+#define PID_SMOOTH_NEW_WEIGHT 7  /* PID 输出保留 30% 旧值、70% 新值。 */
+#define PID_SMOOTH_WEIGHT_SUM 10
 #define PID_SMOOTH_BYPASS_ERROR 20
+#define TURN_MEMORY_STRONG_ERROR 20
+#define TURN_MEMORY_CONFIRM_CYCLES 2U
 #define LOOP_MS 10U
 #define LOG_MS 100U
 #define START_DELAY_MS 2000U
@@ -66,15 +69,15 @@
 #define ULTRASONIC_ECHO GPIO_NUM_11
 #define ULTRASONIC_MIN_CM 2.0f
 #define ULTRASONIC_MAX_CM 400.0f
-#define OBSTACLE_DETECT_CM 8.0f
+#define OBSTACLE_DETECT_CM 10.0f
 #define OBSTACLE_CLEAR_CM 100.0f
 #define AVOID_BRAKE_MS 180U
-#define AVOID_LATERAL_SIDE_SPEED 10
-#define AVOID_LATERAL_B_SPEED 20
+#define AVOID_LATERAL_SIDE_SPEED 15
+#define AVOID_LATERAL_B_SPEED 30
 #define AVOID_LEFT_MIN_MS 250U
 #define AVOID_LEFT_TIMEOUT_MS 8000U
 #define AVOID_FORWARD_SPEED 21
-#define AVOID_FORWARD_MS 2000U
+#define AVOID_FORWARD_MS 3000U
 #define AVOID_RIGHT_MIN_MS 200U
 #define AVOID_RIGHT_TIMEOUT_MS 8000U
 #define ULTRASONIC_PERIOD_MS 60U
@@ -177,11 +180,11 @@ static void drive_vector(int forward, int lateral, int turn, int *a, int *b, int
     motor_set(&motor_d, *d);
 }
 
-static void drive_spin(int turn, int *a, int *b, int *d)
+static void drive_spin(int direction, int *a, int *b, int *d)
 {
-    *a = clamp(-turn, LINE_MAX_OUTPUT);
-    *b = clamp(turn, LINE_MAX_OUTPUT);
-    *d = clamp(-turn, LINE_MAX_OUTPUT);
+    *a = clamp(-direction * LOST_TURN, LINE_MAX_OUTPUT);
+    *b = clamp(direction * LOST_SPIN_B_SPEED, LINE_MAX_OUTPUT);
+    *d = clamp(-direction * LOST_TURN, LINE_MAX_OUTPUT);
     motor_set_direct(&motor_a, *a);
     motor_set_direct(&motor_b, *b);
     motor_set_direct(&motor_d, *d);
@@ -297,6 +300,34 @@ static int line_error(uint8_t mask)
     return count ? sum * 10 / count : 0;
 }
 
+static void remember_turn(int error, int *last_turn, int *candidate,
+                          uint8_t *candidate_cycles)
+{
+    if (error == 0) {
+        *candidate = 0;
+        *candidate_cycles = 0;
+        return;
+    }
+    int direction = error < 0 ? 1 : -1;
+    if (abs(error) >= TURN_MEMORY_STRONG_ERROR) {
+        *last_turn = direction;
+        *candidate = 0;
+        *candidate_cycles = 0;
+        return;
+    }
+    if (*candidate != direction) {
+        *candidate = direction;
+        *candidate_cycles = 1;
+        return;
+    }
+    if (*candidate_cycles < TURN_MEMORY_CONFIRM_CYCLES) ++*candidate_cycles;
+    if (*candidate_cycles >= TURN_MEMORY_CONFIRM_CYCLES) {
+        *last_turn = direction;
+        *candidate = 0;
+        *candidate_cycles = 0;
+    }
+}
+
 static uint8_t filtered_mask(void)
 {
     static uint8_t stable = 0, pending = 0, count = 0;
@@ -378,6 +409,8 @@ void app_main(void)
     xTaskCreate(display_task, "tft", 4096, NULL, 1, NULL);
     vTaskPrioritySet(NULL, 3);
     int a = 0, b = 0, d = 0, turn = 0, last_turn = -1;
+    int turn_candidate = 0;
+    uint8_t turn_candidate_cycles = 0;
     uint32_t log_elapsed = LOG_MS;
     uint32_t avoid_elapsed = 0;
     uint32_t left_shift_ms = 0;
@@ -392,8 +425,12 @@ void app_main(void)
         uint8_t mask = control_mask();
         int error = line_error(mask);
         int immediate_error = line_error(latest_sampled_mask);
-        if (avoid_state == AVOID_LINE && abs(immediate_error) >= 20) {
-            last_turn = immediate_error < 0 ? 1 : -1;
+        if (avoid_state == AVOID_LINE) {
+            remember_turn(immediate_error, &last_turn, &turn_candidate,
+                          &turn_candidate_cycles);
+        } else {
+            turn_candidate = 0;
+            turn_candidate_cycles = 0;
         }
         bool end_raw = raw_all_black();
         float distance = ultrasonic_distance_cm;
@@ -411,7 +448,7 @@ void app_main(void)
             avoid_elapsed = 0;
             lost_elapsed_ms = 0;
             avoid_state = FULL_RUN_ENABLE ? AVOID_BRAKE : AVOID_DISTANCE_STOP;
-            ESP_LOGW(TAG, "BREAKPOINT 8CM dist=%.1fcm FULL_RUN=%d",
+            ESP_LOGW(TAG, "BREAKPOINT 10CM dist=%.1fcm FULL_RUN=%d",
                      (double)distance, FULL_RUN_ENABLE);
         }
 
@@ -490,14 +527,13 @@ void app_main(void)
             lost_elapsed_ms += LOOP_MS;
             turn = last_turn * LOST_TURN;
             if (lost_elapsed_ms <= LOST_SPIN_MS) {
-                drive_spin(turn, &a, &b, &d);
+                drive_spin(last_turn, &a, &b, &d);
             } else {
                 drive(-LOST_REVERSE_SPEED, -LOST_REVERSE_SPEED, turn, &a, &b, &d);
             }
         } else {
             lost_elapsed_ms = 0;
             end_active_ms = 0;
-            if (abs(error) >= 20) last_turn = error < 0 ? 1 : -1;
             turn = pid_steering(error);
             drive(CURVE_A_SPEED, CURVE_D_SPEED, turn, &a, &b, &d);
         }
