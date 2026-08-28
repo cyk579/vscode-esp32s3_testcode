@@ -86,6 +86,7 @@
 #define AVOID_FORWARD_SPEED 25
 #define AVOID_FORWARD_MS 2500U
 #define AVOID_RIGHT_MIN_MS 200U
+#define AVOID_RIGHT_CENTER_CONFIRM_CYCLES 3U
 #define AVOID_RIGHT_TIMEOUT_MS 6000U
 #define ULTRASONIC_PERIOD_MS 60U
 #define DISPLAY_PERIOD_MS 100U
@@ -441,6 +442,7 @@ void app_main(void)
     int a = 0, b = 0, d = 0, turn = 0, last_turn = -1;
     int turn_candidate = 0;
     uint8_t turn_candidate_cycles = 0;
+    uint8_t right_center_cycles = 0;
     uint32_t log_elapsed = LOG_MS;
     uint32_t avoid_elapsed = 0;
     uint32_t left_shift_ms = 0;
@@ -537,21 +539,27 @@ void app_main(void)
             if (avoid_elapsed >= AVOID_FORWARD_MS) {
                 avoid_state = AVOID_RIGHT;
                 avoid_elapsed = 0;
+                right_center_cycles = 0;
                 ESP_LOGI(TAG, "AVOID RIGHT start left=%lums", (unsigned long)left_shift_ms);
             }
         } else if (avoid_state == AVOID_RIGHT) {
             drive_lateral(false, &a, &b, &d);
             turn = pid_steering(0);
-            bool centered = mask == CENTER_MASK;
-            bool matched_time = left_shift_ms > 0U && avoid_elapsed >= left_shift_ms;
-            if (avoid_elapsed >= AVOID_RIGHT_MIN_MS && (centered || matched_time)) {
+            bool centered = latest_sampled_mask == CENTER_MASK;
+            if (avoid_elapsed < AVOID_RIGHT_MIN_MS || !centered) {
+                right_center_cycles = 0;
+            } else if (right_center_cycles < AVOID_RIGHT_CENTER_CONFIRM_CYCLES) {
+                ++right_center_cycles;
+            }
+            if (right_center_cycles >= AVOID_RIGHT_CENTER_CONFIRM_CYCLES) {
                 avoid_state = AVOID_LINE;
                 end_armed = true;
                 avoid_elapsed = 0;
                 end_active_ms = 0;
                 lost_elapsed_ms = 0;
+                right_center_cycles = 0;
                 turn = pid_steering(0);
-                ESP_LOGI(TAG, "AVOID done; END armed");
+                ESP_LOGI(TAG, "AVOID done; center confirmed; END armed");
             } else if (avoid_elapsed >= AVOID_RIGHT_TIMEOUT_MS) {
                 avoid_state = AVOID_FAIL_STOP;
                 ESP_LOGE(TAG, "RIGHT timeout -> FAIL STOP");
