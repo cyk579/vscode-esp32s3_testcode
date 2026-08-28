@@ -16,7 +16,7 @@
 #define REVERSE_SENSOR_ORDER 1
 #define CENTER_MASK 0x06U
 
-#define FULL_RUN_ENABLE 0  /* 0: 7 cm 处停车测试；1: 执行完整避障并跑到 END。 */
+#define FULL_RUN_ENABLE 1  /* 0: 7 cm 处停车测试；1: 执行完整避障并跑到 END。 */
 
 #define A_PWM GPIO_NUM_9
 #define A_IN1 GPIO_NUM_12
@@ -30,12 +30,15 @@
 #define STBY_GPIO GPIO_NUM_8
 
 /* OUT2/OUT3 on black: equal A/D magnitude, B stopped. */
-#define STRAIGHT_A_SPEED 30
-#define STRAIGHT_D_SPEED 30
-#define CURVE_A_SPEED 20
-#define CURVE_D_SPEED 20
+#define STRAIGHT_A_SPEED 25
+#define STRAIGHT_D_SPEED 25
+#define CURVE_A_SPEED 15
+#define CURVE_D_SPEED 15
 #define TURN_MAX 12
-#define MAX_OUTPUT 30
+#define LOST_FORWARD_SPEED 10
+#define LOST_TURN 10
+#define LOST_SEARCH_MS 320U
+#define MAX_OUTPUT 25
 #define FILTER_SAMPLES 5U
 #define FILTER_STABLE_CYCLES 2U
 #define TURN_DELAY_CYCLES 3U
@@ -45,13 +48,14 @@
 #define PID_SCALE 10
 #define PID_DEADBAND 3
 #define PID_INTEGRAL_LIMIT 30
-#define PID_SMOOTH_NEW_WEIGHT 3  /* PID 输出保留 25% 旧值、75% 新值。 */
+#define PID_SMOOTH_NEW_WEIGHT 1  /* PID 输出保留 75% 旧值、25% 新值。 */
 #define PID_SMOOTH_WEIGHT_SUM 4
+#define PID_SMOOTH_BYPASS_ERROR 20
 #define LOOP_MS 10U
 #define LOG_MS 100U
 #define START_DELAY_MS 2000U
 #define PWM_MAX 1023U
-#define START_KICK_OUTPUT 30
+#define START_KICK_OUTPUT 25
 #define START_KICK_CYCLES 8U
 #define MOTOR_A_SIGN 1
 #define MOTOR_B_SIGN 1
@@ -128,7 +132,10 @@ static void motor_set(const motor_t *motor, int speed)
     gpio_set_level(motor->in1, speed > 0);
     gpio_set_level(motor->in2, speed < 0);
     int output = abs(speed);
-    if (kick_cycles[index] && output < START_KICK_OUTPUT) output = START_KICK_OUTPUT;
+    if (kick_cycles[index] && (motor->channel != LEDC_CHANNEL_1 || output > TURN_MAX) &&
+        output < START_KICK_OUTPUT) {
+        output = START_KICK_OUTPUT;
+    }
     if (kick_cycles[index]) --kick_cycles[index];
     uint32_t duty = PWM_MAX * (uint32_t)output / 100U;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, motor->channel, duty);
@@ -305,7 +312,12 @@ static int pid_steering(int error)
     previous = error;
     int output = -(PID_KP * error + PID_KI * integral + PID_KD * derivative_filtered) / PID_SCALE;
     output = clamp(output, TURN_MAX);
-    output_filtered = (output_filtered + PID_SMOOTH_NEW_WEIGHT * output) / PID_SMOOTH_WEIGHT_SUM;
+    if (abs(error) >= PID_SMOOTH_BYPASS_ERROR) {
+        output_filtered = output;
+        return output;
+    }
+    output_filtered = ((PID_SMOOTH_WEIGHT_SUM - PID_SMOOTH_NEW_WEIGHT) * output_filtered +
+                       PID_SMOOTH_NEW_WEIGHT * output) / PID_SMOOTH_WEIGHT_SUM;
     return output_filtered;
 }
 
@@ -330,11 +342,12 @@ void app_main(void)
     xTaskCreate(ultrasonic_task, "ultrasonic", 2048, NULL, 1, NULL);
     xTaskCreate(display_task, "tft", 4096, NULL, 1, NULL);
     vTaskPrioritySet(NULL, 3);
-    int a = 0, b = 0, d = 0, turn = 0, last_turn = 1;
+    int a = 0, b = 0, d = 0, turn = 0, last_turn = -1;
     uint32_t log_elapsed = LOG_MS;
     uint32_t avoid_elapsed = 0;
     uint32_t left_shift_ms = 0;
     uint32_t end_active_ms = 0;
+    uint32_t lost_elapsed_ms = 0;
     uint32_t last_ultrasonic_sequence = 0;
     bool line_seen = false;
     bool end_armed = false;
@@ -357,6 +370,7 @@ void app_main(void)
             drive(0, 0, 0, &a, &b, &d);
             turn = pid_steering(0);
             avoid_elapsed = 0;
+            lost_elapsed_ms = 0;
             avoid_state = FULL_RUN_ENABLE ? AVOID_BRAKE : AVOID_DISTANCE_STOP;
             ESP_LOGW(TAG, "BREAKPOINT 7CM dist=%.1fcm FULL_RUN=%d",
                      (double)distance, FULL_RUN_ENABLE);
@@ -408,6 +422,7 @@ void app_main(void)
                 end_armed = true;
                 avoid_elapsed = 0;
                 end_active_ms = 0;
+                lost_elapsed_ms = 0;
                 turn = pid_steering(0);
                 ESP_LOGI(TAG, "AVOID done; END armed");
             } else if (avoid_elapsed >= AVOID_RIGHT_TIMEOUT_MS) {
@@ -415,9 +430,11 @@ void app_main(void)
                 ESP_LOGE(TAG, "RIGHT timeout -> FAIL STOP");
             }
         } else if (!line_seen) {
+            lost_elapsed_ms = 0;
             turn = pid_steering(0);
             drive(0, 0, 0, &a, &b, &d);
         } else if (end_armed && end_raw) {
+            lost_elapsed_ms = 0;
             end_active_ms += LOOP_MS;
             turn = pid_steering(0);
             drive(0, 0, 0, &a, &b, &d);
@@ -426,15 +443,23 @@ void app_main(void)
                 ESP_LOGW(TAG, "END confirmed");
             }
         } else if (mask == CENTER_MASK || mask == 0x0FU || (mask && error == 0)) {
+            lost_elapsed_ms = 0;
             end_active_ms = 0;
             turn = pid_steering(0);
             drive(STRAIGHT_A_SPEED, STRAIGHT_D_SPEED, 0, &a, &b, &d);
         } else if (mask == 0) {
             end_active_ms = 0;
             pid_steering(0);
-            turn = last_turn * TURN_MAX;
-            drive(0, 0, turn, &a, &b, &d);
+            lost_elapsed_ms += LOOP_MS;
+            if (lost_elapsed_ms <= LOST_SEARCH_MS) {
+                turn = last_turn * LOST_TURN;
+                drive(LOST_FORWARD_SPEED, LOST_FORWARD_SPEED, turn, &a, &b, &d);
+            } else {
+                turn = 0;
+                drive(0, 0, 0, &a, &b, &d);
+            }
         } else {
+            lost_elapsed_ms = 0;
             end_active_ms = 0;
             last_turn = error < 0 ? 1 : -1;
             turn = pid_steering(error);
