@@ -69,13 +69,14 @@
 #define OBSTACLE_CLEAR_CM 15.0f
 #define AVOID_BRAKE_MS 180U
 #define AVOID_LATERAL_SPEED 25
+#define AVOID_D_REVERSE_SPEED 8
 #define AVOID_LEFT_MIN_MS 250U
 #define AVOID_LEFT_NO_ECHO_CLEAR_MS 450U
-#define AVOID_LEFT_TIMEOUT_MS 4000U
+#define AVOID_LEFT_TIMEOUT_MS 8000U
 #define AVOID_FORWARD_SPEED 21
 #define AVOID_FORWARD_MS 1500U
 #define AVOID_RIGHT_MIN_MS 200U
-#define AVOID_RIGHT_TIMEOUT_MS 4000U
+#define AVOID_RIGHT_TIMEOUT_MS 8000U
 #define ULTRASONIC_PERIOD_MS 60U
 #define DISPLAY_PERIOD_MS 100U
 #define END_CONFIRM_MS 30U
@@ -117,14 +118,14 @@ static int clamp(int value, int limit)
     return value;
 }
 
-static void motor_set(const motor_t *motor, int speed)
+static void motor_set_impl(const motor_t *motor, int speed, bool enable_kick)
 {
     static int last_direction[3] = {0};
     static uint8_t kick_cycles[3] = {0};
     speed = clamp(speed * motor->sign, MAX_OUTPUT);
     int index = (int)motor->channel;
     int direction = (speed > 0) - (speed < 0);
-    if (direction == 0) kick_cycles[index] = 0;
+    if (!enable_kick || direction == 0) kick_cycles[index] = 0;
     else if (direction != last_direction[index]) kick_cycles[index] = START_KICK_CYCLES;
     last_direction[index] = direction;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, motor->channel, 0);
@@ -132,7 +133,8 @@ static void motor_set(const motor_t *motor, int speed)
     gpio_set_level(motor->in1, speed > 0);
     gpio_set_level(motor->in2, speed < 0);
     int output = abs(speed);
-    if (kick_cycles[index] && (motor->channel != LEDC_CHANNEL_1 || output > TURN_MAX) &&
+    if (enable_kick && kick_cycles[index] &&
+        (motor->channel != LEDC_CHANNEL_1 || output > TURN_MAX) &&
         output < START_KICK_OUTPUT) {
         output = START_KICK_OUTPUT;
     }
@@ -140,6 +142,16 @@ static void motor_set(const motor_t *motor, int speed)
     uint32_t duty = PWM_MAX * (uint32_t)output / 100U;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, motor->channel, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, motor->channel);
+}
+
+static void motor_set(const motor_t *motor, int speed)
+{
+    motor_set_impl(motor, speed, true);
+}
+
+static void motor_set_direct(const motor_t *motor, int speed)
+{
+    motor_set_impl(motor, speed, false);
 }
 
 static void drive(int forward_a, int forward_d, int turn, int *a, int *b, int *d)
@@ -164,14 +176,24 @@ static void drive_vector(int forward, int lateral, int turn, int *a, int *b, int
     motor_set(&motor_d, *d);
 }
 
-static void drive_lateral_b(int lateral, int *a, int *b, int *d)
+static void drive_spin(int turn, int *a, int *b, int *d)
+{
+    *a = clamp(-turn, MAX_OUTPUT);
+    *b = clamp(turn, MAX_OUTPUT);
+    *d = clamp(-turn, MAX_OUTPUT);
+    motor_set_direct(&motor_a, *a);
+    motor_set_direct(&motor_b, *b);
+    motor_set_direct(&motor_d, *d);
+}
+
+static void drive_lateral(int lateral, int *a, int *b, int *d)
 {
     *a = 0;
     *b = clamp(-lateral, MAX_OUTPUT);
-    *d = 0;
+    *d = -AVOID_D_REVERSE_SPEED;
     motor_set(&motor_a, *a);
     motor_set(&motor_b, *b);
-    motor_set(&motor_d, *d);
+    motor_set_direct(&motor_d, *d);
 }
 
 static void hardware_init(void)
@@ -399,7 +421,7 @@ void app_main(void)
                 ESP_LOGI(TAG, "AVOID LEFT start");
             }
         } else if (avoid_state == AVOID_LEFT) {
-            drive_lateral_b(AVOID_LATERAL_SPEED, &a, &b, &d);
+            drive_lateral(AVOID_LATERAL_SPEED, &a, &b, &d);
             turn = pid_steering(0);
             bool far_clear = ultrasonic_new && ultrasonic_valid && distance >= OBSTACLE_CLEAR_CM;
             bool no_echo_clear = ultrasonic_new && current_ultrasonic_status == US_NO_ECHO &&
@@ -423,7 +445,7 @@ void app_main(void)
                 ESP_LOGI(TAG, "AVOID RIGHT start left=%lums", (unsigned long)left_shift_ms);
             }
         } else if (avoid_state == AVOID_RIGHT) {
-            drive_lateral_b(-AVOID_LATERAL_SPEED, &a, &b, &d);
+            drive_lateral(-AVOID_LATERAL_SPEED, &a, &b, &d);
             turn = pid_steering(0);
             bool centered = mask == CENTER_MASK;
             bool matched_time = left_shift_ms > 0U && avoid_elapsed >= left_shift_ms;
@@ -463,7 +485,7 @@ void app_main(void)
             lost_elapsed_ms += LOOP_MS;
             turn = last_turn * LOST_TURN;
             if (lost_elapsed_ms <= LOST_SPIN_MS) {
-                drive(0, 0, turn, &a, &b, &d);
+                drive_spin(turn, &a, &b, &d);
             } else {
                 drive(-LOST_REVERSE_SPEED, -LOST_REVERSE_SPEED, turn, &a, &b, &d);
             }
