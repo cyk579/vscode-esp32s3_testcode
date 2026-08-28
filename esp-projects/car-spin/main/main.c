@@ -16,7 +16,7 @@
 #define REVERSE_SENSOR_ORDER 1
 #define CENTER_MASK 0x06U
 
-#define FULL_RUN_ENABLE 1  /* 0: 7 cm 处停车测试；1: 执行完整避障并跑到 END。 */
+#define FULL_RUN_ENABLE 1  /* 0: 8 cm 处停车测试；1: 执行完整避障并跑到 END。 */
 
 #define A_PWM GPIO_NUM_9
 #define A_IN1 GPIO_NUM_12
@@ -30,15 +30,15 @@
 #define STBY_GPIO GPIO_NUM_8
 
 /* OUT2/OUT3 on black: equal A/D magnitude, B stopped. */
-#define STRAIGHT_A_SPEED 27
-#define STRAIGHT_D_SPEED 27
-#define CURVE_A_SPEED 17
-#define CURVE_D_SPEED 17
-#define TURN_MAX 14
-#define LOST_REVERSE_SPEED 12
-#define LOST_TURN 12
+#define STRAIGHT_A_SPEED 28
+#define STRAIGHT_D_SPEED 28
+#define CURVE_A_SPEED 18
+#define CURVE_D_SPEED 18
+#define TURN_MAX 15
+#define LOST_REVERSE_SPEED 13
+#define LOST_TURN 13
 #define LOST_SPIN_MS 320U
-#define MAX_OUTPUT 27
+#define MAX_OUTPUT 28
 #define FILTER_SAMPLES 5U
 #define FILTER_STABLE_CYCLES 2U
 #define TURN_DELAY_CYCLES 3U
@@ -48,14 +48,14 @@
 #define PID_SCALE 10
 #define PID_DEADBAND 3
 #define PID_INTEGRAL_LIMIT 30
-#define PID_SMOOTH_NEW_WEIGHT 3  /* PID 输出保留 40% 旧值、60% 新值。 */
-#define PID_SMOOTH_WEIGHT_SUM 5
+#define PID_SMOOTH_NEW_WEIGHT 1  /* PID 输出保留 50% 旧值、50% 新值。 */
+#define PID_SMOOTH_WEIGHT_SUM 2
 #define PID_SMOOTH_BYPASS_ERROR 20
 #define LOOP_MS 10U
 #define LOG_MS 100U
 #define START_DELAY_MS 2000U
 #define PWM_MAX 1023U
-#define START_KICK_OUTPUT 27
+#define START_KICK_OUTPUT 28
 #define START_KICK_CYCLES 8U
 #define MOTOR_A_SIGN 1
 #define MOTOR_B_SIGN 1
@@ -65,15 +65,14 @@
 #define ULTRASONIC_ECHO GPIO_NUM_11
 #define ULTRASONIC_MIN_CM 2.0f
 #define ULTRASONIC_MAX_CM 400.0f
-#define OBSTACLE_DETECT_CM 7.0f
+#define OBSTACLE_DETECT_CM 8.0f
 #define OBSTACLE_CLEAR_CM 15.0f
 #define AVOID_BRAKE_MS 180U
-#define AVOID_LATERAL_SPEED 24
-#define AVOID_D_LATERAL_BIAS 2
+#define AVOID_LATERAL_SPEED 25
 #define AVOID_LEFT_MIN_MS 250U
 #define AVOID_LEFT_NO_ECHO_CLEAR_MS 450U
 #define AVOID_LEFT_TIMEOUT_MS 4000U
-#define AVOID_FORWARD_SPEED 20
+#define AVOID_FORWARD_SPEED 21
 #define AVOID_FORWARD_MS 1500U
 #define AVOID_RIGHT_MIN_MS 200U
 #define AVOID_RIGHT_TIMEOUT_MS 4000U
@@ -157,12 +156,19 @@ static void drive(int forward_a, int forward_d, int turn, int *a, int *b, int *d
 static void drive_vector(int forward, int lateral, int turn, int *a, int *b, int *d)
 {
     int half_lateral = lateral / 2;
-    int d_lateral = half_lateral;
-    if (d_lateral > 0) d_lateral += AVOID_D_LATERAL_BIAS;
-    else if (d_lateral < 0) d_lateral -= AVOID_D_LATERAL_BIAS;
     *a = clamp(-forward + half_lateral + turn, MAX_OUTPUT);
     *b = clamp(-lateral + turn, MAX_OUTPUT);
-    *d = clamp(forward + d_lateral + turn, MAX_OUTPUT);
+    *d = clamp(forward + half_lateral + turn, MAX_OUTPUT);
+    motor_set(&motor_a, *a);
+    motor_set(&motor_b, *b);
+    motor_set(&motor_d, *d);
+}
+
+static void drive_lateral_b(int lateral, int *a, int *b, int *d)
+{
+    *a = 0;
+    *b = clamp(-lateral, MAX_OUTPUT);
+    *d = 0;
     motor_set(&motor_a, *a);
     motor_set(&motor_b, *b);
     motor_set(&motor_d, *d);
@@ -376,7 +382,7 @@ void app_main(void)
             avoid_elapsed = 0;
             lost_elapsed_ms = 0;
             avoid_state = FULL_RUN_ENABLE ? AVOID_BRAKE : AVOID_DISTANCE_STOP;
-            ESP_LOGW(TAG, "BREAKPOINT 7CM dist=%.1fcm FULL_RUN=%d",
+            ESP_LOGW(TAG, "BREAKPOINT 8CM dist=%.1fcm FULL_RUN=%d",
                      (double)distance, FULL_RUN_ENABLE);
         }
 
@@ -393,7 +399,7 @@ void app_main(void)
                 ESP_LOGI(TAG, "AVOID LEFT start");
             }
         } else if (avoid_state == AVOID_LEFT) {
-            drive_vector(0, AVOID_LATERAL_SPEED, 0, &a, &b, &d);
+            drive_lateral_b(AVOID_LATERAL_SPEED, &a, &b, &d);
             turn = pid_steering(0);
             bool far_clear = ultrasonic_new && ultrasonic_valid && distance >= OBSTACLE_CLEAR_CM;
             bool no_echo_clear = ultrasonic_new && current_ultrasonic_status == US_NO_ECHO &&
@@ -417,7 +423,7 @@ void app_main(void)
                 ESP_LOGI(TAG, "AVOID RIGHT start left=%lums", (unsigned long)left_shift_ms);
             }
         } else if (avoid_state == AVOID_RIGHT) {
-            drive_vector(0, -AVOID_LATERAL_SPEED, 0, &a, &b, &d);
+            drive_lateral_b(-AVOID_LATERAL_SPEED, &a, &b, &d);
             turn = pid_steering(0);
             bool centered = mask == CENTER_MASK;
             bool matched_time = left_shift_ms > 0U && avoid_elapsed >= left_shift_ms;
