@@ -69,8 +69,7 @@
 #define OBSTACLE_DETECT_CM 8.0f
 #define OBSTACLE_CLEAR_CM 100.0f
 #define AVOID_BRAKE_MS 180U
-#define AVOID_LATERAL_SIDE_SPEED 15
-#define AVOID_LATERAL_B_SPEED 30
+#define AVOID_LATERAL_SPEED 30
 #define AVOID_LEFT_MIN_MS 250U
 #define AVOID_LEFT_TIMEOUT_MS 8000U
 #define AVOID_FORWARD_SPEED 21
@@ -189,15 +188,11 @@ static void drive_spin(int turn, int *a, int *b, int *d)
 
 static void drive_lateral(bool left, int *a, int *b, int *d)
 {
-    if (left) {
-        *a = -AVOID_LATERAL_SIDE_SPEED;
-        *b = AVOID_LATERAL_B_SPEED;
-        *d = AVOID_LATERAL_SIDE_SPEED;
-    } else {
-        *a = AVOID_LATERAL_SIDE_SPEED;
-        *b = AVOID_LATERAL_B_SPEED;
-        *d = -AVOID_LATERAL_SIDE_SPEED;
-    }
+    int lateral = left ? AVOID_LATERAL_SPEED : -AVOID_LATERAL_SPEED;
+    int half_lateral = lateral / 2;
+    *a = half_lateral;
+    *b = -lateral;
+    *d = half_lateral;
     motor_set_direct(&motor_a, *a);
     motor_set_direct(&motor_b, *b);
     motor_set_direct(&motor_d, *d);
