@@ -30,8 +30,8 @@
 #define STBY_GPIO GPIO_NUM_8
 
 /* OUT2/OUT3 on black: equal A/D magnitude, B stopped. */
-#define STRAIGHT_A_SPEED 29
-#define STRAIGHT_D_SPEED 29
+#define STRAIGHT_A_SPEED 30
+#define STRAIGHT_D_SPEED 30
 #define CURVE_A_SPEED 19
 #define CURVE_D_SPEED 19
 #define TURN_MAX 16
@@ -72,8 +72,9 @@
 #define OBSTACLE_DETECT_CM 10.0f
 #define OBSTACLE_CLEAR_CM 100.0f
 #define AVOID_BRAKE_MS 180U
-#define AVOID_LATERAL_SIDE_SPEED 18
-#define AVOID_LATERAL_B_SPEED 25
+#define AVOID_LEFT_SIDE_SPEED 18
+#define AVOID_LEFT_B_SPEED 25
+#define AVOID_RIGHT_SPEED 20
 #define AVOID_LEFT_MIN_MS 250U
 #define AVOID_LEFT_AFTER_CLEAR_MS 1000U
 #define AVOID_LEFT_TIMEOUT_MS 8000U
@@ -193,10 +194,15 @@ static void drive_spin(int direction, int *a, int *b, int *d)
 
 static void drive_lateral(bool left, int *a, int *b, int *d)
 {
-    int direction = left ? -1 : 1;
-    *a = direction * AVOID_LATERAL_SIDE_SPEED;
-    *b = direction * AVOID_LATERAL_B_SPEED;
-    *d = direction * AVOID_LATERAL_SIDE_SPEED;
+    if (left) {
+        *a = -AVOID_LEFT_SIDE_SPEED;
+        *b = -AVOID_LEFT_B_SPEED;
+        *d = -AVOID_LEFT_SIDE_SPEED;
+    } else {
+        *a = AVOID_RIGHT_SPEED;
+        *b = AVOID_RIGHT_SPEED;
+        *d = AVOID_RIGHT_SPEED;
+    }
     motor_set_direct(&motor_a, *a);
     motor_set_direct(&motor_b, *b);
     motor_set_direct(&motor_d, *d);
