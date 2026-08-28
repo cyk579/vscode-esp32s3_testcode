@@ -72,9 +72,11 @@
 #define OBSTACLE_DETECT_CM 10.0f
 #define OBSTACLE_CLEAR_CM 100.0f
 #define AVOID_BRAKE_MS 180U
-#define AVOID_LATERAL_SIDE_SPEED 15
+#define AVOID_LATERAL_HIGH_SPEED 18
+#define AVOID_LATERAL_LOW_SPEED 12
 #define AVOID_LATERAL_B_SPEED 30
 #define AVOID_LEFT_MIN_MS 250U
+#define AVOID_LEFT_AFTER_CLEAR_MS 1000U
 #define AVOID_LEFT_TIMEOUT_MS 8000U
 #define AVOID_FORWARD_SPEED 21
 #define AVOID_FORWARD_MS 3000U
@@ -192,10 +194,15 @@ static void drive_spin(int direction, int *a, int *b, int *d)
 
 static void drive_lateral(bool left, int *a, int *b, int *d)
 {
-    int direction = left ? -1 : 1;
-    *a = direction * AVOID_LATERAL_SIDE_SPEED;
-    *b = direction * AVOID_LATERAL_B_SPEED;
-    *d = direction * AVOID_LATERAL_SIDE_SPEED;
+    if (left) {
+        *a = -AVOID_LATERAL_HIGH_SPEED;
+        *b = -AVOID_LATERAL_B_SPEED;
+        *d = -AVOID_LATERAL_LOW_SPEED;
+    } else {
+        *a = AVOID_LATERAL_LOW_SPEED;
+        *b = AVOID_LATERAL_B_SPEED;
+        *d = AVOID_LATERAL_HIGH_SPEED;
+    }
     motor_set_direct(&motor_a, *a);
     motor_set_direct(&motor_b, *b);
     motor_set_direct(&motor_d, *d);
@@ -414,17 +421,21 @@ void app_main(void)
     uint32_t log_elapsed = LOG_MS;
     uint32_t avoid_elapsed = 0;
     uint32_t left_shift_ms = 0;
+    uint32_t left_clear_start_ms = 0;
     uint32_t end_active_ms = 0;
     uint32_t lost_elapsed_ms = 0;
     uint32_t last_ultrasonic_sequence = 0;
     bool line_seen = false;
     bool end_armed = false;
+    bool left_clear_started = false;
     drive(0, 0, 0, &a, &b, &d);
     vTaskDelay(pdMS_TO_TICKS(START_DELAY_MS));
     while (true) {
         uint8_t mask = control_mask();
         int error = line_error(mask);
         int immediate_error = line_error(latest_sampled_mask);
+        int immediate_turn = abs(immediate_error) >= TURN_MEMORY_STRONG_ERROR ?
+                             (immediate_error < 0 ? 1 : -1) : 0;
         if (avoid_state == AVOID_LINE) {
             remember_turn(immediate_error, &last_turn, &turn_candidate,
                           &turn_candidate_cycles);
@@ -447,6 +458,8 @@ void app_main(void)
             turn = pid_steering(0);
             avoid_elapsed = 0;
             lost_elapsed_ms = 0;
+            left_clear_started = false;
+            left_clear_start_ms = 0;
             avoid_state = FULL_RUN_ENABLE ? AVOID_BRAKE : AVOID_DISTANCE_STOP;
             ESP_LOGW(TAG, "BREAKPOINT 10CM dist=%.1fcm FULL_RUN=%d",
                      (double)distance, FULL_RUN_ENABLE);
@@ -462,19 +475,28 @@ void app_main(void)
             if (avoid_elapsed >= AVOID_BRAKE_MS) {
                 avoid_state = AVOID_LEFT;
                 avoid_elapsed = 0;
+                left_clear_started = false;
+                left_clear_start_ms = 0;
                 ESP_LOGI(TAG, "AVOID LEFT start");
             }
         } else if (avoid_state == AVOID_LEFT) {
             drive_lateral(true, &a, &b, &d);
             turn = pid_steering(0);
-            bool far_clear = ultrasonic_new && ultrasonic_valid && distance >= OBSTACLE_CLEAR_CM;
-            if (avoid_elapsed >= AVOID_LEFT_MIN_MS && far_clear) {
+            bool far_clear = ultrasonic_new && ultrasonic_valid && distance > OBSTACLE_CLEAR_CM;
+            if (!left_clear_started && avoid_elapsed >= AVOID_LEFT_MIN_MS && far_clear) {
+                left_clear_started = true;
+                left_clear_start_ms = avoid_elapsed;
+                ESP_LOGI(TAG, "LEFT clear; continue for %lums",
+                         (unsigned long)AVOID_LEFT_AFTER_CLEAR_MS);
+            }
+            if (left_clear_started &&
+                avoid_elapsed - left_clear_start_ms >= AVOID_LEFT_AFTER_CLEAR_MS) {
                 left_shift_ms = avoid_elapsed;
                 avoid_state = AVOID_FORWARD;
                 avoid_elapsed = 0;
-                ESP_LOGI(TAG, "LEFT done time=%lums clear=%d",
-                         (unsigned long)left_shift_ms, far_clear);
-            } else if (avoid_elapsed >= AVOID_LEFT_TIMEOUT_MS) {
+                ESP_LOGI(TAG, "LEFT done time=%lums",
+                         (unsigned long)left_shift_ms);
+            } else if (!left_clear_started && avoid_elapsed >= AVOID_LEFT_TIMEOUT_MS) {
                 avoid_state = AVOID_FAIL_STOP;
                 ESP_LOGE(TAG, "LEFT timeout -> FAIL STOP");
             }
@@ -516,6 +538,12 @@ void app_main(void)
                 avoid_state = AVOID_END;
                 ESP_LOGW(TAG, "END confirmed");
             }
+        } else if (immediate_turn != 0) {
+            lost_elapsed_ms = 0;
+            end_active_ms = 0;
+            turn = immediate_turn * LOST_TURN;
+            pid_steering(0);
+            drive_spin(immediate_turn, &a, &b, &d);
         } else if (mask == CENTER_MASK || mask == 0x0FU || (mask && error == 0)) {
             lost_elapsed_ms = 0;
             end_active_ms = 0;
