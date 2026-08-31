@@ -30,52 +30,52 @@
 /* Image processing parameters.  The camera should point down at the track. */
 #define LINE_ROI_TOP_PERCENT 45
 #define LINE_ROI_BOTTOM_PERCENT 95
-#define LINE_CONTROL_TOP_PERCENT 55
+#define LINE_CONTROL_TOP_PERCENT 58
 #define LINE_CONTROL_BOTTOM_PERCENT 90
-#define LINE_ROW_STEP 3
+#define LINE_ROW_STEP 4
+#define LINE_NEAR_ROWS 3
 #define LINE_MIN_CONTRAST 32
 #define LINE_BLACK_FRACTION_PERCENT 30
 #define LINE_BLACK_THRESHOLD_MIN 35
 #define LINE_BLACK_THRESHOLD_MAX 120
 #define LINE_MIN_RUN_SAMPLES 3
-#define LINE_MAX_RUN_PERCENT 70
+#define LINE_MAX_RUN_PERCENT 85
 #define LINE_MIN_VALID_ROWS 3
-#define LINE_FINISH_ROW_COVERAGE_PERCENT 58
+#define LINE_FINISH_ROW_COVERAGE_PERCENT 50
 #define LINE_FINISH_MIN_ROWS 3
 
 /* Motion and temporal safety parameters. */
-#define LINE_START_DELAY_MS 1200U
-#define LINE_ARM_CONFIRM_FRAMES 4U
+#define LINE_START_DELAY_MS 600U
+#define LINE_ARM_CONFIRM_FRAMES 3U
 #define LINE_LOST_HOLD_MS 160U
 #define LINE_LOST_SEARCH_MS 520U
 #define LINE_LOST_STOP_MS 900U
 #define LINE_FRAME_TIMEOUT_MS 450U
-#define LINE_FINISH_CONFIRM_FRAMES 6U
+#define LINE_FINISH_CONFIRM_FRAMES 5U
 
-#define LINE_FORWARD_FAST 18
-#define LINE_FORWARD_MEDIUM 14
-#define LINE_FORWARD_SLOW 10
+#define LINE_FORWARD_FAST 22  /* IR straight speed 30, reduced by 8. */
+#define LINE_FORWARD_MEDIUM 14 /* IR curve speed 22, reduced by 8. */
+#define LINE_FORWARD_SLOW 9
 #define LINE_FORWARD_CRAWL 7
-#define LINE_TURN_MAX 20
-#define LINE_PID_KP 18
-#define LINE_PID_KI 0
-#define LINE_PID_KD 6
+#define LINE_TURN_MAX 15
+#define LINE_ERROR_DEADBAND 18
+#define LINE_ERROR_MEDIUM 35
+#define LINE_ERROR_LARGE 60
+#define LINE_PID_KP 15
+#define LINE_PID_KI 1
+#define LINE_PID_KD 3
 #define LINE_PID_SCALE 100
-#define LINE_PID_DEADBAND 6
-#define LINE_PID_INTEGRAL_LIMIT 120
-#define LINE_ERROR_FILTER_DIV 4
-#define LINE_TURN_SLEW_PER_FRAME 3
-#define LINE_TURN_OUTPUT_DEADBAND 5
-#define LINE_STRONG_ERROR 60
-#define LINE_STRONG_CONFIRM_FRAMES 2U
-#define LINE_STRONG_TURN_SLEW_PER_FRAME 6
+#define LINE_PID_INTEGRAL_LIMIT 60
+#define LINE_PID_SLEW_PER_FRAME 4
+#define LINE_PID_OUTPUT_DEADBAND 1
+#define LINE_ERROR_FILTER_OLD 2
+#define LINE_ERROR_FILTER_NEW 1
 
 #define PWM_MAX 1023U
-#define MOTOR_MIN_RUN_OUTPUT 10
-#define MOTOR_B_MIN_RUN_OUTPUT 12
-#define START_KICK_OUTPUT 22
-#define START_KICK_CYCLES 4U
-#define MOTOR_B_KICK_MIN_OUTPUT 15
+#define MOTOR_MIN_RUN_OUTPUT 8
+#define MOTOR_B_MIN_RUN_OUTPUT 0
+#define START_KICK_OUTPUT 18
+#define START_KICK_CYCLES 3U
 #define MAX_OUTPUT 26
 
 /* These signs match the direction calibration documented by car-spin. */
@@ -113,14 +113,10 @@ static int64_t s_last_line_us;
 static int64_t s_last_log_us;
 static int s_last_error;
 static int s_tracking_error;
-static int s_pid_integral;
-static int s_pid_previous;
-static int s_pid_derivative;
-static int s_pid_output;
-static int s_filtered_error;
 static bool s_error_filter_initialized;
-static uint8_t s_strong_error_frames;
-static int s_strong_error_sign;
+static int s_pid_integral;
+static int s_pid_previous_error;
+static int s_pid_output;
 static int s_command_a;
 static int s_command_b;
 static int s_command_d;
@@ -154,32 +150,61 @@ static uint8_t rgb565_luma(const uint8_t *pixel)
     return (uint8_t)((77 * red + 150 * green + 29 * blue) >> 8);
 }
 
-static void consider_run(int start_x,
-                         int sample_count,
-                         int sample_step,
-                         int width,
-                         int expected_x,
-                         int *best_score,
-                         int *best_center,
-                         int *best_width)
+static bool scan_row(const uint8_t *frame,
+                     uint16_t width,
+                     int y,
+                     int threshold,
+                     int *center,
+                     int *run_width,
+                     int *dark_samples)
 {
-    if (sample_count < LINE_MIN_RUN_SAMPLES) {
-        return;
+    const int x_step = width >= 96 ? 2 : 1;
+    int best_count = 0;
+    int best_center = 0;
+    int run_start = 0;
+    int run_count = 0;
+    int dark_sum = 0;
+    *center = 0;
+    *run_width = 0;
+    *dark_samples = 0;
+
+    for (int x = 0; x < (int)width; x += x_step) {
+        const uint8_t value = rgb565_luma(frame +
+                                          (((size_t)y * (size_t)width + (size_t)x) * 2));
+        if (value <= threshold) {
+            ++*dark_samples;
+            dark_sum += x;
+            if (run_count == 0) {
+                run_start = x;
+            }
+            ++run_count;
+            continue;
+        }
+
+        if (run_count > best_count) {
+            best_count = run_count;
+            best_center = (run_start + x - x_step) / 2;
+        }
+        run_count = 0;
     }
 
-    const int run_width = sample_count * sample_step;
-    if (run_width > width * LINE_MAX_RUN_PERCENT / 100) {
-        return;
+    /* Keep a centroid for wide bars even when their run is too wide to steer on. */
+    if (*dark_samples > 0) {
+        *center = dark_sum / *dark_samples;
+    }
+    if (run_count > best_count) {
+        best_count = run_count;
+        const int last_x = (((int)width - 1) / x_step) * x_step;
+        best_center = (run_start + last_x) / 2;
     }
 
-    const int end_x = start_x + run_width - sample_step;
-    const int center_x = (start_x + end_x) / 2;
-    const int score = sample_count * 100 - abs(center_x - expected_x) * 2;
-    if (score > *best_score) {
-        *best_score = score;
-        *best_center = center_x;
-        *best_width = run_width;
+    *run_width = best_count * x_step;
+    if (best_count < LINE_MIN_RUN_SAMPLES ||
+        *run_width > (int)width * LINE_MAX_RUN_PERCENT / 100) {
+        return false;
     }
+    *center = best_center;
+    return true;
 }
 
 static bool observe_line(const uint8_t *frame,
@@ -191,25 +216,25 @@ static bool observe_line(const uint8_t *frame,
         return false;
     }
 
-    int top = (int)height * LINE_ROI_TOP_PERCENT / 100;
-    int bottom = (int)height * LINE_ROI_BOTTOM_PERCENT / 100;
-    if (top < 0) {
-        top = 0;
+    int roi_top = (int)height * LINE_ROI_TOP_PERCENT / 100;
+    int roi_bottom = (int)height * LINE_ROI_BOTTOM_PERCENT / 100;
+    if (roi_top < 0) {
+        roi_top = 0;
     }
-    if (bottom >= (int)height) {
-        bottom = (int)height - 1;
+    if (roi_bottom >= (int)height) {
+        roi_bottom = (int)height - 1;
     }
-    if (bottom <= top) {
+    if (roi_bottom <= roi_top) {
         return false;
     }
 
     int control_top = (int)height * LINE_CONTROL_TOP_PERCENT / 100;
     int control_bottom = (int)height * LINE_CONTROL_BOTTOM_PERCENT / 100;
-    if (control_top < top) {
-        control_top = top;
+    if (control_top < roi_top) {
+        control_top = roi_top;
     }
-    if (control_bottom > bottom) {
-        control_bottom = bottom;
+    if (control_bottom > roi_bottom) {
+        control_bottom = roi_bottom;
     }
     if (control_bottom <= control_top) {
         return false;
@@ -220,7 +245,7 @@ static bool observe_line(const uint8_t *frame,
     int minimum = 255;
     int maximum = 0;
     int sample_total = 0;
-    for (int y = top; y <= bottom; y += y_step) {
+    for (int y = roi_top; y <= roi_bottom; y += y_step) {
         for (int x = 0; x < (int)width; x += x_step) {
             const uint8_t value = rgb565_luma(frame +
                                               (((size_t)y * (size_t)width + (size_t)x) * 2));
@@ -245,64 +270,36 @@ static bool observe_line(const uint8_t *frame,
         threshold = LINE_BLACK_THRESHOLD_MAX;
     }
 
-    int expected_x = (int)width / 2 + s_tracking_error * (int)width / 240;
-    if (expected_x < 0) {
-        expected_x = 0;
-    }
-    if (expected_x >= (int)width) {
-        expected_x = (int)width - 1;
-    }
-
-    int64_t weighted_center = 0;
-    int weight_sum = 0;
+    int center_sum = 0;
+    int center_weight = 0;
     int valid_rows = 0;
+    int control_rows = 0;
+    int near_rows = 0;
     int wide_rows = 0;
     int wide_center_sum = 0;
-    for (int y = top; y <= bottom; y += y_step) {
-        int best_score = -1;
-        int best_center = 0;
-        int best_width = 0;
-        int run_start = 0;
-        int run_samples = 0;
+    for (int y = roi_bottom; y >= roi_top; y -= y_step) {
+        int center = 0;
+        int run_width = 0;
         int dark_samples = 0;
-        int dark_sum = 0;
+        const bool has_run = scan_row(frame, width, y, threshold, &center, &run_width,
+                                      &dark_samples);
         const int total_row_samples = ((int)width + x_step - 1) / x_step;
-
-        for (int x = 0; x < (int)width; x += x_step) {
-            const uint8_t value = rgb565_luma(frame +
-                                              (((size_t)y * (size_t)width + (size_t)x) * 2));
-            if (value <= threshold) {
-                if (run_samples == 0) {
-                    run_start = x;
-                }
-                ++run_samples;
-                ++dark_samples;
-                dark_sum += x;
-            } else if (run_samples > 0) {
-                consider_run(run_start, run_samples, x_step, width, expected_x,
-                             &best_score, &best_center, &best_width);
-                run_samples = 0;
-            }
-        }
-        if (run_samples > 0) {
-            consider_run(run_start, run_samples, x_step, width, expected_x,
-                         &best_score, &best_center, &best_width);
-        }
-
         if (dark_samples * 100 >= total_row_samples * LINE_FINISH_ROW_COVERAGE_PERCENT) {
             ++wide_rows;
-            if (dark_samples > 0) {
-                wide_center_sum += dark_sum / dark_samples;
-            }
+            wide_center_sum += center;
         }
-        if (y >= control_top && y <= control_bottom && best_score >= 0 && best_width > 0) {
-            /* The nearest scan lines carry much more control authority than
-             * the distant part of a bend visible at the top of the image. */
-            const int relative_y = y - control_top + 1;
-            const int weight = relative_y * relative_y;
-            weighted_center += (int64_t)best_center * weight;
-            weight_sum += weight;
+        if (y < control_top || y > control_bottom) {
+            continue;
+        }
+        ++control_rows;
+        if (has_run && run_width > 0) {
             ++valid_rows;
+            if (near_rows < LINE_NEAR_ROWS) {
+                const int weight = LINE_NEAR_ROWS - near_rows;
+                center_sum += center * weight;
+                center_weight += weight;
+                ++near_rows;
+            }
         }
     }
 
@@ -313,16 +310,16 @@ static bool observe_line(const uint8_t *frame,
                                      (wide_center_sum / (wide_rows ? wide_rows : 1)) <=
                                          (int)width * 4 / 5;
     observation->confidence = (uint8_t)((valid_rows * 100) /
-                                        ((control_bottom - control_top) / y_step + 1));
+                                        (control_rows ? control_rows : 1));
     if (observation->confidence > 100) {
         observation->confidence = 100;
     }
-    if (valid_rows < LINE_MIN_VALID_ROWS || weight_sum == 0) {
+    if (valid_rows < LINE_MIN_VALID_ROWS || center_weight == 0) {
         observation->valid = false;
         return false;
     }
 
-    const int center_x = (int)(weighted_center / weight_sum);
+    const int center_x = center_sum / center_weight;
     int error = (center_x - (int)width / 2) * 100 / ((int)width / 2);
     error = clamp_int(error, 100);
 #if CAMERA_LINE_MIRROR_X
@@ -358,7 +355,8 @@ static void motor_set(const motor_t *motor, int command)
         gpio_set_level(motor->in1, speed > 0);
         gpio_set_level(motor->in2, speed < 0);
         s_last_direction[index] = direction;
-        s_kick_cycles[index] = direction == 0 ? 0 : START_KICK_CYCLES;
+        s_kick_cycles[index] = (direction == 0 || motor->channel == LEDC_CHANNEL_1) ?
+                              0 : START_KICK_CYCLES;
     }
 
     if (direction == 0) {
@@ -375,10 +373,10 @@ static void motor_set(const motor_t *motor, int command)
     if (output < minimum) {
         output = minimum;
     }
-    if (s_kick_cycles[index] > 0 &&
-        (motor->channel != LEDC_CHANNEL_1 || output >= MOTOR_B_KICK_MIN_OUTPUT) &&
-        output < START_KICK_OUTPUT) {
+    if (s_kick_cycles[index] > 0 && output < START_KICK_OUTPUT) {
         output = START_KICK_OUTPUT;
+    }
+    if (s_kick_cycles[index] > 0) {
         --s_kick_cycles[index];
     }
     set_motor_duty(motor, output);
@@ -420,92 +418,73 @@ static void drive_spin(int direction)
     motor_set(&motor_d, s_command_d);
 }
 
-static void reset_pid(void)
+static void reset_tracking(void)
 {
-    s_pid_integral = 0;
-    s_pid_previous = 0;
-    s_pid_derivative = 0;
-    s_pid_output = 0;
-    s_filtered_error = 0;
+    s_tracking_error = 0;
     s_error_filter_initialized = false;
-    s_strong_error_frames = 0;
-    s_strong_error_sign = 0;
+    s_pid_integral = 0;
+    s_pid_previous_error = 0;
+    s_pid_output = 0;
 }
 
 static int pid_steering(int error)
 {
-    int slew_limit = LINE_TURN_SLEW_PER_FRAME;
-    if (abs(error) >= LINE_STRONG_ERROR) {
-        const int sign = error > 0 ? 1 : -1;
-        if (sign != s_strong_error_sign) {
-            s_strong_error_sign = sign;
-            s_strong_error_frames = 1;
-        } else if (s_strong_error_frames < UINT8_MAX) {
-            ++s_strong_error_frames;
-        }
-        if (s_strong_error_frames >= LINE_STRONG_CONFIRM_FRAMES) {
-            slew_limit = LINE_STRONG_TURN_SLEW_PER_FRAME;
-        }
-    } else {
-        s_strong_error_frames = 0;
-        s_strong_error_sign = 0;
-    }
-
     if (!s_error_filter_initialized) {
-        s_filtered_error = error;
+        s_tracking_error = error;
+        s_pid_previous_error = error;
         s_error_filter_initialized = true;
     } else {
-        const int delta = error - s_filtered_error;
-        int step = delta / LINE_ERROR_FILTER_DIV;
-        if (step == 0 && delta != 0) {
-            step = delta > 0 ? 1 : -1;
-        }
-        s_filtered_error = clamp_int(s_filtered_error + step, 100);
+        s_tracking_error = (s_tracking_error * LINE_ERROR_FILTER_OLD +
+                            error * LINE_ERROR_FILTER_NEW) /
+                           (LINE_ERROR_FILTER_OLD + LINE_ERROR_FILTER_NEW);
     }
 
-    if (abs(s_filtered_error) <= LINE_PID_DEADBAND) {
+    const int magnitude = abs(s_tracking_error);
+    if (magnitude <= LINE_ERROR_DEADBAND) {
         s_pid_integral = 0;
-        s_pid_previous = s_filtered_error;
-        s_pid_derivative = 0;
-        if (s_pid_output > LINE_TURN_SLEW_PER_FRAME) {
-            s_pid_output -= LINE_TURN_SLEW_PER_FRAME;
-        } else if (s_pid_output < -LINE_TURN_SLEW_PER_FRAME) {
-            s_pid_output += LINE_TURN_SLEW_PER_FRAME;
-        } else {
-            s_pid_output = 0;
-        }
-        return abs(s_pid_output) <= LINE_TURN_OUTPUT_DEADBAND ? 0 : s_pid_output;
+        s_pid_previous_error = s_tracking_error;
+        s_pid_output = 0;
+        return 0;
     }
 
-    s_pid_integral = clamp_int(s_pid_integral + s_filtered_error, LINE_PID_INTEGRAL_LIMIT);
-    const int derivative = s_filtered_error - s_pid_previous;
-    s_pid_derivative = (s_pid_derivative + derivative) / 2;
-    s_pid_previous = s_filtered_error;
+    if ((s_tracking_error > 0 && s_pid_integral < 0) ||
+        (s_tracking_error < 0 && s_pid_integral > 0)) {
+        s_pid_integral = 0;
+    }
+    s_pid_integral = clamp_int(s_pid_integral + s_tracking_error,
+                               LINE_PID_INTEGRAL_LIMIT);
+    const int derivative = s_tracking_error - s_pid_previous_error;
+    s_pid_previous_error = s_tracking_error;
 
-    int output = -(LINE_PID_KP * s_filtered_error +
+    int target = -(LINE_PID_KP * s_tracking_error +
                    LINE_PID_KI * s_pid_integral +
-                   LINE_PID_KD * s_pid_derivative) / LINE_PID_SCALE;
-    output = clamp_int(output, LINE_TURN_MAX);
-    const int output_delta = output - s_pid_output;
-    if (output_delta > slew_limit) {
-        output = s_pid_output + slew_limit;
-    } else if (output_delta < -slew_limit) {
-        output = s_pid_output - slew_limit;
+                   LINE_PID_KD * derivative) /
+                 LINE_PID_SCALE;
+    target = clamp_int(target, LINE_TURN_MAX);
+    const int delta = target - s_pid_output;
+    if (delta > LINE_PID_SLEW_PER_FRAME) {
+        target = s_pid_output + LINE_PID_SLEW_PER_FRAME;
+    } else if (delta < -LINE_PID_SLEW_PER_FRAME) {
+        target = s_pid_output - LINE_PID_SLEW_PER_FRAME;
     }
-    s_pid_output = output;
-    return abs(s_pid_output) <= LINE_TURN_OUTPUT_DEADBAND ? 0 : s_pid_output;
+    s_pid_output = target;
+    if (abs(s_pid_output) <= LINE_PID_OUTPUT_DEADBAND) {
+        s_pid_output = 0;
+        return 0;
+    }
+    return s_pid_output;
 }
 
-static int forward_speed(int error, int turn)
+static int forward_speed(int error)
 {
     const int magnitude = abs(error);
-    if (magnitude >= 80 || abs(turn) >= 18) {
+    if (magnitude >= LINE_ERROR_LARGE) {
         return LINE_FORWARD_CRAWL;
     }
-    if (magnitude >= 55 || abs(turn) >= 14) {
+    if (magnitude >= LINE_ERROR_MEDIUM) {
         return LINE_FORWARD_SLOW;
     }
-    if (magnitude >= 28 || abs(turn) >= 8) {
+    if (magnitude > LINE_ERROR_DEADBAND) {
         return LINE_FORWARD_MEDIUM;
     }
     return LINE_FORWARD_FAST;
@@ -593,7 +572,6 @@ esp_err_t camera_line_follow_start(void)
     s_last_frame_us = 0;
     s_last_log_us = 0;
     s_last_error = 0;
-    s_tracking_error = 0;
     s_last_threshold = 0;
     s_last_confidence = 0;
     s_last_direction[0] = 0;
@@ -602,7 +580,7 @@ esp_err_t camera_line_follow_start(void)
     s_kick_cycles[0] = 0;
     s_kick_cycles[1] = 0;
     s_kick_cycles[2] = 0;
-    reset_pid();
+    reset_tracking();
     gpio_set_level(STBY_GPIO, 0);
     stop_motors();
 
@@ -668,7 +646,7 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
             }
             if (s_arm_frames >= LINE_ARM_CONFIRM_FRAMES) {
                 s_armed = true;
-                reset_pid();
+                reset_tracking();
                 gpio_set_level(STBY_GPIO, 1);
                 ESP_LOGI(TAG, "Line confirmed; camera steering enabled");
             }
@@ -701,13 +679,11 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
 
     if (line_seen) {
         const int turn = pid_steering(observation.error);
-        s_tracking_error = s_filtered_error;
-        drive(forward_speed(s_filtered_error, turn), turn);
+        drive(forward_speed(s_tracking_error), turn);
         log_state("LINE", &observation);
         return;
     }
 
-    reset_pid();
     const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
     const int search_direction = s_tracking_error < 0 ? 1 : -1;
     if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
@@ -724,7 +700,7 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
             s_armed = false;
             s_arm_frames = 0;
             s_first_frame_us = 0;
-            s_tracking_error = 0;
+            reset_tracking();
             gpio_set_level(STBY_GPIO, 0);
         }
     }
@@ -750,8 +726,7 @@ static void camera_line_follow_watchdog_task(void *arg)
             s_first_frame_us = 0;
             s_last_line_us = 0;
             s_last_frame_us = 0;
-            s_tracking_error = 0;
-            reset_pid();
+            reset_tracking();
             ESP_LOGW(TAG, "Decoded-frame timeout; motors stopped and line confirmation reset");
         }
         (void)xSemaphoreGive(s_control_mutex);
