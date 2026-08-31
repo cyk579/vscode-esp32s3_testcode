@@ -177,7 +177,14 @@ ESP32-S3 是 USB Full Speed Host，程序依次尝试 MJPEG `480×320@25 FPS`、
 
 ## 摄像头巡黑线
 
-`Enable camera black-line following` 默认开启。程序在 ROI 内用自适应灰度阈值二值化，从控制区底部向上扫描，优先使用离车最近的 3 条有效扫描行。控制使用低精度定点 PID（积分限幅、输出限幅），让后轮转向量随偏差平滑变化；中心死区内固定直行混控 `A=-22、B=0、D=22`，只有需要转向时才驱动后轮 Motor B。相机图片中的 104° 广角镜头可以覆盖赛道，但必须刚性朝下安装，车体中心线与镜头中心尽量重合，并让黑线进入画面下半部；不要让车头、轮胎或支架遮住控制区域。
+`Enable camera black-line following` 默认开启。程序不是统计“左边黑像素多还是右边黑像素多”，而是按下面的顺序找黑线中心：
+
+1. 在 ROI 内用自适应灰度阈值二值化；
+2. 从控制区底部略过一行遮挡后向上扫描，第一段窄黑线作为近端锚点；
+3. 后续行必须与上一行中心连续，且只累计最近的 4 行；行间跳变或宽黑块立即停止累计；
+4. 近端中心误差才进入低精度定点 PID；终点宽黑条也要进入中近景控制区才确认，远处行不改变方向或停车。
+
+这对应 [参考文章](https://blog.csdn.net/weixin_28285943/article/details/164210989) 中“底部向上扫描、底部少量行不信、拒绝相邻行突变”的做法，但去掉了浮点前馈和复杂赛道状态机，适合本工程的 ESP32-S3 与低分辨率 RGB565 帧。控制输出带积分限幅、死区和每帧斜率限幅，让后轮转向量平滑变化；中心死区内固定直行混控 `A=-22、B=0、D=22`，Motor B 保持 0。相机的 104° 广角镜头必须刚性朝下安装，车体中心线与镜头中心尽量重合，并让黑线进入画面下半部；不要让车头、轮胎或支架遮住控制区域。
 
 启动和停车条件如下：
 
@@ -190,12 +197,18 @@ ESP32-S3 是 USB Full Speed Host，程序依次尝试 MJPEG `480×320@25 FPS`、
 | 参数 | 默认值 | 作用 |
 | --- | ---: | --- |
 | `CAMERA_LINE_MIRROR_X` | `0` | 画面左右相反时改为 `1` |
-| `LINE_ROI_TOP_PERCENT` / `LINE_ROI_BOTTOM_PERCENT` | `45` / `95` | 阈值和终点条检测范围 |
-| `LINE_CONTROL_TOP_PERCENT` / `LINE_CONTROL_BOTTOM_PERCENT` | `58` / `90` | 实际转向控制范围；提前响应弯道时调大 TOP，盲区遮挡时调小 BOTTOM |
-| `LINE_ROW_STEP` / `LINE_NEAR_ROWS` | `4` / `3` | 扫描行间隔和近端优先使用的有效行数 |
+| `LINE_ROI_TOP_PERCENT` / `LINE_ROI_BOTTOM_PERCENT` | `45` / `95` | 自适应阈值取样范围；终点最终仍受控制区限制 |
+| `LINE_CONTROL_TOP_PERCENT` / `LINE_CONTROL_BOTTOM_PERCENT` | `65` / `90` | 近端控制范围；仍提前响应远处弯道时调大 TOP，底部被车体挡住时调小 BOTTOM |
+| `LINE_ROW_STEP` | `4` | 相邻扫描行的垂直间隔；数值越大越省算力，但过大会漏掉窄线 |
+| `LINE_BOTTOM_SKIP_ROWS` | `1` | 从控制区底部跳过的遮挡行数；底部有车体阴影时可改为 `2` |
+| `LINE_NEAR_BAND_ROWS` / `LINE_NEAR_ROWS` | `6` / `4` | 近端候选带宽和实际累计行数；远处干扰多时减小带宽，线抖时保持至少 3 行 |
+| `LINE_ANCHOR_SEARCH_ROWS` | `4` | 允许向上寻找近端锚点的最大行数；不要设得过大，否则会重新接纳远处支路 |
+| `LINE_MAX_CENTER_STEP_PERCENT` | `14` | 同一帧相邻行中心最大横移；误检跳变多时调小，急弯真实斜率过大时略调大 |
+| `LINE_MAX_ERROR_STEP` | `45` | 相邻帧误差最大变化（归一化百分比）；防止一帧突然跳到远处支路 |
 | `LINE_MIN_CONTRAST` | `32` | 低于此帧对比度时判定为无可靠线 |
 | `LINE_BLACK_THRESHOLD_MIN/MAX` | `35` / `120` | 自适应黑色阈值上下限，降低灰色阴影误检 |
 | `LINE_MIN_RUN_SAMPLES` / `LINE_MIN_VALID_ROWS` | `3` / `3` | 连续黑像素和有效扫描行的最小数量 |
+| `LINE_MAX_RUN_PERCENT` | `45` | 控制用黑段的最大宽度；宽横条不用于转向，只交给终点检测 |
 | `LINE_FORWARD_FAST/MEDIUM/SLOW/CRAWL` | `22/14/9/7` | 摄像头巡线前进速度；比红外对应速度低 8 个 PWM 点（直线为 `30-8=22`） |
 | `LINE_TURN_MAX` | `15` | 丢线搜索和旋转的最大转向量 |
 | `LINE_ERROR_DEADBAND/MEDIUM/LARGE` | `18/35/60` | PID 死区和前进降速阈值；死区内 Motor B 保持 0 |
@@ -203,7 +216,7 @@ ESP32-S3 是 USB Full Speed Host，程序依次尝试 MJPEG `480×320@25 FPS`、
 | `LINE_PID_INTEGRAL_LIMIT` / `LINE_PID_SLEW_PER_FRAME` | `60` / `4` | 积分限幅和每帧输出变化上限 |
 | `LINE_ERROR_FILTER_OLD/NEW` | `2/1` | 整数低通权重，抑制摄像头帧间抖动 |
 
-第一次地面测试建议按以下顺序：架空车轮确认 Motor A/D 直行方向；把车放在赛道长直段，确认日志中的 `line=1`、`err`、`filt` 和 `motor[A,B,D]`，直行时应看到 `B=0`；再逐步调整 `LINE_FORWARD_FAST`。如果黑线在屏幕右侧而车向左修正，先把 `CAMERA_LINE_MIRROR_X` 改为 `1`，不要先改电机方向。若仍提前响应远处弯道，把 `LINE_CONTROL_TOP_PERCENT` 调大；若近端黑线落在盲区之外，把 `LINE_CONTROL_BOTTOM_PERCENT` 调小或把 TOP 调小。
+第一次地面测试建议按以下顺序：架空车轮确认 Motor A/D 直行方向；把车放在长直段，确认日志中的 `line=1`、`rows=4`、`err`、`filt` 和 `motor[A,B,D]`，直行时应看到 `B=0`；再逐步调整 `LINE_FORWARD_FAST`。如果黑线在屏幕右侧而车向左修正，先把 `CAMERA_LINE_MIRROR_X` 改为 `1`，不要先改电机方向。若仍提前响应远处弯道，先把 `LINE_CONTROL_TOP_PERCENT` 调大或把 `LINE_NEAR_BAND_ROWS` 调小；若近端黑线被车体挡住，把 `LINE_CONTROL_BOTTOM_PERCENT` 调小或把 `LINE_BOTTOM_SKIP_ROWS` 调大。若直线左右摆动，先降低 `LINE_FORWARD_FAST`，再检查 `LINE_ERROR_DEADBAND` 和 `LINE_PID_KP`，不要同时改多个参数。
 
 需要只测试摄像头而不让车动时，在 `idf.py menuconfig -> Example Configuration` 关闭 `Enable camera black-line following`，并把 TB6612 的 `STBY` 固定拉低。不要同时开启舵机测试：舵机配置会与整车接线/LEDC 资源冲突。
 

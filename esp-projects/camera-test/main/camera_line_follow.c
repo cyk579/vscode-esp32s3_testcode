@@ -12,7 +12,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-/* The pin map is shared with the tested car-spin application. */
+/* 电机引脚与已经校准过的 car-spin 工程保持一致。 */
 #define A_PWM GPIO_NUM_9
 #define A_IN1 GPIO_NUM_12
 #define A_IN2 GPIO_NUM_10
@@ -24,27 +24,36 @@
 #define D_IN2 GPIO_NUM_15
 #define STBY_GPIO GPIO_NUM_8
 
-/* Camera output is delivered by esp_jpeg with swap_color_bytes enabled. */
+/* 解码器输出的是大端字节序 RGB565；画面左右方向若相反，把它改为 1。 */
 #define CAMERA_LINE_MIRROR_X 0
 
-/* Image processing parameters.  The camera should point down at the track. */
+/*
+ * 图像坐标的 y 轴向下，越靠近 LINE_ROI_BOTTOM 越接近小车。
+ * 只在下方的“近端带”控制方向；终点横条也要进入中近景才确认。
+ * 摄像头最底部可能被车体遮挡，所以先跳过一行，再从下往上找连续黑线。
+ */
 #define LINE_ROI_TOP_PERCENT 45
 #define LINE_ROI_BOTTOM_PERCENT 95
-#define LINE_CONTROL_TOP_PERCENT 58
+#define LINE_CONTROL_TOP_PERCENT 65
 #define LINE_CONTROL_BOTTOM_PERCENT 90
 #define LINE_ROW_STEP 4
-#define LINE_NEAR_ROWS 3
+#define LINE_BOTTOM_SKIP_ROWS 1
+#define LINE_NEAR_BAND_ROWS 6
+#define LINE_ANCHOR_SEARCH_ROWS 4
+#define LINE_NEAR_ROWS 4
+#define LINE_MAX_CENTER_STEP_PERCENT 14
+#define LINE_MAX_ERROR_STEP 45
 #define LINE_MIN_CONTRAST 32
 #define LINE_BLACK_FRACTION_PERCENT 30
 #define LINE_BLACK_THRESHOLD_MIN 35
 #define LINE_BLACK_THRESHOLD_MAX 120
 #define LINE_MIN_RUN_SAMPLES 3
-#define LINE_MAX_RUN_PERCENT 85
+#define LINE_MAX_RUN_PERCENT 45
 #define LINE_MIN_VALID_ROWS 3
 #define LINE_FINISH_ROW_COVERAGE_PERCENT 50
 #define LINE_FINISH_MIN_ROWS 3
 
-/* Motion and temporal safety parameters. */
+/* 启动、丢线和终点确认均使用连续帧，避免单帧噪声直接驱动车体。 */
 #define LINE_START_DELAY_MS 600U
 #define LINE_ARM_CONFIRM_FRAMES 3U
 #define LINE_LOST_HOLD_MS 160U
@@ -53,8 +62,8 @@
 #define LINE_FRAME_TIMEOUT_MS 450U
 #define LINE_FINISH_CONFIRM_FRAMES 5U
 
-#define LINE_FORWARD_FAST 22  /* IR straight speed 30, reduced by 8. */
-#define LINE_FORWARD_MEDIUM 14 /* IR curve speed 22, reduced by 8. */
+#define LINE_FORWARD_FAST 22  /* 红外直行 30，摄像头再降 8。 */
+#define LINE_FORWARD_MEDIUM 14 /* 红外弯道 22，摄像头再降 8。 */
 #define LINE_FORWARD_SLOW 9
 #define LINE_FORWARD_CRAWL 7
 #define LINE_TURN_MAX 15
@@ -78,7 +87,7 @@
 #define START_KICK_CYCLES 3U
 #define MAX_OUTPUT 26
 
-/* These signs match the direction calibration documented by car-spin. */
+/* 方向符号与 car-spin 的实车校准一致。 */
 #define MOTOR_A_SIGN 1
 #define MOTOR_B_SIGN 1
 #define MOTOR_D_SIGN -1
@@ -93,9 +102,11 @@ typedef struct {
 typedef struct {
     bool valid;
     bool finish_candidate;
+    bool rejected_jump; /* 本帧像素中心跳变，按丢线处理而不是立即转向。 */
     int error;
     int threshold;
     uint8_t confidence;
+    uint8_t track_rows; /* 实际参与 PID 的近端行数，串口调试用。 */
 } line_observation_t;
 
 static const char *TAG = "camera_line";
@@ -113,6 +124,7 @@ static int64_t s_last_line_us;
 static int64_t s_last_log_us;
 static int s_last_error;
 static int s_tracking_error;
+static bool s_line_history_valid;
 static bool s_error_filter_initialized;
 static int s_pid_integral;
 static int s_pid_previous_error;
@@ -150,17 +162,59 @@ static uint8_t rgb565_luma(const uint8_t *pixel)
     return (uint8_t)((77 * red + 150 * green + 29 * blue) >> 8);
 }
 
+/*
+ * 把一段连续黑像素作为候选线段。距离期望位置太远的段不进入当前行，
+ * 这样从近端向上跟踪时，远处突然出现的另一条弯线会被断开。
+ */
+static void consider_run(int start_x,
+                         int sample_count,
+                         int sample_step,
+                         int width,
+                         int expected_x,
+                         int max_center_delta,
+                         int *best_distance,
+                         int *best_center,
+                         int *best_width)
+{
+    if (sample_count < LINE_MIN_RUN_SAMPLES) {
+        return;
+    }
+
+    const int run_width = sample_count * sample_step;
+    if (run_width > width * LINE_MAX_RUN_PERCENT / 100) {
+        return; /* 宽黑块留给终点判断，不拿来驱动转向。 */
+    }
+
+    const int end_x = start_x + run_width - sample_step;
+    const int center_x = (start_x + end_x) / 2;
+    const int distance = abs(center_x - expected_x);
+    if (max_center_delta >= 0 && distance > max_center_delta) {
+        return;
+    }
+
+    /* 先选离上一行最近的黑段；距离相同才比较宽度，避免噪点抢走主线。 */
+    if (distance < *best_distance ||
+        (distance == *best_distance && run_width > *best_width)) {
+        *best_distance = distance;
+        *best_center = center_x;
+        *best_width = run_width;
+    }
+}
+
 static bool scan_row(const uint8_t *frame,
                      uint16_t width,
                      int y,
                      int threshold,
+                     int expected_x,
+                     int max_center_delta,
                      int *center,
                      int *run_width,
                      int *dark_samples)
 {
     const int x_step = width >= 96 ? 2 : 1;
-    int best_count = 0;
+    int best_distance = (int)width + 1;
     int best_center = 0;
+    int best_width = 0;
     int run_start = 0;
     int run_count = 0;
     int dark_sum = 0;
@@ -181,29 +235,26 @@ static bool scan_row(const uint8_t *frame,
             continue;
         }
 
-        if (run_count > best_count) {
-            best_count = run_count;
-            best_center = (run_start + x - x_step) / 2;
+        if (run_count > 0) {
+            consider_run(run_start, run_count, x_step, width, expected_x,
+                         max_center_delta, &best_distance, &best_center, &best_width);
+            run_count = 0;
         }
-        run_count = 0;
+    }
+    if (run_count > 0) {
+        consider_run(run_start, run_count, x_step, width, expected_x,
+                     max_center_delta, &best_distance, &best_center, &best_width);
     }
 
-    /* Keep a centroid for wide bars even when their run is too wide to steer on. */
+    /* 即使黑块太宽，也保留其重心给终点检测；控制逻辑会因 best_width=0 忽略它。 */
     if (*dark_samples > 0) {
         *center = dark_sum / *dark_samples;
     }
-    if (run_count > best_count) {
-        best_count = run_count;
-        const int last_x = (((int)width - 1) / x_step) * x_step;
-        best_center = (run_start + last_x) / 2;
-    }
-
-    *run_width = best_count * x_step;
-    if (best_count < LINE_MIN_RUN_SAMPLES ||
-        *run_width > (int)width * LINE_MAX_RUN_PERCENT / 100) {
+    if (best_width == 0) {
         return false;
     }
     *center = best_center;
+    *run_width = best_width;
     return true;
 }
 
@@ -215,6 +266,7 @@ static bool observe_line(const uint8_t *frame,
     if (frame == NULL || observation == NULL || width < 16 || height < 16) {
         return false;
     }
+    *observation = (line_observation_t){0};
 
     int roi_top = (int)height * LINE_ROI_TOP_PERCENT / 100;
     int roi_bottom = (int)height * LINE_ROI_BOTTOM_PERCENT / 100;
@@ -242,6 +294,8 @@ static bool observe_line(const uint8_t *frame,
 
     const int x_step = width >= 96 ? 2 : 1;
     const int y_step = LINE_ROW_STEP;
+
+    /* 阈值在裁剪后的 ROI 内估计；远处像素只影响黑白分界，不会进入转向中心。 */
     int minimum = 255;
     int maximum = 0;
     int sample_total = 0;
@@ -269,53 +323,121 @@ static bool observe_line(const uint8_t *frame,
     if (threshold > LINE_BLACK_THRESHOLD_MAX) {
         threshold = LINE_BLACK_THRESHOLD_MAX;
     }
+    observation->threshold = threshold;
 
-    int center_sum = 0;
-    int center_weight = 0;
-    int valid_rows = 0;
-    int control_rows = 0;
-    int near_rows = 0;
+    /* 终点横黑条也只在中近景确认；远处弯道的横向黑段不能提前停车。 */
     int wide_rows = 0;
     int wide_center_sum = 0;
-    for (int y = roi_bottom; y >= roi_top; y -= y_step) {
+    const int total_row_samples = ((int)width + x_step - 1) / x_step;
+    int finish_top = control_bottom -
+                     (LINE_NEAR_BAND_ROWS + LINE_BOTTOM_SKIP_ROWS - 1) * y_step;
+    if (finish_top < control_top) {
+        finish_top = control_top;
+    }
+    for (int y = control_bottom; y >= finish_top; y -= y_step) {
         int center = 0;
         int run_width = 0;
         int dark_samples = 0;
-        const bool has_run = scan_row(frame, width, y, threshold, &center, &run_width,
-                                      &dark_samples);
-        const int total_row_samples = ((int)width + x_step - 1) / x_step;
+        (void)scan_row(frame, width, y, threshold, (int)width / 2, -1,
+                       &center, &run_width, &dark_samples);
         if (dark_samples * 100 >= total_row_samples * LINE_FINISH_ROW_COVERAGE_PERCENT) {
             ++wide_rows;
             wide_center_sum += center;
         }
-        if (y < control_top || y > control_bottom) {
-            continue;
-        }
-        ++control_rows;
-        if (has_run && run_width > 0) {
-            ++valid_rows;
-            if (near_rows < LINE_NEAR_ROWS) {
-                const int weight = LINE_NEAR_ROWS - near_rows;
-                center_sum += center * weight;
-                center_weight += weight;
-                ++near_rows;
-            }
-        }
+    }
+    const int finish_center = wide_rows > 0 ? wide_center_sum / wide_rows : (int)width / 2;
+    observation->finish_candidate = wide_rows >= LINE_FINISH_MIN_ROWS &&
+                                     finish_center >= (int)width / 5 &&
+                                     finish_center <= (int)width * 4 / 5;
+
+    /*
+     * 近端跟踪：从控制区底部略过遮挡行后，只看固定的 6 行。
+     * 第一条有效黑段作为锚点；之后每一行必须与上一行连续，否则立即停止，
+     * 因而远处锐角/直角支路不会被“跨空”接入中心计算。
+     */
+    int start_y = control_bottom;
+    /* 控制区很窄时不要为了跳过遮挡而牺牲最少的 3 行有效样本。 */
+    if (control_bottom - control_top >=
+        (LINE_MIN_VALID_ROWS + LINE_BOTTOM_SKIP_ROWS - 1) * y_step) {
+        start_y -= LINE_BOTTOM_SKIP_ROWS * y_step;
+    }
+    int near_top = start_y - (LINE_NEAR_BAND_ROWS - 1) * y_step;
+    if (near_top < control_top) {
+        near_top = control_top;
+    }
+    int band_rows = 0;
+    for (int y = start_y; y >= near_top; y -= y_step) {
+        ++band_rows;
     }
 
-    observation->threshold = threshold;
-    observation->finish_candidate = wide_rows >= LINE_FINISH_MIN_ROWS &&
-                                     (wide_center_sum / (wide_rows ? wide_rows : 1)) >=
-                                         (int)width / 5 &&
-                                     (wide_center_sum / (wide_rows ? wide_rows : 1)) <=
-                                         (int)width * 4 / 5;
-    observation->confidence = (uint8_t)((valid_rows * 100) /
-                                        (control_rows ? control_rows : 1));
+    int expected_x = (int)width / 2;
+    if (s_line_history_valid) {
+        int image_error = s_last_error;
+#if CAMERA_LINE_MIRROR_X
+        image_error = -image_error;
+#endif
+        expected_x += image_error * (int)width / 200;
+    }
+    if (expected_x < 0) {
+        expected_x = 0;
+    }
+    if (expected_x >= (int)width) {
+        expected_x = (int)width - 1;
+    }
+    int center_step_limit = (int)width * LINE_MAX_CENTER_STEP_PERCENT / 100;
+    if (center_step_limit < 4) {
+        center_step_limit = 4;
+    }
+
+    int center_sum = 0;
+    int center_weight = 0;
+    int valid_rows = 0;
+    int anchor_attempts = 0;
+    int previous_center = expected_x;
+    bool anchored = false;
+    bool continuity_rejected = false;
+    for (int y = start_y; y >= near_top; y -= y_step) {
+        int center = 0;
+        int run_width = 0;
+        int dark_samples = 0;
+        /* 有上一帧时锚点也不能瞬移；首次上电则允许从画面中心重新捕获。 */
+        const int max_delta = anchored ? center_step_limit :
+                              (s_line_history_valid ? center_step_limit * 2 : -1);
+        const bool has_run = scan_row(frame, width, y, threshold, previous_center, max_delta,
+                                      &center, &run_width, &dark_samples);
+        if (!anchored) {
+            ++anchor_attempts;
+            if (!has_run) {
+                continuity_rejected = s_line_history_valid;
+                if (anchor_attempts >= LINE_ANCHOR_SEARCH_ROWS) {
+                    break;
+                }
+                continue;
+            }
+            anchored = true;
+        } else if (!has_run) {
+            continuity_rejected = s_line_history_valid;
+            break;
+        }
+
+        if (valid_rows >= LINE_NEAR_ROWS) {
+            break;
+        }
+        const int weight = LINE_NEAR_ROWS - valid_rows;
+        center_sum += center * weight;
+        center_weight += weight;
+        previous_center = center;
+        ++valid_rows;
+    }
+
+    const int required_rows = LINE_NEAR_ROWS < band_rows ? LINE_NEAR_ROWS : band_rows;
+    observation->track_rows = (uint8_t)valid_rows;
+    observation->confidence = (uint8_t)(valid_rows * 100 / (required_rows ? required_rows : 1));
     if (observation->confidence > 100) {
         observation->confidence = 100;
     }
     if (valid_rows < LINE_MIN_VALID_ROWS || center_weight == 0) {
-        observation->valid = false;
+        observation->rejected_jump = continuity_rejected;
         return false;
     }
 
@@ -325,6 +447,12 @@ static bool observe_line(const uint8_t *frame,
 #if CAMERA_LINE_MIRROR_X
     error = -error;
 #endif
+
+    /* 一帧若突然跳出很大误差，先当作远端支路/噪声，交给丢线保持逻辑。 */
+    if (s_line_history_valid && abs(error - s_last_error) > LINE_MAX_ERROR_STEP) {
+        observation->rejected_jump = true;
+        return false;
+    }
     observation->error = error;
     observation->valid = true;
     return true;
@@ -345,6 +473,7 @@ static void set_motor_duty(const motor_t *motor, int output)
 
 static void motor_set(const motor_t *motor, int command)
 {
+    /* command 是混控层的有符号 PWM；换向时先清零，避免 TB6612 硬切方向。 */
     const int index = (int)motor->channel;
     int speed = clamp_int(command * motor->sign, MAX_OUTPUT);
     const int direction = (speed > 0) - (speed < 0);
@@ -400,6 +529,7 @@ static void stop_motors(void)
 
 static void drive(int forward, int turn)
 {
+    /* 直行向量固定为 A=-forward、D=forward、B=0；只有 turn 非零才动后轮 B。 */
     s_command_a = clamp_int(-forward - turn, MAX_OUTPUT);
     s_command_b = clamp_int(turn, MAX_OUTPUT);
     s_command_d = clamp_int(forward - turn, MAX_OUTPUT);
@@ -421,6 +551,7 @@ static void drive_spin(int direction)
 static void reset_tracking(void)
 {
     s_tracking_error = 0;
+    s_line_history_valid = false;
     s_error_filter_initialized = false;
     s_pid_integral = 0;
     s_pid_previous_error = 0;
@@ -429,6 +560,8 @@ static void reset_tracking(void)
 
 static int pid_steering(int error)
 {
+    /* 低精度位置式 PID：先做整数低通，再用死区、积分限幅和斜率限幅。 */
+    /* error>0 表示黑线在画面右侧，当前电机校准要求输出相反方向的修正。 */
     if (!s_error_filter_initialized) {
         s_tracking_error = error;
         s_pid_previous_error = error;
@@ -497,11 +630,13 @@ static void log_state(const char *mode, const line_observation_t *observation)
         return;
     }
     s_last_log_us = now;
-    ESP_LOGI(TAG, "mode=%s line=%d err=%d filt=%d conf=%u threshold=%d motor[A,B,D]=[%d,%d,%d]",
+    ESP_LOGI(TAG, "mode=%s line=%d jump=%d err=%d filt=%d rows=%u conf=%u threshold=%d motor[A,B,D]=[%d,%d,%d]",
              mode,
              observation != NULL && observation->valid,
+             observation != NULL && observation->rejected_jump,
              observation != NULL && observation->valid ? observation->error : s_last_error,
              s_tracking_error,
+             (unsigned)(observation != NULL ? observation->track_rows : 0),
              (unsigned)(observation != NULL ? observation->confidence : s_last_confidence),
              observation != NULL ? observation->threshold : s_last_threshold,
              s_command_a, s_command_b, s_command_d);
@@ -637,16 +772,22 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
     if (line_seen) {
         s_last_line_us = now;
         s_last_error = observation.error;
+        s_line_history_valid = true;
     }
 
+    /* 先确认画面稳定，再允许 STBY；复位后不会因为一帧误检突然起步。 */
     if (!s_armed) {
         if (line_seen && now - s_first_frame_us >= (int64_t)LINE_START_DELAY_MS * 1000) {
             if (s_arm_frames < LINE_ARM_CONFIRM_FRAMES) {
                 ++s_arm_frames;
             }
             if (s_arm_frames >= LINE_ARM_CONFIRM_FRAMES) {
+                const int confirmed_error = observation.error;
                 s_armed = true;
                 reset_tracking();
+                /* 重置 PID 后保留刚确认的图像位置，防止起步第一帧跳到远处支路。 */
+                s_last_error = confirmed_error;
+                s_line_history_valid = true;
                 gpio_set_level(STBY_GPIO, 1);
                 ESP_LOGI(TAG, "Line confirmed; camera steering enabled");
             }
@@ -684,12 +825,15 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
         return;
     }
 
+    /* 丢线时先保持最后方向低速走，再原地搜索；超过时限直接停车。 */
     const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
     const int search_direction = s_tracking_error < 0 ? 1 : -1;
     if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
-        const int turn = search_direction * (LINE_TURN_MAX / 2);
+        /* 跳变拒绝时保持直行，避免远处支路在第一帧触发旧方向修正。 */
+        const int turn = observation.rejected_jump ? 0 :
+                         search_direction * (LINE_TURN_MAX / 2);
         drive(LINE_FORWARD_CRAWL, turn);
-        log_state("LOST-HOLD", &observation);
+        log_state(observation.rejected_jump ? "JUMP-HOLD" : "LOST-HOLD", &observation);
     } else if (lost_us <= (int64_t)LINE_LOST_SEARCH_MS * 1000) {
         drive_spin(search_direction);
         log_state("SEARCH", &observation);
