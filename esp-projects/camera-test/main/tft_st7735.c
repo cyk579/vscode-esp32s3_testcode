@@ -15,8 +15,9 @@
 #define TFT_CS   GPIO_NUM_47
 #define TFT_RST  GPIO_NUM_38
 
-#define TFT_SPI_CLOCK_HZ 20000000
-#define TFT_MADCTL_LANDSCAPE 0xA8
+#define TFT_SPI_CLOCK_HZ 8000000
+/* MX+MY+MV landscape; this panel uses RGB order (BGR bit cleared). */
+#define TFT_MADCTL_LANDSCAPE 0xA0
 
 static const char *TAG = "tft";
 static spi_device_handle_t s_tft;

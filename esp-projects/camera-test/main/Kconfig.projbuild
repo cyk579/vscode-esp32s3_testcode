@@ -5,6 +5,14 @@ menu "Example Configuration"
         help
             Enables streaming of captured video.
 
+    config EXAMPLE_ENABLE_SERVO_TEST
+        bool "Run servo test at startup"
+        default n
+        help
+            Runs the short pan/tilt servo movement test before USB Host starts.
+            Keep this disabled when the servos are not powered from a separate
+            stable 5 V supply.
+
     choice EXAMPLE_UVC_PROTOCOL_MODE
         prompt "UVC Protocol mode"
         default EXAMPLE_UVC_PROTOCOL_MODE_AUTO

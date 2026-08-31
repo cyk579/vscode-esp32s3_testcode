@@ -25,6 +25,8 @@
 static const char *TAG = "example";
 
 #define USB_DISCONNECT_PIN  GPIO_NUM_0
+
+#if CONFIG_EXAMPLE_ENABLE_SERVO_TEST
 #define PAN_SERVO_PIN       GPIO_NUM_1
 #define TILT_SERVO_PIN      GPIO_NUM_2
 #define SERVO_TIMER         LEDC_TIMER_1
@@ -95,9 +97,10 @@ static void servo_test(void)
     servo_set_pulse(LEDC_CHANNEL_0, 1500);
     servo_set_pulse(LEDC_CHANNEL_1, 1500);
 }
+#endif
 
 #if (CONFIG_EXAMPLE_UVC_PROTOCOL_MODE_AUTO)
-#define EXAMPLE_UVC_PROTOCOL_AUTO_COUNT     3
+#define EXAMPLE_UVC_PROTOCOL_AUTO_COUNT     4
 typedef struct {
     enum uvc_frame_format format;
     int width;
@@ -107,8 +110,9 @@ typedef struct {
 } uvc_stream_profile_t;
 
 uvc_stream_profile_t uvc_stream_profiles[EXAMPLE_UVC_PROTOCOL_AUTO_COUNT] = {
+    {UVC_FRAME_FORMAT_MJPEG, 480, 320, 25, "480x320, fps 25"},
+    {UVC_FRAME_FORMAT_MJPEG, 480, 320,  0, "480x320, any fps"},
     {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, "320x240, fps 30"},
-    {UVC_FRAME_FORMAT_MJPEG, 320, 240,  0, "320x240, any fps"},
     {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, "640x480, fps 15"}
 };
 #endif // CONFIG_EXAMPLE_UVC_PROTOCOL_MODE_AUTO
@@ -331,7 +335,11 @@ void app_main(void)
     ESP_LOGI(TAG, "Diagnostic window: USB Host starts in 15 seconds");
     vTaskDelay(pdMS_TO_TICKS(15000));
 
+#if CONFIG_EXAMPLE_ENABLE_SERVO_TEST
     servo_test();
+#else
+    ESP_LOGI(TAG, "Servo test disabled; continuing to USB Host");
+#endif
 
     app_flags = xEventGroupCreate();
     assert(app_flags);
@@ -395,9 +403,10 @@ void app_main(void)
         uvc_print_diag(devh, stderr);
         // Negotiate stream profile
         if (UVC_SUCCESS == uvc_negotiate_stream_profile(devh, &ctrl)) {
-            // dwMaxPayloadTransferSize has to be overwritten to MPS (maximum packet size)
-            // supported by ESP32-S2(S3), as libuvc selects the highest possible MPS by default.
-            ctrl.dwMaxPayloadTransferSize = 512;
+            // This camera exposes a 64-byte bulk endpoint. Keep each USB
+            // transfer to one payload packet; larger transfers concatenate
+            // several UVC headers and corrupt the JPEG byte stream.
+            ctrl.dwMaxPayloadTransferSize = 64;
 
             uvc_print_stream_ctrl(&ctrl, stderr);
 

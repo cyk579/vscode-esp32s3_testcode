@@ -1,5 +1,6 @@
 #include "camera_display.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_heap_caps.h"
@@ -15,11 +16,13 @@
 #define CAMERA_DISPLAY_MAX_JPEG_BYTES (160 * 1024)
 #define CAMERA_DISPLAY_RGB565_BYTES \
     (TFT_ST7735_WIDTH * (TFT_ST7735_HEIGHT - 8) * 2)
+#define CAMERA_DISPLAY_JPEG_WORK_BYTES (16 * 1024)
 
 typedef struct {
     uint8_t *jpeg_slots[CAMERA_DISPLAY_SLOT_COUNT];
     size_t jpeg_sizes[CAMERA_DISPLAY_SLOT_COUNT];
     uint8_t *rgb565;
+    uint8_t *jpeg_work;
     QueueHandle_t free_slots;
     QueueHandle_t ready_slots;
     bool started;
@@ -58,6 +61,30 @@ static bool choose_scale(uint16_t source_width,
 
 static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
 {
+    static bool logged_format_diagnostic;
+    /* A number of MJPEG UVC devices prepend a private payload prefix even
+     * though they advertise the stream as MJPEG. Trim everything before the
+     * JPEG SOI marker and ignore trailing bytes after EOI. */
+    size_t soi = 0;
+    while (soi + 1 < jpeg_len && !(jpeg[soi] == 0xff && jpeg[soi + 1] == 0xd8)) {
+        ++soi;
+    }
+    if (soi + 1 >= jpeg_len) {
+        ESP_LOGW(TAG, "MJPEG frame has no JPEG SOI marker (len=%u)", (unsigned)jpeg_len);
+        return false;
+    }
+    if (soi > 0) {
+        jpeg += soi;
+        jpeg_len -= soi;
+    }
+
+    for (size_t i = 2; i + 1 < jpeg_len; ++i) {
+        if (jpeg[i] == 0xff && jpeg[i + 1] == 0xd9) {
+            jpeg_len = i + 2;
+            break;
+        }
+    }
+
     esp_jpeg_image_cfg_t info_config = {
         .indata = jpeg,
         .indata_size = jpeg_len,
@@ -68,6 +95,40 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
     esp_err_t err = esp_jpeg_get_image_info(&info_config, &source_info);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "MJPEG header is not a baseline JPEG: %s", esp_err_to_name(err));
+        if (!logged_format_diagnostic) {
+            logged_format_diagnostic = true;
+            size_t sof0 = 0, sof2 = 0, dht = 0, dqt = 0;
+            for (size_t i = 0; i + 1 < jpeg_len; ++i) {
+                if (jpeg[i] != 0xff) {
+                    continue;
+                }
+                switch (jpeg[i + 1]) {
+                case 0xc0: sof0++; break;
+                case 0xc2: sof2++; break;
+                case 0xc4: dht++; break;
+                case 0xdb: dqt++; break;
+                default: break;
+                }
+            }
+            char head[3 * 32 + 1] = {0};
+            size_t head_len = jpeg_len < 32 ? jpeg_len : 32;
+            for (size_t i = 0; i < head_len; ++i) {
+                snprintf(head + i * 3, 4, "%02x ", jpeg[i]);
+            }
+            char markers[160] = {0};
+            size_t marker_pos = 0;
+            for (size_t i = 0; i + 1 < jpeg_len && marker_pos + 8 < sizeof(markers); ++i) {
+                if (jpeg[i] == 0xff && jpeg[i + 1] != 0x00 && jpeg[i + 1] != 0xff) {
+                    int written = snprintf(markers + marker_pos, sizeof(markers) - marker_pos,
+                                            "%02x@%u ", jpeg[i + 1], (unsigned)i);
+                    if (written > 0) marker_pos += (size_t)written;
+                }
+            }
+            ESP_LOGW(TAG, "JPEG diagnostic len=%u SOF0=%u SOF2=%u DQT=%u DHT=%u head=%s",
+                     (unsigned)jpeg_len, (unsigned)sof0, (unsigned)sof2,
+                     (unsigned)dqt, (unsigned)dht, head);
+            ESP_LOGW(TAG, "JPEG markers: %s", markers);
+        }
         return false;
     }
 
@@ -86,8 +147,13 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
         .out_format = JPEG_IMAGE_FORMAT_RGB565,
         .out_scale = scale,
         .flags = {
-            // ST7735 expects the high byte of each RGB565 pixel first.
+            /* Decoder RGB565 words are little-endian in memory; ST7735
+             * expects the high byte first on the wire. */
             .swap_color_bytes = true,
+        },
+        .advanced = {
+            .working_buffer = s_display.jpeg_work,
+            .working_buffer_size = CAMERA_DISPLAY_JPEG_WORK_BYTES,
         },
     };
     esp_jpeg_image_output_t output = {0};
@@ -150,6 +216,8 @@ static void release_allocations(void)
     }
     heap_caps_free(s_display.rgb565);
     s_display.rgb565 = NULL;
+    heap_caps_free(s_display.jpeg_work);
+    s_display.jpeg_work = NULL;
     if (s_display.free_slots != NULL) {
         vQueueDelete(s_display.free_slots);
         s_display.free_slots = NULL;
@@ -192,6 +260,14 @@ esp_err_t camera_display_start(void)
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_display.rgb565 == NULL) {
         ESP_LOGE(TAG, "Could not allocate RGB565 frame buffer");
+        release_allocations();
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_display.jpeg_work = heap_caps_malloc(CAMERA_DISPLAY_JPEG_WORK_BYTES,
+                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (s_display.jpeg_work == NULL) {
+        ESP_LOGE(TAG, "Could not allocate JPEG working buffer");
         release_allocations();
         return ESP_ERR_NO_MEM;
     }

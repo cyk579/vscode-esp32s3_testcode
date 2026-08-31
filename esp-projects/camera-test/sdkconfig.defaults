@@ -26,7 +26,9 @@ CONFIG_ESP_WIFI_RX_BA_WIN=8
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=15000
 
 # Use the fixed native USB OTG pins on ESP32-S3 for the camera host.
-CONFIG_EXAMPLE_ENABLE_STREAMING=y
+# Keep Wi-Fi/TCP streaming off in the vehicle build so the local TFT preview
+# does not depend on a hotspot and has more power headroom for the camera.
+# CONFIG_EXAMPLE_ENABLE_STREAMING is not set
 
 # Decode UVC MJPEG frames to the ST7735's RGB565 input.  Use the external
 # decoder so common UVC frames without an embedded Huffman table also work.
