@@ -13,7 +13,7 @@
 #include "tft_st7735.h"
 
 #define CAMERA_DISPLAY_SLOT_COUNT 2
-#define CAMERA_DISPLAY_MAX_JPEG_BYTES (160 * 1024)
+#define CAMERA_DISPLAY_MAX_JPEG_BYTES (256 * 1024)
 #define CAMERA_DISPLAY_RGB565_BYTES \
     (TFT_ST7735_WIDTH * (TFT_ST7735_HEIGHT - 8) * 2)
 #define CAMERA_DISPLAY_JPEG_WORK_BYTES (16 * 1024)
@@ -26,6 +26,9 @@ typedef struct {
     QueueHandle_t free_slots;
     QueueHandle_t ready_slots;
     bool started;
+    bool tft_ready;
+    camera_display_frame_callback_t frame_callback;
+    void *frame_callback_ctx;
     uint16_t previous_width;
     uint16_t previous_height;
     uint32_t frames_drawn;
@@ -169,6 +172,15 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
         return false;
     }
 
+    if (s_display.frame_callback != NULL) {
+        s_display.frame_callback(s_display.rgb565, output.width, output.height,
+                                 s_display.frame_callback_ctx);
+    }
+
+    if (!s_display.tft_ready) {
+        return true;
+    }
+
     if (output.width != s_display.previous_width || output.height != s_display.previous_height) {
         tft_st7735_fill(0x0000);
         s_display.previous_width = output.width;
@@ -201,7 +213,7 @@ static void camera_display_task(void *arg)
 
         const int64_t now = esp_timer_get_time();
         if (now >= next_report_us) {
-            ESP_LOGI(TAG, "TFT frames=%u, skipped=%u", (unsigned)s_display.frames_drawn,
+            ESP_LOGI(TAG, "Decoded frames=%u, skipped=%u", (unsigned)s_display.frames_drawn,
                      (unsigned)s_display.frames_dropped);
             next_report_us = now + 5000000;
         }
@@ -233,8 +245,9 @@ esp_err_t camera_display_start(void)
     if (s_display.started) {
         return ESP_OK;
     }
-    if (!tft_st7735_init()) {
-        return ESP_FAIL;
+    s_display.tft_ready = tft_st7735_init();
+    if (!s_display.tft_ready) {
+        ESP_LOGW(TAG, "ST7735 unavailable; decoded-frame callbacks remain active");
     }
 
     s_display.free_slots = xQueueCreate(CAMERA_DISPLAY_SLOT_COUNT, sizeof(uint8_t));
@@ -279,9 +292,17 @@ esp_err_t camera_display_start(void)
     }
 
     s_display.started = true;
-    ESP_LOGI(TAG, "TFT preview started; JPEG frames larger than %u bytes are skipped",
+    ESP_LOGI(TAG, "Camera decoder started; TFT preview=%s; JPEG frames larger than %u bytes are skipped",
+             s_display.tft_ready ? "ready" : "disabled",
              CAMERA_DISPLAY_MAX_JPEG_BYTES);
     return ESP_OK;
+}
+
+void camera_display_set_frame_callback(camera_display_frame_callback_t callback,
+                                       void *user_ctx)
+{
+    s_display.frame_callback = callback;
+    s_display.frame_callback_ctx = user_ctx;
 }
 
 bool camera_display_submit(const uint8_t *jpeg, size_t jpeg_len)

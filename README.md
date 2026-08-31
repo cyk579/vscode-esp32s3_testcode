@@ -7,7 +7,7 @@
 | 工程 | 功能 |
 | --- | --- |
 | `esp-projects/car-spin` | 三轮小车电机控制、四路红外检测与巡线 |
-| `esp-projects/camera-test` | USB 摄像头枚举、ST7735 本地预览、Wi-Fi MJPEG 图像传输与抓拍测试 |
+| `esp-projects/camera-test` | USB 摄像头枚举、RGB565 黑线识别、三轮车巡线、ST7735 本地预览与可选 Wi-Fi 图像传输 |
 
 每个工程的接线、参数和运行方法请查看对应目录中的 `README.md`。
 

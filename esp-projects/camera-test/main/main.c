@@ -3,9 +3,13 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <assert.h>
 #include <stdio.h>
 #include <unistd.h>
 #include "camera_display.h"
+#if CONFIG_EXAMPLE_ENABLE_CAMERA_LINE_FOLLOW
+#include "camera_line_follow.h"
+#endif
 #include "esp_log.h"
 #include "tcp_server.h"
 #include "libuvc/libuvc.h"
@@ -100,7 +104,7 @@ static void servo_test(void)
 #endif
 
 #if (CONFIG_EXAMPLE_UVC_PROTOCOL_MODE_AUTO)
-#define EXAMPLE_UVC_PROTOCOL_AUTO_COUNT     4
+#define EXAMPLE_UVC_PROTOCOL_AUTO_COUNT     5
 typedef struct {
     enum uvc_frame_format format;
     int width;
@@ -113,7 +117,8 @@ uvc_stream_profile_t uvc_stream_profiles[EXAMPLE_UVC_PROTOCOL_AUTO_COUNT] = {
     {UVC_FRAME_FORMAT_MJPEG, 480, 320, 25, "480x320, fps 25"},
     {UVC_FRAME_FORMAT_MJPEG, 480, 320,  0, "480x320, any fps"},
     {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, "320x240, fps 30"},
-    {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, "640x480, fps 15"}
+    {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, "640x480, fps 15"},
+    {UVC_FRAME_FORMAT_MJPEG, 1280, 720,  0, "1280x720, any fps"}
 };
 #endif // CONFIG_EXAMPLE_UVC_PROTOCOL_MODE_AUTO
 
@@ -319,9 +324,21 @@ void app_main(void)
     ESP_LOGI(TAG, "USB wiring under test: GPIO19=D-, GPIO20=D+");
     ESP_LOGI(TAG, "Camera must also have 5 V VBUS and common GND");
 
+#if CONFIG_EXAMPLE_ENABLE_CAMERA_LINE_FOLLOW
+    esp_err_t line_follow_err = camera_line_follow_start();
+    if (line_follow_err == ESP_OK) {
+        camera_display_set_frame_callback(camera_line_follow_frame_callback, NULL);
+        ESP_LOGI(TAG, "Camera black-line following enabled; TB6612 standby is held low until arm");
+    } else {
+        ESP_LOGE(TAG, "Camera black-line following disabled: %s", esp_err_to_name(line_follow_err));
+    }
+#else
+    ESP_LOGI(TAG, "Camera black-line following disabled in menuconfig");
+#endif
+
     esp_err_t display_err = camera_display_start();
     if (display_err == ESP_OK) {
-        ESP_LOGI(TAG, "ST7735 preview ready (160x128 landscape)");
+        ESP_LOGI(TAG, "Camera JPEG decoder ready (TFT preview is optional, 160x128 landscape)");
     } else {
         ESP_LOGW(TAG, "ST7735 preview unavailable: %s; PC streaming remains available",
                  esp_err_to_name(display_err));
@@ -434,5 +451,9 @@ void app_main(void)
     ESP_LOGI(TAG, "UVC exited");
 
     uninitialize_usb_host_lib();
+
+#if CONFIG_EXAMPLE_ENABLE_CAMERA_LINE_FOLLOW
+    camera_line_follow_stop();
+#endif
 
 }

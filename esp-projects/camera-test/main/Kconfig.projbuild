@@ -5,6 +5,15 @@ menu "Example Configuration"
         help
             Enables streaming of captured video.
 
+    config EXAMPLE_ENABLE_CAMERA_LINE_FOLLOW
+        bool "Enable camera black-line following"
+        default y
+        depends on !EXAMPLE_ENABLE_SERVO_TEST
+        help
+            Decodes each UVC MJPEG frame and drives the three-wheel TB6612
+            vehicle from the black-line position.  The motors remain in
+            standby until a line is confirmed for several frames.
+
     config EXAMPLE_ENABLE_SERVO_TEST
         bool "Run servo test at startup"
         default n
@@ -20,12 +29,14 @@ menu "Example Configuration"
         config EXAMPLE_UVC_PROTOCOL_MODE_AUTO
             bool "Auto"
             help
-                When protocol mode set to Auto, the example tries to make three attempts to negotiate
+                When protocol mode set to Auto, the example tries to make five attempts to negotiate
                 the protocol with following parameters:
-                1 Attempt: 320x240, 30 FPS, MJPEG
-                2 Attempt: 320x240, first available FPS, MJPEG
-                3 Attempt: 640x480, 15 FPS, MJPEG
-                If all three attempts result in an error, the example displays the error message and
+                1 Attempt: 480x320, 25 FPS, MJPEG
+                2 Attempt: 480x320, first available FPS, MJPEG
+                3 Attempt: 320x240, 30 FPS, MJPEG
+                4 Attempt: 640x480, 15 FPS, MJPEG
+                5 Attempt: 1280x720, first available FPS, MJPEG
+                If all five attempts result in an error, the example displays the error message and
                 suggests to try another USB UVC Device.
 
         config EXAMPLE_UVC_PROTOCOL_MODE_CUSTOM
