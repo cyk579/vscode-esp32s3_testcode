@@ -29,6 +29,7 @@
 static const char *TAG = "example";
 
 #define USB_DISCONNECT_PIN  GPIO_NUM_0
+#define USB_DIAGNOSTIC_WINDOW_MS 3000U
 
 #if CONFIG_EXAMPLE_ENABLE_SERVO_TEST
 #define PAN_SERVO_PIN       GPIO_NUM_1
@@ -349,8 +350,9 @@ void app_main(void)
     ESP_LOGI(TAG, "Wi-Fi AP initialization complete");
 
     // Keep USB-Serial/JTAG alive briefly before GPIO19/20 become USB Host.
-    ESP_LOGI(TAG, "Diagnostic window: USB Host starts in 15 seconds");
-    vTaskDelay(pdMS_TO_TICKS(15000));
+    ESP_LOGI(TAG, "Diagnostic window: USB Host starts in %u seconds",
+             (unsigned)(USB_DIAGNOSTIC_WINDOW_MS / 1000U));
+    vTaskDelay(pdMS_TO_TICKS(USB_DIAGNOSTIC_WINDOW_MS));
 
 #if CONFIG_EXAMPLE_ENABLE_SERVO_TEST
     servo_test();

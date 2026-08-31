@@ -138,7 +138,7 @@ idf.py -p COM6 -b 115200 flash
 
 只有在 `Enable streaming` 开启时，程序才会先创建 Wi-Fi 热点，再初始化 USB Host；默认巡线配置关闭该选项，因此应通过串口日志判断固件是否运行到应用层。启用 streaming 时，即使 D+/D- 接反也应该能看到热点；热点不存在时先检查开发板供电或 UART0 日志。
 
-复位后的前 15 秒是诊断窗口：启用 streaming 时热点应在这段时间内出现；15 秒后程序把 GPIO19/20 切换为 USB Host，COM6 正常消失，这不代表掉电或崩溃。
+复位后的前 3 秒是诊断窗口：启用 streaming 时热点应在这段时间内出现；3 秒后程序把 GPIO19/20 切换为 USB Host，COM6 正常消失，这不代表掉电或崩溃。
 
 启用 streaming 后，电脑端连接方式如下：
 
@@ -177,7 +177,7 @@ ESP32-S3 是 USB Full Speed Host，程序依次尝试 MJPEG `480×320@25 FPS`、
 
 ## 摄像头巡黑线
 
-`Enable camera black-line following` 默认开启。程序使用解码帧的下半部作为 ROI：在白底上寻找连续的黑色像素带，按多个水平扫描行加权得到线中心，再用 PID 输出三轮差速/旋转量。相机图片中的 104° 广角镜头可以覆盖赛道，但必须刚性朝下安装，车体中心线与镜头中心尽量重合，并让黑线进入画面下半部；不要让车头、轮胎或支架遮住 ROI。
+`Enable camera black-line following` 默认开启。程序在较宽区域内计算黑色阈值和终点条，在近端控制区域寻找连续的黑色像素带；近处扫描行使用平方权重，降低远处锐角弯对当前转向的影响，并避开画面最底部可能对应的车体/盲区。最后用经过低通和转向限速的 PID 输出三轮差速/旋转量。相机图片中的 104° 广角镜头可以覆盖赛道，但必须刚性朝下安装，车体中心线与镜头中心尽量重合，并让黑线进入画面下半部；不要让车头、轮胎或支架遮住控制区域。
 
 启动和停车条件如下：
 
@@ -190,14 +190,18 @@ ESP32-S3 是 USB Full Speed Host，程序依次尝试 MJPEG `480×320@25 FPS`、
 | 参数 | 默认值 | 作用 |
 | --- | ---: | --- |
 | `CAMERA_LINE_MIRROR_X` | `0` | 画面左右相反时改为 `1` |
-| `LINE_ROI_TOP_PERCENT` / `LINE_ROI_BOTTOM_PERCENT` | `45` / `95` | 黑线搜索的垂直范围 |
-| `LINE_MIN_CONTRAST` | `28` | 低于此帧对比度时判定为无可靠线 |
-| `LINE_BLACK_THRESHOLD_MIN/MAX` | `45` / `145` | 自适应黑色阈值上下限 |
-| `LINE_FORWARD_FAST` | `28` | 直线基础速度（PWM 百分比） |
-| `LINE_TURN_MAX` | `30` | 最大转向量 |
-| `LINE_PID_KP/KI/KD` | `30/1/10` | 比例、积分、微分增益 |
+| `LINE_ROI_TOP_PERCENT` / `LINE_ROI_BOTTOM_PERCENT` | `45` / `95` | 阈值和终点条检测范围 |
+| `LINE_CONTROL_TOP_PERCENT` / `LINE_CONTROL_BOTTOM_PERCENT` | `55` / `90` | 实际转向控制范围；提前响应弯道时调大 TOP，盲区遮挡时调小 BOTTOM |
+| `LINE_MIN_CONTRAST` | `32` | 低于此帧对比度时判定为无可靠线 |
+| `LINE_BLACK_THRESHOLD_MIN/MAX` | `35` / `120` | 自适应黑色阈值上下限，降低灰色阴影误检 |
+| `LINE_MIN_RUN_SAMPLES` / `LINE_MIN_VALID_ROWS` | `3` / `3` | 连续黑像素和有效扫描行的最小数量 |
+| `LINE_FORWARD_FAST` | `18` | 直线基础速度（PWM 百分比） |
+| `LINE_TURN_MAX` | `20` | 最大转向量 |
+| `LINE_PID_KP/KI/KD` | `18/0/6` | 比例、积分、微分增益；积分关闭以避免低精度累积漂移 |
+| `LINE_ERROR_FILTER_DIV` | `4` | 误差低通分母，越大越平滑 |
+| `LINE_TURN_SLEW_PER_FRAME` | `3` | 每帧转向最大变化量，抑制单帧急转 |
 
-第一次地面测试建议按以下顺序：架空车轮确认 Motor A/D 直行方向；把车放在赛道长直段，确认日志中的 `line=1` 和 `err` 随黑线左右变化；再逐步提高 `LINE_FORWARD_FAST`。如果黑线在屏幕右侧而车向左修正，先把 `CAMERA_LINE_MIRROR_X` 改为 `1`，不要先改电机方向。
+第一次地面测试建议按以下顺序：架空车轮确认 Motor A/D 直行方向；把车放在赛道长直段，确认日志中的 `line=1`、`err` 和 `filt` 随黑线左右变化；再逐步提高 `LINE_FORWARD_FAST`。如果黑线在屏幕右侧而车向左修正，先把 `CAMERA_LINE_MIRROR_X` 改为 `1`，不要先改电机方向。若仍提前响应远处弯道，把 `LINE_CONTROL_TOP_PERCENT` 调大；若近端黑线落在盲区之外，把 `LINE_CONTROL_BOTTOM_PERCENT` 调小或把 TOP 调小。
 
 需要只测试摄像头而不让车动时，在 `idf.py menuconfig -> Example Configuration` 关闭 `Enable camera black-line following`，并把 TB6612 的 `STBY` 固定拉低。不要同时开启舵机测试：舵机配置会与整车接线/LEDC 资源冲突。
 

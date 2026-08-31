@@ -30,14 +30,16 @@
 /* Image processing parameters.  The camera should point down at the track. */
 #define LINE_ROI_TOP_PERCENT 45
 #define LINE_ROI_BOTTOM_PERCENT 95
+#define LINE_CONTROL_TOP_PERCENT 55
+#define LINE_CONTROL_BOTTOM_PERCENT 90
 #define LINE_ROW_STEP 3
-#define LINE_MIN_CONTRAST 28
-#define LINE_BLACK_FRACTION_PERCENT 42
-#define LINE_BLACK_THRESHOLD_MIN 45
-#define LINE_BLACK_THRESHOLD_MAX 145
-#define LINE_MIN_RUN_SAMPLES 2
+#define LINE_MIN_CONTRAST 32
+#define LINE_BLACK_FRACTION_PERCENT 30
+#define LINE_BLACK_THRESHOLD_MIN 35
+#define LINE_BLACK_THRESHOLD_MAX 120
+#define LINE_MIN_RUN_SAMPLES 3
 #define LINE_MAX_RUN_PERCENT 70
-#define LINE_MIN_VALID_ROWS 2
+#define LINE_MIN_VALID_ROWS 3
 #define LINE_FINISH_ROW_COVERAGE_PERCENT 58
 #define LINE_FINISH_MIN_ROWS 3
 
@@ -50,25 +52,31 @@
 #define LINE_FRAME_TIMEOUT_MS 450U
 #define LINE_FINISH_CONFIRM_FRAMES 6U
 
-#define LINE_FORWARD_FAST 28
-#define LINE_FORWARD_MEDIUM 22
-#define LINE_FORWARD_SLOW 16
-#define LINE_FORWARD_CRAWL 11
-#define LINE_TURN_MAX 30
-#define LINE_PID_KP 30
-#define LINE_PID_KI 1
-#define LINE_PID_KD 10
+#define LINE_FORWARD_FAST 18
+#define LINE_FORWARD_MEDIUM 14
+#define LINE_FORWARD_SLOW 10
+#define LINE_FORWARD_CRAWL 7
+#define LINE_TURN_MAX 20
+#define LINE_PID_KP 18
+#define LINE_PID_KI 0
+#define LINE_PID_KD 6
 #define LINE_PID_SCALE 100
-#define LINE_PID_DEADBAND 3
-#define LINE_PID_INTEGRAL_LIMIT 220
+#define LINE_PID_DEADBAND 6
+#define LINE_PID_INTEGRAL_LIMIT 120
+#define LINE_ERROR_FILTER_DIV 4
+#define LINE_TURN_SLEW_PER_FRAME 3
+#define LINE_TURN_OUTPUT_DEADBAND 5
+#define LINE_STRONG_ERROR 60
+#define LINE_STRONG_CONFIRM_FRAMES 2U
+#define LINE_STRONG_TURN_SLEW_PER_FRAME 6
 
 #define PWM_MAX 1023U
 #define MOTOR_MIN_RUN_OUTPUT 10
 #define MOTOR_B_MIN_RUN_OUTPUT 12
-#define START_KICK_OUTPUT 27
-#define START_KICK_CYCLES 5U
-#define MOTOR_B_KICK_MIN_OUTPUT 18
-#define MAX_OUTPUT 34
+#define START_KICK_OUTPUT 22
+#define START_KICK_CYCLES 4U
+#define MOTOR_B_KICK_MIN_OUTPUT 15
+#define MAX_OUTPUT 26
 
 /* These signs match the direction calibration documented by car-spin. */
 #define MOTOR_A_SIGN 1
@@ -104,10 +112,15 @@ static int64_t s_first_frame_us;
 static int64_t s_last_line_us;
 static int64_t s_last_log_us;
 static int s_last_error;
+static int s_tracking_error;
 static int s_pid_integral;
 static int s_pid_previous;
 static int s_pid_derivative;
 static int s_pid_output;
+static int s_filtered_error;
+static bool s_error_filter_initialized;
+static uint8_t s_strong_error_frames;
+static int s_strong_error_sign;
 static int s_command_a;
 static int s_command_b;
 static int s_command_d;
@@ -190,6 +203,18 @@ static bool observe_line(const uint8_t *frame,
         return false;
     }
 
+    int control_top = (int)height * LINE_CONTROL_TOP_PERCENT / 100;
+    int control_bottom = (int)height * LINE_CONTROL_BOTTOM_PERCENT / 100;
+    if (control_top < top) {
+        control_top = top;
+    }
+    if (control_bottom > bottom) {
+        control_bottom = bottom;
+    }
+    if (control_bottom <= control_top) {
+        return false;
+    }
+
     const int x_step = width >= 96 ? 2 : 1;
     const int y_step = LINE_ROW_STEP;
     int minimum = 255;
@@ -220,7 +245,7 @@ static bool observe_line(const uint8_t *frame,
         threshold = LINE_BLACK_THRESHOLD_MAX;
     }
 
-    int expected_x = (int)width / 2 + s_last_error * (int)width / 240;
+    int expected_x = (int)width / 2 + s_tracking_error * (int)width / 240;
     if (expected_x < 0) {
         expected_x = 0;
     }
@@ -270,8 +295,11 @@ static bool observe_line(const uint8_t *frame,
                 wide_center_sum += dark_sum / dark_samples;
             }
         }
-        if (best_score >= 0 && best_width > 0) {
-            const int weight = y - top + 1;
+        if (y >= control_top && y <= control_bottom && best_score >= 0 && best_width > 0) {
+            /* The nearest scan lines carry much more control authority than
+             * the distant part of a bend visible at the top of the image. */
+            const int relative_y = y - control_top + 1;
+            const int weight = relative_y * relative_y;
             weighted_center += (int64_t)best_center * weight;
             weight_sum += weight;
             ++valid_rows;
@@ -285,7 +313,7 @@ static bool observe_line(const uint8_t *frame,
                                      (wide_center_sum / (wide_rows ? wide_rows : 1)) <=
                                          (int)width * 4 / 5;
     observation->confidence = (uint8_t)((valid_rows * 100) /
-                                        ((bottom - top) / y_step + 1));
+                                        ((control_bottom - control_top) / y_step + 1));
     if (observation->confidence > 100) {
         observation->confidence = 100;
     }
@@ -398,42 +426,86 @@ static void reset_pid(void)
     s_pid_previous = 0;
     s_pid_derivative = 0;
     s_pid_output = 0;
+    s_filtered_error = 0;
+    s_error_filter_initialized = false;
+    s_strong_error_frames = 0;
+    s_strong_error_sign = 0;
 }
 
 static int pid_steering(int error)
 {
-    if (abs(error) <= LINE_PID_DEADBAND) {
-        reset_pid();
-        return 0;
+    int slew_limit = LINE_TURN_SLEW_PER_FRAME;
+    if (abs(error) >= LINE_STRONG_ERROR) {
+        const int sign = error > 0 ? 1 : -1;
+        if (sign != s_strong_error_sign) {
+            s_strong_error_sign = sign;
+            s_strong_error_frames = 1;
+        } else if (s_strong_error_frames < UINT8_MAX) {
+            ++s_strong_error_frames;
+        }
+        if (s_strong_error_frames >= LINE_STRONG_CONFIRM_FRAMES) {
+            slew_limit = LINE_STRONG_TURN_SLEW_PER_FRAME;
+        }
+    } else {
+        s_strong_error_frames = 0;
+        s_strong_error_sign = 0;
     }
 
-    s_pid_integral = clamp_int(s_pid_integral + error, LINE_PID_INTEGRAL_LIMIT);
-    const int derivative = error - s_pid_previous;
-    s_pid_derivative = (s_pid_derivative + derivative) / 2;
-    s_pid_previous = error;
+    if (!s_error_filter_initialized) {
+        s_filtered_error = error;
+        s_error_filter_initialized = true;
+    } else {
+        const int delta = error - s_filtered_error;
+        int step = delta / LINE_ERROR_FILTER_DIV;
+        if (step == 0 && delta != 0) {
+            step = delta > 0 ? 1 : -1;
+        }
+        s_filtered_error = clamp_int(s_filtered_error + step, 100);
+    }
 
-    int output = -(LINE_PID_KP * error +
+    if (abs(s_filtered_error) <= LINE_PID_DEADBAND) {
+        s_pid_integral = 0;
+        s_pid_previous = s_filtered_error;
+        s_pid_derivative = 0;
+        if (s_pid_output > LINE_TURN_SLEW_PER_FRAME) {
+            s_pid_output -= LINE_TURN_SLEW_PER_FRAME;
+        } else if (s_pid_output < -LINE_TURN_SLEW_PER_FRAME) {
+            s_pid_output += LINE_TURN_SLEW_PER_FRAME;
+        } else {
+            s_pid_output = 0;
+        }
+        return abs(s_pid_output) <= LINE_TURN_OUTPUT_DEADBAND ? 0 : s_pid_output;
+    }
+
+    s_pid_integral = clamp_int(s_pid_integral + s_filtered_error, LINE_PID_INTEGRAL_LIMIT);
+    const int derivative = s_filtered_error - s_pid_previous;
+    s_pid_derivative = (s_pid_derivative + derivative) / 2;
+    s_pid_previous = s_filtered_error;
+
+    int output = -(LINE_PID_KP * s_filtered_error +
                    LINE_PID_KI * s_pid_integral +
                    LINE_PID_KD * s_pid_derivative) / LINE_PID_SCALE;
     output = clamp_int(output, LINE_TURN_MAX);
-    if (abs(error) >= 70) {
-        s_pid_output = output;
-        return output;
+    const int output_delta = output - s_pid_output;
+    if (output_delta > slew_limit) {
+        output = s_pid_output + slew_limit;
+    } else if (output_delta < -slew_limit) {
+        output = s_pid_output - slew_limit;
     }
-    s_pid_output = (s_pid_output * 2 + output) / 3;
-    return s_pid_output;
+    s_pid_output = output;
+    return abs(s_pid_output) <= LINE_TURN_OUTPUT_DEADBAND ? 0 : s_pid_output;
 }
 
 static int forward_speed(int error, int turn)
 {
     const int magnitude = abs(error);
-    if (magnitude >= 80 || abs(turn) >= 26) {
+    if (magnitude >= 80 || abs(turn) >= 18) {
         return LINE_FORWARD_CRAWL;
     }
-    if (magnitude >= 55 || abs(turn) >= 18) {
+    if (magnitude >= 55 || abs(turn) >= 14) {
         return LINE_FORWARD_SLOW;
     }
-    if (magnitude >= 28 || abs(turn) >= 10) {
+    if (magnitude >= 28 || abs(turn) >= 8) {
         return LINE_FORWARD_MEDIUM;
     }
     return LINE_FORWARD_FAST;
@@ -446,10 +518,11 @@ static void log_state(const char *mode, const line_observation_t *observation)
         return;
     }
     s_last_log_us = now;
-    ESP_LOGI(TAG, "mode=%s line=%d err=%d conf=%u threshold=%d motor[A,B,D]=[%d,%d,%d]",
+    ESP_LOGI(TAG, "mode=%s line=%d err=%d filt=%d conf=%u threshold=%d motor[A,B,D]=[%d,%d,%d]",
              mode,
              observation != NULL && observation->valid,
              observation != NULL && observation->valid ? observation->error : s_last_error,
+             s_tracking_error,
              (unsigned)(observation != NULL ? observation->confidence : s_last_confidence),
              observation != NULL ? observation->threshold : s_last_threshold,
              s_command_a, s_command_b, s_command_d);
@@ -520,6 +593,7 @@ esp_err_t camera_line_follow_start(void)
     s_last_frame_us = 0;
     s_last_log_us = 0;
     s_last_error = 0;
+    s_tracking_error = 0;
     s_last_threshold = 0;
     s_last_confidence = 0;
     s_last_direction[0] = 0;
@@ -627,19 +701,21 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
 
     if (line_seen) {
         const int turn = pid_steering(observation.error);
-        drive(forward_speed(observation.error, turn), turn);
+        s_tracking_error = s_filtered_error;
+        drive(forward_speed(s_filtered_error, turn), turn);
         log_state("LINE", &observation);
         return;
     }
 
     reset_pid();
     const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
+    const int search_direction = s_tracking_error < 0 ? 1 : -1;
     if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
-        const int turn = s_last_error < 0 ? LINE_TURN_MAX / 2 : -LINE_TURN_MAX / 2;
+        const int turn = search_direction * (LINE_TURN_MAX / 2);
         drive(LINE_FORWARD_CRAWL, turn);
         log_state("LOST-HOLD", &observation);
     } else if (lost_us <= (int64_t)LINE_LOST_SEARCH_MS * 1000) {
-        drive_spin(s_last_error < 0 ? 1 : -1);
+        drive_spin(search_direction);
         log_state("SEARCH", &observation);
     } else {
         stop_motors();
@@ -648,6 +724,7 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
             s_armed = false;
             s_arm_frames = 0;
             s_first_frame_us = 0;
+            s_tracking_error = 0;
             gpio_set_level(STBY_GPIO, 0);
         }
     }
@@ -673,6 +750,7 @@ static void camera_line_follow_watchdog_task(void *arg)
             s_first_frame_us = 0;
             s_last_line_us = 0;
             s_last_frame_us = 0;
+            s_tracking_error = 0;
             reset_pid();
             ESP_LOGW(TAG, "Decoded-frame timeout; motors stopped and line confirmation reset");
         }
