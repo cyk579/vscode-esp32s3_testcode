@@ -23,7 +23,6 @@
 #include "usb/usb_host.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "driver/ledc.h"
 
 static const char *TAG = "example";
@@ -115,9 +114,9 @@ typedef struct {
 } uvc_stream_profile_t;
 
 uvc_stream_profile_t uvc_stream_profiles[EXAMPLE_UVC_PROTOCOL_AUTO_COUNT] = {
+    {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, "320x240, fps 30"},
     {UVC_FRAME_FORMAT_MJPEG, 480, 320, 15, "480x320, fps 15"},
     {UVC_FRAME_FORMAT_MJPEG, 480, 320,  0, "480x320, any fps"},
-    {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, "320x240, fps 30"},
     {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, "640x480, fps 15"},
     {UVC_FRAME_FORMAT_MJPEG, 1280, 720,  0, "1280x720, any fps"}
 };
@@ -210,27 +209,8 @@ static void uninitialize_usb_host_lib(void)
  * input queue. If this function takes too long, you'll start losing frames. */
 void frame_callback(uvc_frame_t *frame, void *ptr)
 {
-    static size_t fps;
-    static size_t bytes_per_second;
-    static int64_t start_time;
-
-    int64_t current_time = esp_timer_get_time();
-    bytes_per_second += frame->data_bytes;
-    fps++;
-
-    if (!start_time) {
-        start_time = current_time;
-    }
-
-    if (current_time > start_time + 1000000) {
-        ESP_LOGI(TAG, "fps: %u, bytes per second: %u", fps, bytes_per_second);
-        start_time = current_time;
-        bytes_per_second = 0;
-        fps = 0;
-    }
-
-    // The display task copies only the newest frame and decodes it outside this
-    // UVC callback, so a slow TFT refresh cannot stall USB reception.
+    // The decoder task copies only the newest frame outside this UVC callback,
+    // so USB reception is not stalled by JPEG processing or an optional TFT.
     camera_display_submit(frame->data, frame->data_bytes);
 
     // Stream received frame to the PC client, if enabled.
@@ -339,15 +319,23 @@ void app_main(void)
 
     esp_err_t display_err = camera_display_start();
     if (display_err == ESP_OK) {
-        ESP_LOGI(TAG, "Camera JPEG decoder ready (TFT preview is optional, 160x128 landscape)");
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+        ESP_LOGI(TAG, "Camera JPEG decoder ready; TFT preview enabled (160x128 landscape)");
+#else
+        ESP_LOGI(TAG, "Camera JPEG decoder ready; TFT preview disabled (competition mode)");
+#endif
     } else {
-        ESP_LOGW(TAG, "ST7735 preview unavailable: %s; PC streaming remains available",
+        ESP_LOGW(TAG, "Camera JPEG decoder unavailable: %s; PC streaming remains available",
                  esp_err_to_name(display_err));
     }
 
-    // Start the AP first so its presence proves that app_main reached Wi-Fi.
+    // Start the AP when streaming is enabled; this call is a no-op otherwise.
     tcp_server_start_ap();
+#if CONFIG_EXAMPLE_ENABLE_STREAMING
     ESP_LOGI(TAG, "Wi-Fi AP initialization complete");
+#else
+    ESP_LOGI(TAG, "Wi-Fi streaming disabled; continuing without an AP");
+#endif
 
     // Keep USB-Serial/JTAG alive briefly before GPIO19/20 become USB Host.
     ESP_LOGI(TAG, "Diagnostic window: USB Host starts in %u seconds",

@@ -1,9 +1,12 @@
 #include "camera_line_follow.h"
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 
+#include "camera_display.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "esp_log.h"
@@ -24,64 +27,65 @@
 #define D_IN2 GPIO_NUM_15
 #define STBY_GPIO GPIO_NUM_8
 
-/* 解码器输出的是大端字节序 RGB565；画面左右方向若相反，把它改为 1。 */
+/* 解码器输出大端字节序 RGB565；画面左右相反时改为 1。 */
 #define CAMERA_LINE_MIRROR_X 0
 
-/*
- * 图像坐标 y 向下增大。画面被明确分成三个职责：
- *   远端区（35%~60%）：只记住下一次向左还是向右，绝不直接控制电机；
- *   近端区（70%~90%）：判断线形和终点；其中最下方区域才给 PID/触发使用。
- * 这样上方已经出现锐角时，小车仍会沿下方尚未走完的直线前进。
- */
+/* 只从底部种子向上跟踪，固定窗口和固定数组保证单帧时间有界。 */
 #define LINE_ROI_TOP_PERCENT 30
 #define LINE_ROI_BOTTOM_PERCENT 95
-#define LINE_FAR_TOP_PERCENT 35
-#define LINE_FAR_BOTTOM_PERCENT 60
-#define LINE_NEAR_TOP_PERCENT 70
-#define LINE_NEAR_BOTTOM_PERCENT 90
-#define LINE_LOWER_TOP_PERCENT 78
-#define LINE_ROW_STEP 3
+#define LINE_NEAR_TOP_PERCENT 65
+#define LINE_NEAR_BOTTOM_PERCENT 92
+#define LINE_ROW_STEP 4
 #define LINE_BOTTOM_SKIP_ROWS 1
-#define LINE_STRAIGHT_SPAN_PERCENT 14
-#define LINE_BINARY_BLACK_MAX 0
-#define LINE_MIN_ROW_SAMPLES 3
-#define LINE_MIN_VALID_ROWS 3
-#define LINE_STRAIGHT_MIN_ROWS 3
-#define LINE_MIN_DARK_ROWS 3
-#define LINE_FINISH_ROW_COVERAGE_PERCENT 50
-#define LINE_FINISH_MIN_ROWS 3
+#define LINE_SCAN_MAX_ROWS 64
+#define LINE_SEARCH_HALF_PERCENT 20
+#define LINE_SEARCH_HALF_MIN 6
+#define LINE_SEARCH_HALF_MAX 80
+#define LINE_LOST_WINDOW_GROW_PERCENT 4
+#define LINE_LOST_WINDOW_MAX_PERCENT 42
+#define LINE_CORNER_WINDOW_START_PERCENT 28
+#define LINE_CORNER_WINDOW_GROW_PERCENT 4
+#define LINE_CORNER_WINDOW_MAX_PERCENT 46
+#define LINE_CORNER_PREDICT_STEP_PERCENT 4
+#define LINE_MAX_CENTER_JUMP_PERCENT 18
+#define LINE_MIN_SEGMENT_WIDTH 3
+#define LINE_MAX_SEGMENT_WIDTH_PERCENT 55
+#define LINE_FINISH_WIDTH_PERCENT 62
+#define LINE_FINISH_MIN_ROWS 2
+#define LINE_MIN_VALID_ROWS 4
+#define LINE_BRANCH_ROWS 3
+#define LINE_BRANCH_OFFSET_PERCENT 14
+#define LINE_BRANCH_WINDOW_PERCENT 12
+#define LINE_BRANCH_MIN_OFFSET_PERCENT 8
+#define LINE_BRANCH_CONFIRM_FRAMES 3U
+#define LINE_PENDING_MISS_CONFIRM_FRAMES 2U
+#define LINE_REACQUIRE_CONFIRM_FRAMES 2U
+#define LINE_CORNER_EXIT_CONFIRM_FRAMES 3U
 
-/* 弯道采用“先记忆、后触发”：所有判断都要求连续帧，单帧噪声不会转动车体。 */
+/* 这些值保留原有的上电、限速、换向保护和超时停车行为。 */
 #define LINE_START_DELAY_MS 600U
 #define LINE_ARM_CONFIRM_FRAMES 3U
 #define LINE_MOTOR_START_RAMP_FRAMES 18U
 #define LINE_MOTOR_START_MIN_OUTPUT 12
-#define LINE_FAR_HINT_ERROR 18
-#define LINE_FAR_CONFIRM_FRAMES 3U
-#define LINE_STRAIGHT_CORRIDOR_PERCENT 8
-#define LINE_TURN_TRIGGER_FRAMES 2U
-#define LINE_TURN_EXIT_ERROR 35
-#define LINE_TURN_EXIT_FRAMES 2U
-#define LINE_TURN_TIMEOUT_MS 3000U
 #define LINE_LOST_HOLD_MS 300U
 #define LINE_LOST_STOP_MS 900U
 #define LINE_FRAME_TIMEOUT_MS 1200U
+#define LINE_CORNER_TIMEOUT_MS 3000U
 #define LINE_FINISH_CONFIRM_FRAMES 5U
 
-#define LINE_FORWARD_FAST 30   /* 与红外直行速度一致。 */
-#define LINE_FORWARD_MEDIUM 22 /* 与红外弯道速度一致。 */
+#define LINE_FORWARD_FAST 30
+#define LINE_FORWARD_MEDIUM 22
 #define LINE_FORWARD_SLOW 22
-#define LINE_FORWARD_CRAWL 17  /* 与红外丢线恢复速度一致，避免低速失速。 */
-#define LINE_TURN_MAX 19       /* 与红外最大转向量一致。 */
-#define LINE_PID_TURN_MAX 8
+#define LINE_FORWARD_CRAWL 17
+#define LINE_TURN_MAX 19
+#define LINE_PID_TURN_MAX 10
 #define LINE_ERROR_DEADBAND 18
 #define LINE_ERROR_MEDIUM 35
 #define LINE_ERROR_LARGE 60
 #define LINE_PID_KP 12
-#define LINE_PID_KI 1
+#define LINE_PID_KH 8
 #define LINE_PID_KD 4
 #define LINE_PID_SCALE 100
-#define LINE_PID_INTEGRAL_LIMIT 40
 #define LINE_PID_SLEW_PER_FRAME 2
 #define LINE_PID_OUTPUT_DEADBAND 1
 #define LINE_ERROR_FILTER_OLD 3
@@ -107,24 +111,35 @@ typedef struct {
 } motor_t;
 
 typedef struct {
-    bool valid;
-    bool straight_visible;
-    bool far_valid;
-    bool lower_valid;
-    bool finish_candidate;
-    int error;       /* 近端黑线相对画面中心的误差，只供直线 PID 使用。 */
-    int far_error;   /* 远端黑线相对近端线的方向，只供记忆左/右弯。 */
-    int lower_error; /* 画面下方全部黑像素的重心，只供确认转弯时机。 */
-    int threshold;
-    uint8_t track_rows;
-} line_observation_t;
+    int x;
+    int y;
+    int width;
+} line_point_t;
 
 typedef struct {
     int center;
-    int span;
-    uint8_t rows;
-    uint8_t wide_rows;
-} band_measurement_t;
+    int width;
+    bool wide;
+} line_segment_t;
+
+typedef enum {
+    LINE_STATE_NORMAL = 0,
+    LINE_STATE_CORNER,
+    LINE_STATE_LOST,
+} line_state_t;
+
+typedef struct {
+    bool candidate;
+    bool old_line_visible;
+    bool finish_candidate;
+    int seed_x;
+    int lateral_error;
+    int heading_error;
+    int branch_direction;
+    uint8_t valid_rows;
+    uint8_t confidence;
+    int threshold;
+} line_observation_t;
 
 static const char *TAG = "camera_line";
 static const motor_t motor_a = {A_IN1, A_IN2, LEDC_CHANNEL_0, MOTOR_A_SIGN};
@@ -139,28 +154,53 @@ static uint8_t s_motor_start_ramp_frames;
 static uint8_t s_finish_frames;
 static int64_t s_first_frame_us;
 static int64_t s_last_line_us;
-static int64_t s_last_log_us;
-static int s_last_error;
-static int s_tracking_error;
+static int64_t s_last_frame_us;
+
+static line_state_t s_state;
+static bool s_seed_valid;
+static int s_seed_x;
+static int s_seed_heading;
+static uint32_t s_lost_frames;
+static uint8_t s_reacquire_frames;
+static int s_last_lateral_error;
+static int s_last_heading_error;
+static uint8_t s_last_valid_rows;
+static uint8_t s_last_confidence;
+static int s_last_threshold;
+
 static bool s_error_filter_initialized;
-static int s_pid_integral;
-static int s_pid_previous_error;
+static int s_tracking_error;
+static int s_previous_tracking_error;
 static int s_pid_output;
-static int s_pending_turn;        /* 镜像校正后：-1=左弯，+1=右弯，0=尚未记忆。 */
+
+static int s_pending_turn;
+static int s_pending_seed_x;
+static uint8_t s_pending_miss_frames;
 static int s_hint_direction;
 static uint8_t s_hint_frames;
-static uint8_t s_trigger_frames;
-static uint8_t s_turn_exit_frames;
-static bool s_turning;
-static int s_turn_reference_error;
-static int64_t s_turn_started_us;
+static uint8_t s_corner_frames;
+static uint8_t s_corner_exit_frames;
+static int s_corner_origin_x;
+static int s_corner_predicted_x;
+static int64_t s_corner_started_us;
+static int s_reacquire_x;
+
 static int s_command_a;
 static int s_command_b;
 static int s_command_d;
-static int s_last_threshold;
 static int s_last_direction[3];
 static uint8_t s_kick_cycles[3];
-static int64_t s_last_frame_us;
+
+static uint32_t s_control_frames;
+static uint32_t s_line_us_sum;
+static uint32_t s_line_us_max;
+static int64_t s_summary_start_us;
+static uint32_t s_summary_camera_frames;
+static uint32_t s_summary_processed_frames;
+static uint32_t s_summary_dropped_frames;
+static uint32_t s_callback_dropped_frames;
+static uint32_t s_summary_callback_dropped_frames;
+
 static SemaphoreHandle_t s_control_mutex;
 static bool s_watchdog_created;
 
@@ -177,6 +217,28 @@ static int clamp_int(int value, int limit)
     return value;
 }
 
+static int clamp_range(int value, int low, int high)
+{
+    if (value < low) {
+        return low;
+    }
+    if (value > high) {
+        return high;
+    }
+    return value;
+}
+
+static int direction_of(int value)
+{
+    return (value > 0) - (value < 0);
+}
+
+static int positive_percent(int value, int percent, int minimum)
+{
+    int result = value * percent / 100;
+    return result < minimum ? minimum : result;
+}
+
 static uint8_t rgb565_luma(const uint8_t *pixel)
 {
     const uint16_t value = ((uint16_t)pixel[0] << 8) | pixel[1];
@@ -186,9 +248,10 @@ static uint8_t rgb565_luma(const uint8_t *pixel)
     return (uint8_t)((77 * red + 150 * green + 29 * blue) >> 8);
 }
 
-static int normalized_error(int delta_x, uint16_t width)
+/* 正值表示赛道在画面中心左侧，便于直接套用整数 PD 符号。 */
+static int line_error(int center, uint16_t width)
 {
-    int error = delta_x * 100 / ((int)width / 2);
+    int error = ((int)width / 2 - center) * 100 / ((int)width / 2);
     error = clamp_int(error, 100);
 #if CAMERA_LINE_MIRROR_X
     error = -error;
@@ -196,137 +259,321 @@ static int normalized_error(int delta_x, uint16_t width)
     return error;
 }
 
-/*
- * 三个区域共用这一段统计：每隔 4 行取样，计算黑像素重心、行间跨度和宽行数。
- * 没有浮点、连通域或动态内存，160x120 图像上只需少量整数加法。
- */
-static void measure_band(const uint8_t *frame,
+static bool scan_segment(const uint8_t *frame,
                          uint16_t width,
-                         int top,
-                         int bottom,
+                         int y,
+                         int expected_x,
+                         int half_window,
                          int threshold,
-                         band_measurement_t *band)
+                         line_segment_t *segment)
 {
-    const int x_step = width >= 96 ? 2 : 1;
-    const int row_samples = ((int)width + x_step - 1) / x_step;
-    int total_x = 0;
-    int total_dark = 0;
-    int minimum_center = (int)width;
-    int maximum_center = 0;
-    *band = (band_measurement_t){0};
+    if (frame == NULL || segment == NULL || y < 0) {
+        return false;
+    }
 
-    for (int y = top; y <= bottom; y += LINE_ROW_STEP) {
-        int row_x = 0;
-        int row_dark = 0;
-        for (int x = 0; x < (int)width; x += x_step) {
-            if (rgb565_luma(frame + (((size_t)y * width + (size_t)x) * 2)) <= threshold) {
-                row_x += x;
-                ++row_dark;
+    *segment = (line_segment_t){0};
+    int left = expected_x < 0 ? 0 : expected_x - half_window;
+    int right = expected_x < 0 ? (int)width - 1 : expected_x + half_window;
+    left = left < 0 ? 0 : left;
+    right = right >= (int)width ? (int)width - 1 : right;
+    if (left > right) {
+        return false;
+    }
+
+    const int min_width = LINE_MIN_SEGMENT_WIDTH;
+    const int max_width = positive_percent((int)width,
+                                           LINE_MAX_SEGMENT_WIDTH_PERCENT,
+                                           min_width + 2);
+    /* Finish width is relative to the local window, not the whole image. */
+    const int window_width = right - left + 1;
+    const int finish_width = positive_percent(window_width,
+                                              LINE_FINISH_WIDTH_PERCENT,
+                                              LINE_MIN_SEGMENT_WIDTH + 1);
+    int best_distance = INT_MAX;
+    line_segment_t best = {0};
+    int best_wide_distance = INT_MAX;
+    line_segment_t best_wide = {0};
+    bool in_run = false;
+    int run_start = 0;
+
+    for (int x = left; x <= right + 1; ++x) {
+        const bool dark = x <= right &&
+                          rgb565_luma(frame + (((size_t)y * width + (size_t)x) * 2)) <= threshold;
+        if (dark && !in_run) {
+            in_run = true;
+            run_start = x;
+        }
+        if (!dark && in_run) {
+            const int run_end = x - 1;
+            const int run_width = run_end - run_start + 1;
+            const int run_center = (run_start + run_end) / 2;
+            if (run_width >= finish_width) {
+                const int wide_distance = expected_x < 0 ?
+                                           abs(run_center - (int)width / 2) :
+                                           abs(run_center - expected_x);
+                if (wide_distance < best_wide_distance) {
+                    best_wide_distance = wide_distance;
+                    best_wide.center = run_center;
+                    best_wide.width = run_width;
+                    best_wide.wide = true;
+                }
+            }
+            if (run_width >= min_width && run_width <= max_width) {
+                const int distance = expected_x < 0 ?
+                                     abs(run_center - (int)width / 2) :
+                                     abs(run_center - expected_x);
+                if (distance < best_distance) {
+                    best_distance = distance;
+                    best.center = run_center;
+                    best.width = run_width;
+                    best.wide = run_width >= finish_width;
+                }
+            }
+            in_run = false;
+        }
+    }
+
+    if (best_distance == INT_MAX) {
+        /* A broad local finish bar is still a valid seed for confirmation. */
+        if (best_wide_distance == INT_MAX) {
+            return false;
+        }
+        best = best_wide;
+    }
+    /* Only the selected run may mark a finish candidate.  A separate wide
+     * run elsewhere in the search window must not taint the tracked line. */
+    *segment = best;
+    return true;
+}
+
+static int average_points(const line_point_t *points, int first, int count)
+{
+    if (points == NULL || count <= 0) {
+        return 0;
+    }
+    int total = 0;
+    for (int i = 0; i < count; ++i) {
+        total += points[first + i].x;
+    }
+    return total / count;
+}
+
+static int branch_hint(const uint8_t *frame,
+                       uint16_t width,
+                       int threshold,
+                       const line_point_t *points,
+                       int point_count,
+                       int heading_error)
+{
+    if (point_count < LINE_MIN_VALID_ROWS) {
+        return 0;
+    }
+
+    const line_point_t *end = &points[point_count - 1];
+    const int offset = positive_percent((int)width, LINE_BRANCH_OFFSET_PERCENT,
+                                        LINE_SEARCH_HALF_MIN * 2);
+    const int half = positive_percent((int)width, LINE_BRANCH_WINDOW_PERCENT,
+                                      LINE_SEARCH_HALF_MIN);
+    int found_direction = 0;
+    for (int direction = -1; direction <= 1; direction += 2) {
+        int hits = 0;
+        for (int i = 0; i < LINE_BRANCH_ROWS; ++i) {
+            int y = end->y + (i - 1) * LINE_ROW_STEP;
+            if (y < 0) {
+                y = 0;
+            }
+            line_segment_t branch = {0};
+            if (scan_segment(frame, width, y, end->x + direction * offset,
+                             half, threshold, &branch) &&
+                abs(branch.center - end->x) >= offset * LINE_BRANCH_MIN_OFFSET_PERCENT /
+                                                LINE_BRANCH_OFFSET_PERCENT) {
+                ++hits;
             }
         }
-        if (row_dark < LINE_MIN_ROW_SAMPLES) {
-            continue;
-        }
-
-        const int row_center = row_x / row_dark;
-        total_x += row_x;
-        total_dark += row_dark;
-        ++band->rows;
-        if (row_center < minimum_center) {
-            minimum_center = row_center;
-        }
-        if (row_center > maximum_center) {
-            maximum_center = row_center;
-        }
-        if (row_dark * 100 >= row_samples * LINE_FINISH_ROW_COVERAGE_PERCENT) {
-            ++band->wide_rows;
+        if (hits >= 2) {
+            if (found_direction != 0 && found_direction != direction) {
+                return 0;
+            }
+            found_direction = direction;
         }
     }
 
-    if (total_dark > 0) {
-        band->center = total_x / total_dark;
-        band->span = maximum_center - minimum_center;
+    if (found_direction != 0) {
+        return found_direction;
     }
+
+    /* 连续斜线没有清晰分叉时，仅把明显的中远场方向作为弱提示。 */
+    if (abs(heading_error) >= 38) {
+        return heading_error > 0 ? 1 : -1;
+    }
+    return 0;
+}
+
+static bool track_line(const uint8_t *frame,
+                       uint16_t width,
+                       uint16_t height,
+                       int threshold,
+                       bool use_history,
+                       int seed_x,
+                       int corridor_x,
+                       int corridor_half,
+                       line_observation_t *observation)
+{
+    if (frame == NULL || observation == NULL || width < 16 || height < 16 || threshold <= 0) {
+        return false;
+    }
+
+    int top = (int)height * LINE_ROI_TOP_PERCENT / 100;
+    int bottom = (int)height * LINE_ROI_BOTTOM_PERCENT / 100;
+    const int near_top = (int)height * LINE_NEAR_TOP_PERCENT / 100;
+    const int near_bottom = (int)height * LINE_NEAR_BOTTOM_PERCENT / 100 -
+                            LINE_BOTTOM_SKIP_ROWS * LINE_ROW_STEP;
+    top = top < 0 ? 0 : top;
+    bottom = bottom >= (int)height ? (int)height - 1 : bottom;
+    if (bottom > near_bottom) {
+        bottom = near_bottom;
+    }
+    if (bottom <= top) {
+        return false;
+    }
+
+    int search_percent = LINE_SEARCH_HALF_PERCENT;
+    if (s_state == LINE_STATE_CORNER) {
+        search_percent = LINE_CORNER_WINDOW_START_PERCENT +
+                         (int)s_corner_frames * LINE_CORNER_WINDOW_GROW_PERCENT;
+        if (search_percent > LINE_CORNER_WINDOW_MAX_PERCENT) {
+            search_percent = LINE_CORNER_WINDOW_MAX_PERCENT;
+        }
+    } else if (s_state == LINE_STATE_LOST) {
+        const int extra = (int)(s_lost_frames * LINE_LOST_WINDOW_GROW_PERCENT);
+        search_percent += extra;
+        if (search_percent > LINE_LOST_WINDOW_MAX_PERCENT) {
+            search_percent = LINE_LOST_WINDOW_MAX_PERCENT;
+        }
+    }
+    int half_window = positive_percent((int)width, search_percent, LINE_SEARCH_HALF_MIN);
+    if (half_window > LINE_SEARCH_HALF_MAX) {
+        half_window = LINE_SEARCH_HALF_MAX;
+    }
+
+    int expected = use_history ? seed_x : (int)width / 2;
+    expected = expected < 0 ? 0 : (expected >= (int)width ? (int)width - 1 : expected);
+    line_point_t points[LINE_SCAN_MAX_ROWS];
+    int point_count = 0;
+    int misses = 0;
+    int wide_near_rows = 0;
+    int y = bottom;
+
+    while (y >= top && point_count < LINE_SCAN_MAX_ROWS) {
+        line_segment_t segment = {0};
+        const int row_half = point_count == 0 && !use_history ? (int)width : half_window;
+        const bool found = scan_segment(frame, width, y,
+                                        point_count == 0 && !use_history ? -1 : expected,
+                                        row_half, threshold, &segment);
+        if (!found) {
+            if (point_count > 0 && misses == 0) {
+                ++misses;
+                y -= LINE_ROW_STEP;
+                continue;
+            }
+            break;
+        }
+        misses = 0;
+
+        const int jump_limit = positive_percent((int)width,
+                                                LINE_MAX_CENTER_JUMP_PERCENT,
+                                                LINE_SEARCH_HALF_MIN * 2);
+        if (point_count > 0 && abs(segment.center - expected) > jump_limit) {
+            break;
+        }
+        if (corridor_x >= 0 && abs(segment.center - corridor_x) > corridor_half) {
+            break;
+        }
+
+        points[point_count++] = (line_point_t){segment.center, y, segment.width};
+        expected = segment.center;
+        if (segment.wide && y >= near_top && y <= near_bottom) {
+            ++wide_near_rows;
+        }
+        y -= LINE_ROW_STEP;
+    }
+
+    observation->valid_rows = (uint8_t)(point_count > UINT8_MAX ? UINT8_MAX : point_count);
+    observation->finish_candidate = wide_near_rows >= LINE_FINISH_MIN_ROWS;
+    if (point_count < LINE_MIN_VALID_ROWS) {
+        return false;
+    }
+
+    const int near_count = point_count < 4 ? point_count : 4;
+    const int far_count = point_count < 4 ? point_count : 4;
+    const int near_center = average_points(points, 0, near_count);
+    const int far_center = average_points(points, point_count - far_count, far_count);
+    observation->candidate = true;
+    observation->old_line_visible = point_count >= LINE_MIN_VALID_ROWS + 1;
+    observation->seed_x = points[0].x;
+    observation->lateral_error = line_error(near_center, width);
+    /* Positive heading means the far path is to the right.  This keeps the
+     * requested -Kh*heading term aligned with the calibrated motor sign. */
+    observation->heading_error = line_error(near_center, width) -
+                                 line_error(far_center, width);
+    observation->confidence = (uint8_t)((point_count * 100) /
+                                        (LINE_MIN_VALID_ROWS + 6));
+    if (observation->confidence > 100) {
+        observation->confidence = 100;
+    }
+    observation->branch_direction = branch_hint(frame, width, threshold,
+                                                 points, point_count,
+                                                 observation->heading_error);
+    if (observation->finish_candidate &&
+        abs(observation->seed_x - (use_history ? seed_x : (int)width / 2)) > half_window) {
+        observation->finish_candidate = false;
+    }
+    return true;
 }
 
 static bool observe_line(const uint8_t *frame,
                          uint16_t width,
                          uint16_t height,
                          uint8_t source_threshold,
+                         bool remembered_corridor,
                          line_observation_t *observation)
 {
-    if (frame == NULL || observation == NULL || width < 16 || height < 16) {
+    if (observation == NULL) {
         return false;
     }
     *observation = (line_observation_t){0};
-
-    int roi_top = (int)height * LINE_ROI_TOP_PERCENT / 100;
-    int roi_bottom = (int)height * LINE_ROI_BOTTOM_PERCENT / 100;
-    if (roi_top < 0) {
-        roi_top = 0;
-    }
-    if (roi_bottom >= (int)height) {
-        roi_bottom = (int)height - 1;
-    }
-    if (roi_bottom <= roi_top) {
-        return false;
-    }
-
-    int far_top = (int)height * LINE_FAR_TOP_PERCENT / 100;
-    int far_bottom = (int)height * LINE_FAR_BOTTOM_PERCENT / 100;
-    int near_top = (int)height * LINE_NEAR_TOP_PERCENT / 100;
-    int near_bottom = (int)height * LINE_NEAR_BOTTOM_PERCENT / 100;
-    int lower_top = (int)height * LINE_LOWER_TOP_PERCENT / 100;
-    far_top = far_top < roi_top ? roi_top : far_top;
-    far_bottom = far_bottom > roi_bottom ? roi_bottom : far_bottom;
-    near_top = near_top < roi_top ? roi_top : near_top;
-    near_bottom = near_bottom > roi_bottom ? roi_bottom : near_bottom;
-    near_bottom -= LINE_BOTTOM_SKIP_ROWS * LINE_ROW_STEP;
-    lower_top = lower_top < near_top ? near_top : lower_top;
-    if (far_bottom <= far_top || near_bottom <= near_top) {
-        return false;
-    }
-
+    observation->threshold = source_threshold;
     if (source_threshold == 0) {
         return false;
     }
-    observation->threshold = source_threshold;
 
-    /*
-     * far 只负责记忆；lower 同时给直线 PID 和转弯触发；near 只判断线形与终点。
-     * 因为 PID 完全不读取 far/near 的重心，画面上方的弯线不可能提前拉动后轮。
-     */
-    band_measurement_t far = {0};
-    band_measurement_t near = {0};
-    band_measurement_t lower = {0};
-    measure_band(frame, width, far_top, far_bottom, LINE_BINARY_BLACK_MAX, &far);
-    measure_band(frame, width, near_top, near_bottom, LINE_BINARY_BLACK_MAX, &near);
-    measure_band(frame, width, lower_top, near_bottom, LINE_BINARY_BLACK_MAX, &lower);
-
-    observation->finish_candidate = near.wide_rows >= LINE_FINISH_MIN_ROWS &&
-                                    near.center >= (int)width / 5 &&
-                                    near.center <= (int)width * 4 / 5;
-    if (lower.rows >= LINE_MIN_DARK_ROWS) {
-        observation->lower_error = normalized_error(lower.center - (int)width / 2, width);
-        observation->lower_valid = true;
-    }
-    if (lower.rows < LINE_MIN_VALID_ROWS || lower.wide_rows > 0) {
-        return false;
+    int seed = s_seed_x;
+    if (s_state == LINE_STATE_CORNER && s_pending_turn != 0) {
+        const int step = positive_percent((int)width,
+                                          LINE_CORNER_PREDICT_STEP_PERCENT, 2);
+        const int predicted = s_corner_origin_x +
+                              s_pending_turn * step * (int)s_corner_frames;
+        s_corner_predicted_x = clamp_range(predicted, 0, (int)width - 1);
+        seed = s_corner_predicted_x;
+    } else if (s_state == LINE_STATE_LOST && s_seed_valid) {
+        const int predicted_delta = s_seed_heading * (int)s_lost_frames * (int)width / 300;
+        seed = clamp_range(s_seed_x + predicted_delta, 0, (int)width - 1);
     }
 
-    observation->error = observation->lower_error;
-    observation->track_rows = lower.rows;
-    observation->straight_visible = near.rows >= LINE_STRAIGHT_MIN_ROWS &&
-                                    near.wide_rows == 0 &&
-                                    near.span * 100 <=
-                                    (int)width * LINE_STRAIGHT_SPAN_PERCENT;
-    if (far.rows >= LINE_MIN_DARK_ROWS) {
-        /* 与眼前线比较，整车轻微横移不会被误记成弯道。 */
-        observation->far_error = normalized_error(far.center - lower.center, width);
-        observation->far_valid = true;
+    int corridor_half = positive_percent((int)width,
+                                         LINE_SEARCH_HALF_PERCENT,
+                                         LINE_SEARCH_HALF_MIN);
+    int corridor_x = remembered_corridor && s_pending_turn != 0 ?
+                     s_pending_seed_x : -1;
+    if (s_state == LINE_STATE_CORNER && s_pending_turn != 0) {
+        corridor_half = positive_percent((int)width,
+                                         LINE_CORNER_WINDOW_START_PERCENT,
+                                         LINE_SEARCH_HALF_MIN);
+        corridor_x = s_corner_predicted_x;
     }
-    observation->valid = true;
-    return true;
+    return track_line(frame, width, height, source_threshold,
+                      s_seed_valid, seed, corridor_x,
+                      corridor_half, observation);
 }
 
 static void set_motor_duty(const motor_t *motor, int output)
@@ -344,7 +591,7 @@ static void set_motor_duty(const motor_t *motor, int output)
 
 static void motor_set(const motor_t *motor, int command)
 {
-    /* command 是混控层的有符号 PWM；换向时先清零，避免 TB6612 硬切方向。 */
+    /* command 是混控层有符号 PWM；换向时先清零，避免 TB6612 硬切方向。 */
     const int index = (int)motor->channel;
     int output_limit = MAX_OUTPUT;
     if (s_motor_start_ramp_frames > 0) {
@@ -354,7 +601,7 @@ static void motor_set(const motor_t *motor, int command)
                        ((MAX_OUTPUT - LINE_MOTOR_START_MIN_OUTPUT) * elapsed) /
                        LINE_MOTOR_START_RAMP_FRAMES;
     }
-    int speed = clamp_int(command * motor->sign, output_limit);
+    const int speed = clamp_int(command * motor->sign, output_limit);
     const int direction = (speed > 0) - (speed < 0);
     const bool direction_changed = direction != s_last_direction[index];
 
@@ -364,7 +611,7 @@ static void motor_set(const motor_t *motor, int command)
         gpio_set_level(motor->in2, speed < 0);
         s_last_direction[index] = direction;
         s_kick_cycles[index] = (direction == 0 || motor->channel == LEDC_CHANNEL_1) ?
-                              0 : START_KICK_CYCLES;
+                               0 : START_KICK_CYCLES;
     }
 
     if (direction == 0) {
@@ -383,12 +630,10 @@ static void motor_set(const motor_t *motor, int command)
     }
     if (s_kick_cycles[index] > 0) {
         const int kick_output = s_motor_start_ramp_frames > 0 ?
-                                 output_limit : START_KICK_OUTPUT;
+                                output_limit : START_KICK_OUTPUT;
         if (output < kick_output) {
             output = kick_output;
         }
-    }
-    if (s_kick_cycles[index] > 0) {
         --s_kick_cycles[index];
     }
     set_motor_duty(motor, output);
@@ -412,7 +657,7 @@ static void stop_motors(void)
 
 static void drive(int forward, int turn)
 {
-    /* 直行向量固定为 A=-forward、D=forward、B=0；只有 turn 非零才动后轮 B。 */
+    /* 直行向量固定为 A=-forward、D=forward；只有 turn 非零才动后轮 B。 */
     s_command_a = clamp_int(-forward - turn, MAX_OUTPUT);
     s_command_b = clamp_int(turn, MAX_OUTPUT);
     s_command_d = clamp_int(forward - turn, MAX_OUTPUT);
@@ -424,72 +669,65 @@ static void drive(int forward, int turn)
     }
 }
 
-static void reset_pid(void)
+static void reset_pd(void)
 {
     s_tracking_error = 0;
+    s_previous_tracking_error = 0;
     s_error_filter_initialized = false;
-    s_pid_integral = 0;
-    s_pid_previous_error = 0;
     s_pid_output = 0;
 }
 
 static void clear_turn_plan(void)
 {
     s_pending_turn = 0;
+    s_pending_seed_x = 0;
+    s_pending_miss_frames = 0;
     s_hint_direction = 0;
     s_hint_frames = 0;
-    s_trigger_frames = 0;
-    s_turn_exit_frames = 0;
-    s_turning = false;
-    s_turn_reference_error = 0;
-    s_turn_started_us = 0;
+    s_corner_frames = 0;
+    s_corner_exit_frames = 0;
+    s_corner_origin_x = 0;
+    s_corner_predicted_x = 0;
+    s_corner_started_us = 0;
 }
 
 static void reset_tracking(void)
 {
-    reset_pid();
+    reset_pd();
     clear_turn_plan();
+    s_seed_valid = false;
+    s_seed_x = 0;
+    s_seed_heading = 0;
+    s_lost_frames = 0;
+    s_reacquire_frames = 0;
+    s_reacquire_x = 0;
+    s_state = LINE_STATE_NORMAL;
 }
 
-static int pid_steering(int error)
+static int pd_steering(int lateral_error, int heading_error)
 {
-    /*
-     * 低精度定点 PID，只负责直线上的小修正：
-     * 3:1 低通抑制摄像头延迟造成的帧间抖动，输出最多 8 且每帧只变 2。
-     * 大角度转弯由状态机固定输出，绝不把它混进直线 PID。
-     */
-    /* error>0 表示黑线在画面右侧，当前电机校准要求输出相反方向的修正。 */
     if (!s_error_filter_initialized) {
-        s_tracking_error = error;
-        s_pid_previous_error = error;
+        s_tracking_error = lateral_error;
+        s_previous_tracking_error = lateral_error;
         s_error_filter_initialized = true;
     } else {
         s_tracking_error = (s_tracking_error * LINE_ERROR_FILTER_OLD +
-                            error * LINE_ERROR_FILTER_NEW) /
+                            lateral_error * LINE_ERROR_FILTER_NEW) /
                            (LINE_ERROR_FILTER_OLD + LINE_ERROR_FILTER_NEW);
     }
 
-    const int magnitude = abs(s_tracking_error);
-    if (magnitude <= LINE_ERROR_DEADBAND) {
-        s_pid_integral = 0;
-        s_pid_previous_error = s_tracking_error;
+    const int delta_lateral_error = s_tracking_error - s_previous_tracking_error;
+    s_previous_tracking_error = s_tracking_error;
+    if (abs(s_tracking_error) <= LINE_ERROR_DEADBAND &&
+        abs(heading_error) <= LINE_ERROR_DEADBAND) {
         s_pid_output = 0;
         return 0;
     }
 
-    if ((s_tracking_error > 0 && s_pid_integral < 0) ||
-        (s_tracking_error < 0 && s_pid_integral > 0)) {
-        s_pid_integral = 0;
-    }
-    s_pid_integral = clamp_int(s_pid_integral + s_tracking_error,
-                               LINE_PID_INTEGRAL_LIMIT);
-    const int derivative = s_tracking_error - s_pid_previous_error;
-    s_pid_previous_error = s_tracking_error;
-
-    int target = -(LINE_PID_KP * s_tracking_error +
-                   LINE_PID_KI * s_pid_integral +
-                   LINE_PID_KD * derivative) /
-                 LINE_PID_SCALE;
+    /* 只保留整数 P、heading 前馈和 D；没有积分状态。 */
+    int target = (LINE_PID_KP * s_tracking_error -
+                  LINE_PID_KH * heading_error -
+                  LINE_PID_KD * delta_lateral_error) / LINE_PID_SCALE;
     target = clamp_int(target, LINE_PID_TURN_MAX);
     const int delta = target - s_pid_output;
     if (delta > LINE_PID_SLEW_PER_FRAME) {
@@ -500,14 +738,13 @@ static int pid_steering(int error)
     s_pid_output = target;
     if (abs(s_pid_output) <= LINE_PID_OUTPUT_DEADBAND) {
         s_pid_output = 0;
-        return 0;
     }
     return s_pid_output;
 }
 
-static int forward_speed(int error)
+static int forward_speed(int lateral_error)
 {
-    const int magnitude = abs(error);
+    const int magnitude = abs(lateral_error);
     if (magnitude >= LINE_ERROR_LARGE) {
         return LINE_FORWARD_CRAWL;
     }
@@ -520,17 +757,21 @@ static int forward_speed(int error)
     return LINE_FORWARD_FAST;
 }
 
-static int error_direction(int error)
+static void update_seed(const line_observation_t *observation)
 {
-    return (error > 0) - (error < 0);
+    if (observation == NULL || !observation->candidate) {
+        return;
+    }
+    s_seed_x = observation->seed_x;
+    s_seed_heading = observation->heading_error;
+    s_seed_valid = true;
 }
 
-/* 远端弯向连续出现 3 帧才保存；保存后不再让远端像素参与本次转弯。 */
 static void update_turn_memory(const line_observation_t *observation)
 {
-    if (s_turning || s_pending_turn != 0 || !observation->valid ||
-        !observation->far_valid ||
-        abs(observation->far_error) < LINE_FAR_HINT_ERROR) {
+    if (observation == NULL || !observation->candidate ||
+        observation->branch_direction == 0 || s_pending_turn != 0 ||
+        s_state != LINE_STATE_NORMAL) {
         if (s_pending_turn == 0) {
             s_hint_direction = 0;
             s_hint_frames = 0;
@@ -538,71 +779,83 @@ static void update_turn_memory(const line_observation_t *observation)
         return;
     }
 
-    const int direction = error_direction(observation->far_error);
+    const int direction = observation->branch_direction;
     if (direction != s_hint_direction) {
         s_hint_direction = direction;
         s_hint_frames = 1;
-    } else if (s_hint_frames < LINE_FAR_CONFIRM_FRAMES) {
+    } else if (s_hint_frames < LINE_BRANCH_CONFIRM_FRAMES) {
         ++s_hint_frames;
     }
 
-    if (s_hint_frames >= LINE_FAR_CONFIRM_FRAMES) {
+    if (s_hint_frames >= LINE_BRANCH_CONFIRM_FRAMES) {
         s_pending_turn = direction;
-        s_turn_reference_error = observation->error;
-        s_trigger_frames = 0;
-        ESP_LOGI(TAG, "Remembered upcoming %s turn; near line remains in control",
-                 direction < 0 ? "left" : "right");
+        s_pending_seed_x = observation->seed_x;
+        s_hint_direction = 0;
+        s_hint_frames = 0;
+        ESP_LOGI(TAG, "pending_turn=%d; continue on the old line until it disappears",
+                 s_pending_turn);
     }
 }
 
-/*
- * 记住弯向时同时冻结“当前直线”的横坐标。之后只在该坐标左右 8% 宽的
- * 窄走廊里找线并计算 PID；走廊外的未来支路即使像素更多也无法拉动后轮。
- * 当走廊连续看不到线，才认为原直线真正消失。
- */
-static bool measure_remembered_straight(const uint8_t *frame,
-                                        uint16_t width,
-                                        uint16_t height,
-                                        int threshold,
-                                        int *error)
+static const char *state_name(void)
 {
-    int image_error = s_turn_reference_error;
-#if CAMERA_LINE_MIRROR_X
-    image_error = -image_error;
-#endif
-    const int reference_x = (int)width / 2 + image_error * (int)width / 200;
-    const int half_width = (int)width * LINE_STRAIGHT_CORRIDOR_PERCENT / 100;
-    int left = reference_x - half_width;
-    int right = reference_x + half_width;
-    const int top = (int)height * LINE_LOWER_TOP_PERCENT / 100;
-    const int bottom = (int)height * LINE_NEAR_BOTTOM_PERCENT / 100 -
-                       LINE_BOTTOM_SKIP_ROWS * LINE_ROW_STEP;
-    const int x_step = width >= 96 ? 2 : 1;
-    int total_x = 0;
-    int total_dark = 0;
-    int dark_rows = 0;
+    switch (s_state) {
+    case LINE_STATE_CORNER:
+        return "CORNER";
+    case LINE_STATE_LOST:
+        return "LOST";
+    case LINE_STATE_NORMAL:
+    default:
+        return "NORMAL";
+    }
+}
 
-    left = left < 0 ? 0 : left;
-    right = right >= (int)width ? (int)width - 1 : right;
-    for (int y = top; y <= bottom; y += LINE_ROW_STEP) {
-        int row_dark = 0;
-        for (int x = left; x <= right; x += x_step) {
-            if (rgb565_luma(frame + (((size_t)y * width + (size_t)x) * 2)) <= threshold) {
-                total_x += x;
-                ++total_dark;
-                ++row_dark;
-            }
-        }
-        if (row_dark >= LINE_MIN_ROW_SAMPLES) {
-            ++dark_rows;
-        }
+static void maybe_log_summary(int64_t now)
+{
+    if (s_summary_start_us == 0) {
+        s_summary_start_us = now;
+        camera_display_get_counters(&s_summary_camera_frames,
+                                    &s_summary_processed_frames,
+                                    &s_summary_dropped_frames);
+        s_summary_callback_dropped_frames = s_callback_dropped_frames;
+        return;
+    }
+    if (now - s_summary_start_us < 1000000) {
+        return;
     }
 
-    if (dark_rows < LINE_MIN_DARK_ROWS || total_dark == 0) {
-        return false;
-    }
-    *error = normalized_error(total_x / total_dark - (int)width / 2, width);
-    return true;
+    uint32_t camera_frames = 0;
+    uint32_t processed_frames = 0;
+    uint32_t dropped_frames = 0;
+    camera_display_get_counters(&camera_frames, &processed_frames, &dropped_frames);
+    const uint32_t camera_fps = camera_frames - s_summary_camera_frames;
+    const uint32_t processed_fps = processed_frames - s_summary_processed_frames;
+    const uint32_t frames_dropped = (dropped_frames - s_summary_dropped_frames) +
+                                    (s_callback_dropped_frames -
+                                     s_summary_callback_dropped_frames);
+    const uint32_t line_us_avg = s_control_frames == 0 ? 0 :
+                                 s_line_us_sum / s_control_frames;
+    ESP_LOGI(TAG,
+             "camera_fps=%u processed_fps=%u control_fps=%u frames_dropped=%u "
+             "line_us_avg=%u line_us_max=%u state=%s threshold=%d seed_x=%d "
+             "valid_rows=%u confidence=%u lateral_error=%d heading_error=%d "
+             "pending_turn=%d motor[A,B,D]=[%d,%d,%d]",
+             (unsigned)camera_fps, (unsigned)processed_fps,
+             (unsigned)s_control_frames, (unsigned)frames_dropped,
+             (unsigned)line_us_avg, (unsigned)s_line_us_max, state_name(),
+             s_last_threshold, s_seed_valid ? s_seed_x : -1,
+             (unsigned)s_last_valid_rows, (unsigned)s_last_confidence,
+             s_last_lateral_error, s_last_heading_error, s_pending_turn,
+             s_command_a, s_command_b, s_command_d);
+
+    s_summary_camera_frames = camera_frames;
+    s_summary_processed_frames = processed_frames;
+    s_summary_dropped_frames = dropped_frames;
+    s_summary_callback_dropped_frames = s_callback_dropped_frames;
+    s_summary_start_us = now;
+    s_control_frames = 0;
+    s_line_us_sum = 0;
+    s_line_us_max = 0;
 }
 
 static void disarm_tracking(void)
@@ -614,27 +867,274 @@ static void disarm_tracking(void)
     s_first_frame_us = 0;
     s_last_line_us = 0;
     reset_tracking();
+    s_state = LINE_STATE_LOST;
 }
 
-static void log_state(const char *mode, const line_observation_t *observation)
+static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
+                                             uint16_t width,
+                                             uint16_t height,
+                                             uint8_t source_threshold)
 {
-    const int64_t now = esp_timer_get_time();
-    if (s_last_log_us != 0 && now - s_last_log_us < 500000) {
-        return;
+    const int64_t line_start_us = esp_timer_get_time();
+    const int64_t now = line_start_us;
+    if (!s_started || s_finished) {
+        if (s_started) {
+            stop_motors();
+        }
+        goto done;
     }
-    s_last_log_us = now;
-    ESP_LOGI(TAG, "mode=%s near=%d straight=%d err=%d filt=%d far=%d memory=%d lower=%d rows=%u threshold=%d motor[A,B,D]=[%d,%d,%d]",
-             mode,
-             observation != NULL && observation->valid,
-             observation != NULL && observation->straight_visible,
-             observation != NULL && observation->valid ? observation->error : s_last_error,
-             s_tracking_error,
-             observation != NULL && observation->far_valid ? observation->far_error : 0,
-             s_pending_turn,
-             observation != NULL && observation->lower_valid ? observation->lower_error : 0,
-             (unsigned)(observation != NULL ? observation->track_rows : 0),
-             observation != NULL ? observation->threshold : s_last_threshold,
-             s_command_a, s_command_b, s_command_d);
+    if (s_first_frame_us == 0) {
+        s_first_frame_us = now;
+    }
+
+    line_observation_t observation = {0};
+    if (s_state == LINE_STATE_CORNER && s_corner_frames < UINT8_MAX) {
+        ++s_corner_frames;
+    }
+    if (s_state == LINE_STATE_LOST && s_lost_frames < UINT32_MAX) {
+        ++s_lost_frames;
+    }
+    const bool remembered_corridor = s_pending_turn != 0 &&
+                                     s_state != LINE_STATE_CORNER;
+    const bool candidate = observe_line(rgb565_big_endian, width, height,
+                                        source_threshold, remembered_corridor,
+                                        &observation);
+    s_last_threshold = observation.threshold;
+    s_last_valid_rows = observation.valid_rows;
+    s_last_confidence = observation.confidence;
+    if (candidate) {
+        s_last_lateral_error = observation.lateral_error;
+        s_last_heading_error = observation.heading_error;
+    }
+
+    if (!s_armed) {
+        if (candidate && now - s_first_frame_us >= (int64_t)LINE_START_DELAY_MS * 1000) {
+            if (s_arm_frames < LINE_ARM_CONFIRM_FRAMES) {
+                ++s_arm_frames;
+            }
+            if (s_arm_frames >= LINE_ARM_CONFIRM_FRAMES) {
+                s_armed = true;
+                s_state = LINE_STATE_NORMAL;
+                reset_pd();
+                update_seed(&observation);
+                s_last_line_us = now;
+                s_motor_start_ramp_frames = LINE_MOTOR_START_RAMP_FRAMES;
+                gpio_set_level(STBY_GPIO, 1);
+                ESP_LOGI(TAG, "line confirmed; camera steering enabled");
+            }
+        } else if (!candidate) {
+            s_arm_frames = 0;
+        }
+        if (!s_armed) {
+            stop_motors();
+            goto done;
+        }
+        zero_motor_outputs();
+        goto done;
+    }
+
+    if (observation.finish_candidate && candidate) {
+        if (s_finish_frames < LINE_FINISH_CONFIRM_FRAMES) {
+            ++s_finish_frames;
+        }
+        if (s_finish_frames >= LINE_FINISH_CONFIRM_FRAMES) {
+            s_finished = true;
+            stop_motors();
+            ESP_LOGW(TAG, "finish bar confirmed; motors stopped");
+            goto done;
+        }
+    } else {
+        s_finish_frames = 0;
+    }
+
+    if (s_state == LINE_STATE_CORNER) {
+        bool new_line_candidate = candidate;
+        if (new_line_candidate && s_pending_turn != 0) {
+            const int displacement = observation.seed_x - s_corner_origin_x;
+            const int minimum_shift = positive_percent((int)width,
+                                                       LINE_BRANCH_MIN_OFFSET_PERCENT,
+                                                       LINE_SEARCH_HALF_MIN);
+            const int prediction_window = positive_percent((int)width,
+                                                            LINE_CORNER_WINDOW_START_PERCENT,
+                                                            LINE_SEARCH_HALF_MIN);
+            /* Do not count the old seed as a CORNER exit.  The bottom seed
+             * must move in the remembered direction and stay near prediction. */
+            if (direction_of(displacement) != s_pending_turn ||
+                abs(displacement) < minimum_shift ||
+                abs(observation.seed_x - s_corner_predicted_x) > prediction_window) {
+                new_line_candidate = false;
+            }
+        }
+        if (new_line_candidate) {
+            if (s_corner_exit_frames < LINE_CORNER_EXIT_CONFIRM_FRAMES) {
+                ++s_corner_exit_frames;
+            }
+        } else {
+            s_corner_exit_frames = 0;
+        }
+        if (s_corner_exit_frames >= LINE_CORNER_EXIT_CONFIRM_FRAMES) {
+            s_state = LINE_STATE_NORMAL;
+            update_seed(&observation);
+            clear_turn_plan();
+            reset_pd();
+            s_last_line_us = now;
+            const int turn = pd_steering(observation.lateral_error,
+                                         observation.heading_error);
+            drive(forward_speed(observation.lateral_error), turn);
+            goto done;
+        }
+        if (s_corner_started_us != 0 &&
+            now - s_corner_started_us > (int64_t)LINE_CORNER_TIMEOUT_MS * 1000) {
+            disarm_tracking();
+            ESP_LOGW(TAG, "corner timed out; motors stopped and line confirmation reset");
+            goto done;
+        }
+        drive(LINE_FORWARD_CRAWL, -s_pending_turn * LINE_TURN_MAX);
+        goto done;
+    }
+
+    if (s_pending_turn != 0) {
+        if (candidate && observation.old_line_visible) {
+            s_state = LINE_STATE_NORMAL;
+            s_pending_miss_frames = 0;
+            s_lost_frames = 0;
+            s_reacquire_frames = 0;
+            s_last_line_us = now;
+            update_seed(&observation);
+            const int turn = pd_steering(observation.lateral_error,
+                                         observation.heading_error);
+            drive(forward_speed(observation.lateral_error), turn);
+            goto done;
+        }
+
+        /* 旧直线消失需连续确认，避免一帧曝光抖动提前拐。 */
+        if (s_pending_miss_frames < LINE_PENDING_MISS_CONFIRM_FRAMES) {
+            ++s_pending_miss_frames;
+        }
+        if (s_pending_miss_frames < LINE_PENDING_MISS_CONFIRM_FRAMES) {
+            drive(LINE_FORWARD_CRAWL, 0);
+            goto done;
+        }
+
+        /* 旧直线已不在保存的局部走廊内，现在才进入统一 CORNER。 */
+        s_state = LINE_STATE_CORNER;
+        s_corner_started_us = now;
+        s_corner_frames = 0;
+        s_corner_exit_frames = 0;
+        s_corner_origin_x = s_pending_seed_x;
+        s_corner_predicted_x = s_pending_seed_x;
+        reset_pd();
+        drive(LINE_FORWARD_CRAWL, -s_pending_turn * LINE_TURN_MAX);
+        goto done;
+    }
+
+    if (s_state == LINE_STATE_LOST) {
+        const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
+        if (candidate) {
+            const int confirm_window = positive_percent((int)width,
+                                                        LINE_SEARCH_HALF_PERCENT,
+                                                        LINE_SEARCH_HALF_MIN);
+            if (s_reacquire_frames == 0 ||
+                abs(observation.seed_x - s_reacquire_x) <= confirm_window) {
+                s_reacquire_x = observation.seed_x;
+                if (s_reacquire_frames < LINE_REACQUIRE_CONFIRM_FRAMES) {
+                    ++s_reacquire_frames;
+                }
+            } else {
+                s_reacquire_x = observation.seed_x;
+                s_reacquire_frames = 1;
+            }
+            if (s_reacquire_frames >= LINE_REACQUIRE_CONFIRM_FRAMES) {
+                s_state = LINE_STATE_NORMAL;
+                s_lost_frames = 0;
+                s_reacquire_frames = 0;
+                update_seed(&observation);
+                s_last_line_us = now;
+                reset_pd();
+                update_turn_memory(&observation);
+                const int turn = pd_steering(observation.lateral_error,
+                                             observation.heading_error);
+                drive(forward_speed(observation.lateral_error), turn);
+                goto done;
+            }
+            const int correction = direction_of(observation.seed_x - s_seed_x);
+            drive(LINE_FORWARD_CRAWL, -correction * 4);
+        } else {
+            /* 候选线必须在相邻帧连续出现，任何空帧都重新开始确认。 */
+            s_reacquire_frames = 0;
+            s_reacquire_x = s_seed_x;
+            if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
+                drive(LINE_FORWARD_CRAWL, -s_seed_heading * 3);
+            } else {
+                zero_motor_outputs();
+            }
+        }
+        if (lost_us >= (int64_t)LINE_LOST_STOP_MS * 1000) {
+            disarm_tracking();
+        }
+        goto done;
+    }
+
+    if (candidate) {
+        s_state = LINE_STATE_NORMAL;
+        s_lost_frames = 0;
+        s_reacquire_frames = 0;
+        s_last_line_us = now;
+        update_turn_memory(&observation);
+        update_seed(&observation);
+        const int turn = pd_steering(observation.lateral_error,
+                                     observation.heading_error);
+        drive(forward_speed(observation.lateral_error), turn);
+        goto done;
+    }
+
+    s_state = LINE_STATE_LOST;
+    s_lost_frames = 1;
+    s_reacquire_frames = 0;
+    s_reacquire_x = s_seed_x;
+    reset_pd();
+    const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
+    if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
+        drive(LINE_FORWARD_CRAWL, 0);
+    } else {
+        zero_motor_outputs();
+        if (lost_us >= (int64_t)LINE_LOST_STOP_MS * 1000) {
+            disarm_tracking();
+        }
+    }
+
+done:
+    {
+        const uint32_t elapsed = (uint32_t)(esp_timer_get_time() - line_start_us);
+        ++s_control_frames;
+        s_line_us_sum += elapsed;
+        if (elapsed > s_line_us_max) {
+            s_line_us_max = elapsed;
+        }
+        maybe_log_summary(esp_timer_get_time());
+    }
+}
+
+static void camera_line_follow_watchdog_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (!s_started || s_control_mutex == NULL) {
+            continue;
+        }
+        const int64_t now = esp_timer_get_time();
+        if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+            continue;
+        }
+        if (s_started && s_last_frame_us != 0 &&
+            now - s_last_frame_us > (int64_t)LINE_FRAME_TIMEOUT_MS * 1000) {
+            disarm_tracking();
+            s_last_frame_us = 0;
+            ESP_LOGW(TAG, "decoded-frame timeout; motors stopped and line confirmation reset");
+        }
+        (void)xSemaphoreGive(s_control_mutex);
+    }
 }
 
 esp_err_t camera_line_follow_start(void)
@@ -701,8 +1201,11 @@ esp_err_t camera_line_follow_start(void)
     s_first_frame_us = 0;
     s_last_line_us = 0;
     s_last_frame_us = 0;
-    s_last_log_us = 0;
-    s_last_error = 0;
+    s_state = LINE_STATE_NORMAL;
+    s_last_lateral_error = 0;
+    s_last_heading_error = 0;
+    s_last_valid_rows = 0;
+    s_last_confidence = 0;
     s_last_threshold = 0;
     s_last_direction[0] = 0;
     s_last_direction[1] = 0;
@@ -710,6 +1213,15 @@ esp_err_t camera_line_follow_start(void)
     s_kick_cycles[0] = 0;
     s_kick_cycles[1] = 0;
     s_kick_cycles[2] = 0;
+    s_summary_start_us = 0;
+    s_summary_camera_frames = 0;
+    s_summary_processed_frames = 0;
+    s_summary_dropped_frames = 0;
+    s_callback_dropped_frames = 0;
+    s_summary_callback_dropped_frames = 0;
+    s_control_frames = 0;
+    s_line_us_sum = 0;
+    s_line_us_max = 0;
     reset_tracking();
     gpio_set_level(STBY_GPIO, 0);
     stop_motors();
@@ -743,189 +1255,6 @@ void camera_line_follow_stop(void)
     }
 }
 
-static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
-                                             uint16_t width,
-                                             uint16_t height,
-                                             uint8_t source_threshold)
-{
-    if (!s_started || s_finished) {
-        if (s_started) {
-            stop_motors();
-        }
-        return;
-    }
-
-    const int64_t now = esp_timer_get_time();
-    if (s_first_frame_us == 0) {
-        s_first_frame_us = now;
-    }
-
-    line_observation_t observation = {0};
-    const bool line_seen = observe_line(rgb565_big_endian, width, height,
-                                        source_threshold, &observation);
-    s_last_threshold = observation.threshold;
-
-    if (line_seen) {
-        s_last_line_us = now;
-        s_last_error = observation.error;
-    }
-
-    /* 先确认画面稳定，再允许 STBY；复位后不会因为一帧误检突然起步。 */
-    if (!s_armed) {
-        if (line_seen && now - s_first_frame_us >= (int64_t)LINE_START_DELAY_MS * 1000) {
-            if (s_arm_frames < LINE_ARM_CONFIRM_FRAMES) {
-                ++s_arm_frames;
-            }
-            if (s_arm_frames >= LINE_ARM_CONFIRM_FRAMES) {
-                s_armed = true;
-                reset_tracking();
-                s_last_error = observation.error;
-                s_motor_start_ramp_frames = LINE_MOTOR_START_RAMP_FRAMES;
-                gpio_set_level(STBY_GPIO, 1);
-                ESP_LOGI(TAG, "Line confirmed; camera steering enabled with %u-frame motor ramp",
-                         (unsigned)LINE_MOTOR_START_RAMP_FRAMES);
-            }
-        } else if (!line_seen) {
-            s_arm_frames = 0;
-        }
-        if (!s_armed) {
-            stop_motors();
-            log_state("ARM", &observation);
-            return;
-        }
-        zero_motor_outputs();
-        log_state("ARMED", &observation);
-        return;
-    }
-
-    if (observation.finish_candidate) {
-        if (s_finish_frames < LINE_FINISH_CONFIRM_FRAMES) {
-            ++s_finish_frames;
-        }
-        if (s_finish_frames >= LINE_FINISH_CONFIRM_FRAMES) {
-            s_finished = true;
-            stop_motors();
-            ESP_LOGW(TAG, "Finish bar confirmed; motors stopped");
-            return;
-        }
-    } else {
-        s_finish_frames = 0;
-    }
-
-    update_turn_memory(&observation);
-
-    /*
-     * TURN：真正开始转弯后使用固定的小车转向量，不再受远端像素多少影响。
-     * 新直线回到近端中央并稳定 3 帧后退出，随后重新交给小幅 PID。
-     */
-    if (s_turning) {
-        if (observation.valid && abs(observation.error) <= LINE_TURN_EXIT_ERROR) {
-            if (s_turn_exit_frames < LINE_TURN_EXIT_FRAMES) {
-                ++s_turn_exit_frames;
-            }
-        } else {
-            s_turn_exit_frames = 0;
-        }
-
-        if (s_turn_exit_frames >= LINE_TURN_EXIT_FRAMES) {
-            clear_turn_plan();
-            reset_pid();
-            const int turn = pid_steering(observation.error);
-            drive(forward_speed(s_tracking_error), turn);
-            log_state("TURN-EXIT", &observation);
-            return;
-        }
-
-        if (now - s_turn_started_us > (int64_t)LINE_TURN_TIMEOUT_MS * 1000) {
-            disarm_tracking();
-            ESP_LOGW(TAG, "Turn timed out; motors stopped and line confirmation reset");
-            log_state("TURN-TIMEOUT", &observation);
-            return;
-        }
-
-        drive(LINE_FORWARD_CRAWL, -s_pending_turn * LINE_TURN_MAX);
-        log_state("TURN", &observation);
-        return;
-    }
-
-    /*
-     * MEMORY：弯向虽已记住，只要原来的近端直线还在，就继续按它做 PID。
-     * 原直线消失后先保持 B=0 慢慢前探；只有下方黑重心与记忆同向连续
-     * 两帧，才进入 TURN。等待过久则原地停车，但保留画面判断，不盲目搜索。
-    */
-    if (s_pending_turn != 0) {
-        int straight_error = 0;
-        if (measure_remembered_straight(rgb565_big_endian, width, height,
-                                        LINE_BINARY_BLACK_MAX, &straight_error)) {
-            s_trigger_frames = 0;
-            const int turn = pid_steering(straight_error);
-            drive(forward_speed(s_tracking_error), turn);
-            log_state("STRAIGHT-MEM", &observation);
-            return;
-        }
-
-        reset_pid();
-        if (s_trigger_frames < LINE_TURN_TRIGGER_FRAMES) {
-            ++s_trigger_frames;
-        }
-
-        if (s_trigger_frames >= LINE_TURN_TRIGGER_FRAMES) {
-            s_turning = true;
-            s_turn_started_us = now;
-            s_turn_exit_frames = 0;
-            drive(LINE_FORWARD_CRAWL, -s_pending_turn * LINE_TURN_MAX);
-            log_state("TURN-START", &observation);
-        } else {
-            drive(LINE_FORWARD_CRAWL, -s_pending_turn * LINE_TURN_MAX);
-            log_state("CORNER-TURN-ARM", &observation);
-        }
-        return;
-    }
-
-    if (line_seen) {
-        const int turn = pid_steering(observation.error);
-        drive(forward_speed(s_tracking_error), turn);
-        log_state("LINE", &observation);
-        return;
-    }
-
-    /* 未记住弯向时绝不按旧误差原地搜索：短暂前探，持续丢线就停车重认。 */
-    const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
-    if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
-        reset_pid();
-        drive(LINE_FORWARD_CRAWL, 0);
-        log_state("LOST-HOLD", &observation);
-    } else {
-        zero_motor_outputs();
-        log_state("LOST-STOP", &observation);
-        if (lost_us >= (int64_t)LINE_LOST_STOP_MS * 1000) {
-            disarm_tracking();
-        }
-    }
-}
-
-static void camera_line_follow_watchdog_task(void *arg)
-{
-    (void)arg;
-    while (true) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        if (!s_started || s_control_mutex == NULL) {
-            continue;
-        }
-        const int64_t now = esp_timer_get_time();
-        if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
-            continue;
-        }
-        if (s_started && s_last_frame_us != 0 &&
-            now - s_last_frame_us > (int64_t)LINE_FRAME_TIMEOUT_MS * 1000) {
-            disarm_tracking();
-            s_last_frame_us = 0;
-            ESP_LOGW(TAG, "Decoded-frame timeout; motors stopped and line confirmation reset");
-        }
-        (void)xSemaphoreGive(s_control_mutex);
-    }
-}
-
 void camera_line_follow_frame_callback(const uint8_t *rgb565_big_endian,
                                        uint16_t width,
                                        uint16_t height,
@@ -938,6 +1267,7 @@ void camera_line_follow_frame_callback(const uint8_t *rgb565_big_endian,
     }
     if (s_control_mutex != NULL &&
         xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+        ++s_callback_dropped_frames;
         return;
     }
     s_last_frame_us = esp_timer_get_time();

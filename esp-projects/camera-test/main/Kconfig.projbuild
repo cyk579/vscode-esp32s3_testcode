@@ -5,6 +5,14 @@ menu "Example Configuration"
         help
             Enables streaming of captured video.
 
+    config EXAMPLE_ENABLE_TFT_PREVIEW
+        bool "Enable TFT preview"
+        default n
+        help
+            Enables the ST7735 preview.  Leave this disabled for competition
+            mode so JPEG decoding and line-follow control are not slowed by SPI
+            display transfers.
+
     config EXAMPLE_ENABLE_CAMERA_LINE_FOLLOW
         bool "Enable camera black-line following"
         default y
@@ -29,11 +37,11 @@ menu "Example Configuration"
         config EXAMPLE_UVC_PROTOCOL_MODE_AUTO
             bool "Auto"
             help
-                When protocol mode set to Auto, the example tries to make five attempts to negotiate
-                the protocol with following parameters:
-                1 Attempt: 480x320, 15 FPS, MJPEG
-                2 Attempt: 480x320, first available FPS, MJPEG
-                3 Attempt: 320x240, 30 FPS, MJPEG
+                When protocol mode is Auto, the example tries five profiles in
+                this order (each profile is retried as configured below):
+                1 Attempt: 320x240, 30 FPS, MJPEG
+                2 Attempt: 480x320, 15 FPS, MJPEG
+                3 Attempt: 480x320, first available FPS, MJPEG
                 4 Attempt: 640x480, 15 FPS, MJPEG
                 5 Attempt: 1280x720, first available FPS, MJPEG
                 If all five attempts result in an error, the example displays the error message and

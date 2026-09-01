@@ -5,17 +5,20 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "jpeg_decoder.h"
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
 #include "tft_st7735.h"
+#endif
 
 #define CAMERA_DISPLAY_SLOT_COUNT 2
 #define CAMERA_DISPLAY_MAX_JPEG_BYTES (256 * 1024)
+#define CAMERA_DECODE_MAX_WIDTH 320
+#define CAMERA_DECODE_MAX_HEIGHT 240
 #define CAMERA_DISPLAY_RGB565_BYTES \
-    (TFT_ST7735_WIDTH * (TFT_ST7735_HEIGHT - 8) * 2)
+    ((size_t)CAMERA_DECODE_MAX_WIDTH * CAMERA_DECODE_MAX_HEIGHT * 2)
 #define CAMERA_DISPLAY_JPEG_WORK_BYTES (16 * 1024)
 #define CAMERA_BINARY_ROI_TOP_PERCENT 30
 #define CAMERA_BINARY_ROI_BOTTOM_PERCENT 95
@@ -26,8 +29,17 @@
 #define CAMERA_BINARY_BLACK_FRACTION_PERCENT 20
 #define CAMERA_BINARY_THRESHOLD_MIN 25
 #define CAMERA_BINARY_THRESHOLD_MAX 120
-/* Set a fixed grayscale threshold for track calibration; 0 keeps adaptive mode. */
-#define CAMERA_BINARY_FIXED_THRESHOLD 70
+#define CAMERA_BINARY_THRESHOLD_SLEW 8
+#define CAMERA_BINARY_THRESHOLD_FILTER_OLD 3
+#define CAMERA_BINARY_THRESHOLD_FILTER_NEW 1
+
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+#define CAMERA_OUTPUT_MAX_WIDTH TFT_ST7735_WIDTH
+#define CAMERA_OUTPUT_MAX_HEIGHT (TFT_ST7735_HEIGHT - 8)
+#else
+#define CAMERA_OUTPUT_MAX_WIDTH CAMERA_DECODE_MAX_WIDTH
+#define CAMERA_OUTPUT_MAX_HEIGHT CAMERA_DECODE_MAX_HEIGHT
+#endif
 
 typedef struct {
     uint8_t *jpeg_slots[CAMERA_DISPLAY_SLOT_COUNT];
@@ -43,8 +55,11 @@ typedef struct {
     uint16_t previous_width;
     uint16_t previous_height;
     uint8_t binary_threshold;
-    uint32_t frames_drawn;
-    uint32_t frames_dropped;
+    bool threshold_initialized;
+    uint8_t threshold_filtered;
+    volatile uint32_t camera_frames;
+    volatile uint32_t processed_frames;
+    volatile uint32_t frames_dropped;
 } camera_display_state_t;
 
 static const char *TAG = "camera_display";
@@ -59,7 +74,6 @@ static uint8_t rgb565_luma(const uint8_t *pixel)
     return (uint8_t)((77U * red + 150U * green + 29U * blue) >> 8);
 }
 
-#if CAMERA_BINARY_FIXED_THRESHOLD == 0
 static uint8_t histogram_percentile(const uint16_t histogram[256],
                                     uint32_t sample_count,
                                     uint32_t percentile)
@@ -74,18 +88,11 @@ static uint8_t histogram_percentile(const uint16_t histogram[256],
     }
     return 255;
 }
-#endif
 
 static uint8_t calculate_binary_threshold(const uint8_t *frame,
                                           uint16_t width,
                                           uint16_t height)
 {
-#if CAMERA_BINARY_FIXED_THRESHOLD > 0
-    (void)frame;
-    (void)width;
-    (void)height;
-    return CAMERA_BINARY_FIXED_THRESHOLD;
-#else
     uint16_t histogram[256] = {0};
     const int x_step = width >= 96 ? 2 : 1;
     int top = (int)height * CAMERA_BINARY_ROI_TOP_PERCENT / 100;
@@ -122,7 +129,32 @@ static uint8_t calculate_binary_threshold(const uint8_t *frame,
         threshold = CAMERA_BINARY_THRESHOLD_MAX;
     }
     return (uint8_t)threshold;
-#endif
+}
+
+static uint8_t filter_binary_threshold(uint8_t candidate)
+{
+    if (candidate == 0) {
+        return 0;
+    }
+    if (!s_display.threshold_initialized) {
+        s_display.threshold_filtered = candidate;
+        s_display.threshold_initialized = true;
+        return candidate;
+    }
+
+    int limited = candidate;
+    const int delta = limited - s_display.threshold_filtered;
+    if (delta > CAMERA_BINARY_THRESHOLD_SLEW) {
+        limited = s_display.threshold_filtered + CAMERA_BINARY_THRESHOLD_SLEW;
+    } else if (delta < -CAMERA_BINARY_THRESHOLD_SLEW) {
+        limited = s_display.threshold_filtered - CAMERA_BINARY_THRESHOLD_SLEW;
+    }
+    s_display.threshold_filtered = (uint8_t)((s_display.threshold_filtered *
+                                                CAMERA_BINARY_THRESHOLD_FILTER_OLD +
+                                                limited * CAMERA_BINARY_THRESHOLD_FILTER_NEW) /
+                                               (CAMERA_BINARY_THRESHOLD_FILTER_OLD +
+                                                CAMERA_BINARY_THRESHOLD_FILTER_NEW));
+    return s_display.threshold_filtered;
 }
 
 static bool choose_scale(uint16_t source_width,
@@ -140,8 +172,12 @@ static bool choose_scale(uint16_t source_width,
     };
 
     for (size_t i = 0; i < sizeof(choices) / sizeof(choices[0]); ++i) {
-        if ((source_width / choices[i].divider) <= TFT_ST7735_WIDTH &&
-            (source_height / choices[i].divider) <= TFT_ST7735_HEIGHT - 8) {
+        const uint16_t scaled_width = (source_width + choices[i].divider - 1) /
+                                      choices[i].divider;
+        const uint16_t scaled_height = (source_height + choices[i].divider - 1) /
+                                       choices[i].divider;
+        if (scaled_width <= CAMERA_OUTPUT_MAX_WIDTH &&
+            scaled_height <= CAMERA_OUTPUT_MAX_HEIGHT) {
             *scale = choices[i].scale;
             return true;
         }
@@ -223,7 +259,7 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
 
     esp_jpeg_image_scale_t scale;
     if (!choose_scale(source_info.width, source_info.height, &scale)) {
-        ESP_LOGW(TAG, "Frame %ux%u is too large for the TFT preview",
+         ESP_LOGW(TAG, "Frame %ux%u is too large for the decoded frame buffer",
                  (unsigned)source_info.width, (unsigned)source_info.height);
         return false;
     }
@@ -236,8 +272,7 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
         .out_format = JPEG_IMAGE_FORMAT_RGB565,
         .out_scale = scale,
         .flags = {
-            /* Decoder RGB565 words are little-endian in memory; ST7735
-             * expects the high byte first on the wire. */
+             /* Keep RGB565 bytes in the order expected by the callback/TFT. */
             .swap_color_bytes = true,
         },
         .advanced = {
@@ -251,22 +286,18 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
         ESP_LOGW(TAG, "MJPEG decode failed: %s", esp_err_to_name(err));
         return false;
     }
-    if (output.width == 0 || output.height == 0 || output.width > TFT_ST7735_WIDTH ||
-        output.height > TFT_ST7735_HEIGHT - 8 || output.output_len > CAMERA_DISPLAY_RGB565_BYTES) {
+    if (output.width == 0 || output.height == 0 ||
+        output.width > CAMERA_OUTPUT_MAX_WIDTH ||
+        output.height > CAMERA_OUTPUT_MAX_HEIGHT ||
+        output.output_len > CAMERA_DISPLAY_RGB565_BYTES) {
         ESP_LOGW(TAG, "Unexpected decoded size %ux%u (%u bytes)",
                  (unsigned)output.width, (unsigned)output.height, (unsigned)output.output_len);
         return false;
     }
 
-    const uint8_t source_threshold =
+    const uint8_t threshold_candidate =
         calculate_binary_threshold(s_display.rgb565, output.width, output.height);
-    for (size_t i = 0; i < output.output_len; i += 2) {
-        const uint8_t luma = rgb565_luma(s_display.rgb565 + i);
-        const uint16_t bw = source_threshold != 0 && luma <= source_threshold ?
-                            0x0000 : 0xffff;
-        s_display.rgb565[i] = (uint8_t)(bw >> 8);
-        s_display.rgb565[i + 1] = (uint8_t)bw;
-    }
+    const uint8_t source_threshold = filter_binary_threshold(threshold_candidate);
     s_display.binary_threshold = source_threshold;
 
     if (s_display.frame_callback != NULL) {
@@ -274,10 +305,10 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
                                  source_threshold, s_display.frame_callback_ctx);
     }
 
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
     if (!s_display.tft_ready) {
         return true;
     }
-
     if (output.width != s_display.previous_width || output.height != s_display.previous_height) {
         tft_st7735_fill(0xffff);
         s_display.previous_width = output.width;
@@ -287,6 +318,7 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
         ESP_LOGW(TAG, "TFT draw failed");
         return false;
     }
+#endif
     return true;
 }
 
@@ -294,7 +326,6 @@ static void camera_display_task(void *arg)
 {
     (void)arg;
     uint8_t slot;
-    int64_t next_report_us = 0;
 
     while (true) {
         if (xQueueReceive(s_display.ready_slots, &slot, portMAX_DELAY) != pdTRUE) {
@@ -302,20 +333,12 @@ static void camera_display_task(void *arg)
         }
 
         if (decode_and_draw(s_display.jpeg_slots[slot], s_display.jpeg_sizes[slot])) {
-            s_display.frames_drawn++;
+            s_display.processed_frames++;
         }
         if (xQueueSend(s_display.free_slots, &slot, pdMS_TO_TICKS(100)) != pdTRUE) {
             ESP_LOGE(TAG, "Display frame pool corruption");
         }
 
-        const int64_t now = esp_timer_get_time();
-        if (now >= next_report_us) {
-            ESP_LOGI(TAG, "Decoded frames=%u, skipped=%u, binary threshold=%u",
-                     (unsigned)s_display.frames_drawn,
-                     (unsigned)s_display.frames_dropped,
-                     (unsigned)s_display.binary_threshold);
-            next_report_us = now + 5000000;
-        }
     }
 }
 
@@ -344,10 +367,20 @@ esp_err_t camera_display_start(void)
     if (s_display.started) {
         return ESP_OK;
     }
+    s_display.camera_frames = 0;
+    s_display.processed_frames = 0;
+    s_display.frames_dropped = 0;
+    s_display.binary_threshold = 0;
+    s_display.threshold_initialized = false;
+    s_display.threshold_filtered = 0;
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
     s_display.tft_ready = tft_st7735_init();
     if (!s_display.tft_ready) {
         ESP_LOGW(TAG, "ST7735 unavailable; decoded-frame callbacks remain active");
     }
+#else
+    s_display.tft_ready = false;
+#endif
 
     s_display.free_slots = xQueueCreate(CAMERA_DISPLAY_SLOT_COUNT, sizeof(uint8_t));
     s_display.ready_slots = xQueueCreate(1, sizeof(uint8_t));
@@ -384,16 +417,19 @@ esp_err_t camera_display_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    if (xTaskCreate(camera_display_task, "camera_tft", 6144, NULL, 4, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "Could not create TFT preview task");
+    if (xTaskCreate(camera_display_task, "camera_decode", 6144, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Could not create camera decoder task");
         release_allocations();
         return ESP_ERR_NO_MEM;
     }
 
     s_display.started = true;
-    ESP_LOGI(TAG, "Camera decoder started; fixed binary threshold=%u, TFT preview=%s; JPEG frames larger than %u bytes are skipped",
-             (unsigned)CAMERA_BINARY_FIXED_THRESHOLD,
-             s_display.tft_ready ? "ready" : "disabled",
+    ESP_LOGI(TAG, "Camera decoder started; adaptive threshold, TFT preview=%s; JPEG frames larger than %u bytes are skipped",
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+             s_display.tft_ready ? "ready" : "unavailable",
+#else
+             "disabled",
+#endif
              CAMERA_DISPLAY_MAX_JPEG_BYTES);
     return ESP_OK;
 }
@@ -410,9 +446,10 @@ bool camera_display_submit(const uint8_t *jpeg, size_t jpeg_len)
     if (!s_display.started || jpeg == NULL || jpeg_len == 0) {
         return false;
     }
+    s_display.camera_frames++;
     if (jpeg_len > CAMERA_DISPLAY_MAX_JPEG_BYTES) {
         if ((++s_display.frames_dropped % 100U) == 1U) {
-            ESP_LOGW(TAG, "Dropping %u-byte JPEG; preview limit is %u bytes",
+            ESP_LOGW(TAG, "Dropping %u-byte JPEG; input limit is %u bytes",
                      (unsigned)jpeg_len, CAMERA_DISPLAY_MAX_JPEG_BYTES);
         }
         return false;
@@ -449,4 +486,19 @@ bool camera_display_submit(const uint8_t *jpeg, size_t jpeg_len)
     xQueueSend(s_display.free_slots, &slot, 0);
     s_display.frames_dropped++;
     return false;
+}
+
+void camera_display_get_counters(uint32_t *camera_frames,
+                                 uint32_t *processed_frames,
+                                 uint32_t *dropped_frames)
+{
+    if (camera_frames != NULL) {
+        *camera_frames = s_display.camera_frames;
+    }
+    if (processed_frames != NULL) {
+        *processed_frames = s_display.processed_frames;
+    }
+    if (dropped_frames != NULL) {
+        *dropped_frames = s_display.frames_dropped;
+    }
 }

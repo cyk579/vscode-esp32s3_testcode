@@ -29,6 +29,7 @@ CONFIG_LWIP_TCP_SND_BUF_DEFAULT=15000
 # Keep Wi-Fi/TCP streaming off in the vehicle build so the local TFT preview
 # does not depend on a hotspot and has more power headroom for the camera.
 # CONFIG_EXAMPLE_ENABLE_STREAMING is not set
+# CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW is not set
 # Enable the vehicle task by default; it keeps TB6612 in standby until a line
 # is confirmed. Disable this in menuconfig for camera-only diagnostics.
 CONFIG_EXAMPLE_ENABLE_CAMERA_LINE_FOLLOW=y
