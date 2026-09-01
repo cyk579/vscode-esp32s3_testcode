@@ -187,7 +187,7 @@ ESP32-S3 是 USB Full Speed Host，程序依次尝试 MJPEG `480×320@25 FPS`、
 
 弯道只有一个很小的状态机：远端支路相对眼前线明显偏向一侧时先保存方向；只要下方仍能看到保存方向前的那条直线，就继续按这条直线做 PID，远端弯线不参与输出；原直线消失后 Motor B 保持 `0` 并低速前探；直到下方黑像素重心连续 2 帧明显偏向已保存的一侧，才以固定转向量进入弯道。转过弯后，新直线回到近端中央并稳定 3 帧，清除记忆并恢复直线 PID。
 
-这保留了[参考文章](https://blog.csdn.net/weixin_28285943/article/details/164210989)“控制优先看车前近处”的核心，但删掉了跨帧锚点、浮点前馈和盲目丢线旋转。实现只包含三个区域的整数黑像素重心和一个弯向记忆，适合低分辨率 RGB565 与单片机。直线 PID 最大只输出 8，每帧最多变化 2；中心死区内固定为 `A=-22、B=0、D=22`。相机应刚性朝下，车体中心线与镜头中心尽量重合，并让当前线落在画面下方区。
+这保留了[参考文章](https://blog.csdn.net/weixin_28285943/article/details/164210989)“控制优先看车前近处”的核心，但删掉了跨帧锚点、浮点前馈和盲目丢线旋转。实现只包含三个区域的整数黑像素重心和一个弯向记忆，适合低分辨率 RGB565 与单片机。直线 PID 最大只输出 8，每帧最多变化 2；中心死区内固定为 `A=-30、B=0、D=30`。相机应刚性朝下，车体中心线与镜头中心尽量重合，并让当前线落在画面下方区。
 
 启动和停车条件如下：
 
@@ -212,8 +212,8 @@ ESP32-S3 是 USB Full Speed Host，程序依次尝试 MJPEG `480×320@25 FPS`、
 | `LINE_FAR_HINT_ERROR` / `LINE_FAR_CONFIRM_FRAMES` | `18` / `3` | 远端相对近端的最小偏移与记忆确认帧数 |
 | `LINE_STRAIGHT_CORRIDOR_PERCENT` | `8` | 保存弯向后只在原直线左右各 8% 画宽内找线和做 PID；区域外支路不能参与微调 |
 | `LINE_TURN_TRIGGER_ERROR` / `LINE_TURN_TRIGGER_FRAMES` | `25` / `2` | 原直线消失后，下方同向黑重心的转弯门槛与确认帧数 |
-| `LINE_FORWARD_FAST/MEDIUM/SLOW/CRAWL` | `22/14/9/7` | 摄像头巡线前进速度；比红外对应速度低 8 个 PWM 点（直线为 `30-8=22`） |
-| `LINE_TURN_MAX` / `LINE_PID_TURN_MAX` | `15` / `8` | 真正过弯的固定转向量 / 直线 PID 最大微调量 |
+| `LINE_FORWARD_FAST/MEDIUM/SLOW/CRAWL` | `30/22/22/17` | 恢复红外巡线的直行、弯道和丢线恢复速度，避免低 PWM 失速 |
+| `LINE_TURN_MAX` / `LINE_PID_TURN_MAX` | `19` / `8` | 红外最大转向量 / 直线 PID 最大微调量 |
 | `LINE_ERROR_DEADBAND/MEDIUM/LARGE` | `18/35/60` | PID 死区和前进降速阈值；死区内 Motor B 保持 0 |
 | `LINE_PID_KP/KI/KD` | `12/1/4` | 直线定点 PID；减弱 P、保留极小 I、增加 D 抑制来回摆动 |
 | `LINE_PID_INTEGRAL_LIMIT` / `LINE_PID_SLEW_PER_FRAME` | `40` / `2` | 积分限幅和每帧输出变化上限 |

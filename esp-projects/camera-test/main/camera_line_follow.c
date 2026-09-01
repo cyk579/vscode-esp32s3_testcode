@@ -71,11 +71,11 @@
 #define LINE_FRAME_TIMEOUT_MS 450U
 #define LINE_FINISH_CONFIRM_FRAMES 5U
 
-#define LINE_FORWARD_FAST 22  /* 红外直行 30，摄像头再降 8。 */
-#define LINE_FORWARD_MEDIUM 14 /* 红外弯道 22，摄像头再降 8。 */
-#define LINE_FORWARD_SLOW 9
-#define LINE_FORWARD_CRAWL 7
-#define LINE_TURN_MAX 15
+#define LINE_FORWARD_FAST 30   /* 与红外直行速度一致。 */
+#define LINE_FORWARD_MEDIUM 22 /* 与红外弯道速度一致。 */
+#define LINE_FORWARD_SLOW 22
+#define LINE_FORWARD_CRAWL 17  /* 与红外丢线恢复速度一致，避免低速失速。 */
+#define LINE_TURN_MAX 19       /* 与红外最大转向量一致。 */
 #define LINE_PID_TURN_MAX 8
 #define LINE_ERROR_DEADBAND 18
 #define LINE_ERROR_MEDIUM 35
@@ -95,7 +95,7 @@
 #define MOTOR_B_MIN_RUN_OUTPUT 0
 #define START_KICK_OUTPUT 18
 #define START_KICK_CYCLES 3U
-#define MAX_OUTPUT 26
+#define MAX_OUTPUT 34
 
 /* 方向符号与 car-spin 的实车校准一致。 */
 #define MOTOR_A_SIGN 1
