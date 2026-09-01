@@ -160,7 +160,6 @@ static int64_t s_last_frame_us;
 static line_state_t s_state;
 static bool s_seed_valid;
 static int s_seed_x;
-static int s_seed_heading;
 static uint32_t s_lost_frames;
 static uint8_t s_reacquire_frames;
 static int s_last_lateral_error;
@@ -625,8 +624,9 @@ static bool observe_line(uint8_t *frame,
         s_corner_predicted_x = clamp_range(predicted, 0, (int)width - 1);
         seed = s_corner_predicted_x;
     } else if (s_state == LINE_STATE_LOST && s_seed_valid) {
-        const int predicted_delta = s_seed_heading * (int)s_lost_frames * (int)width / 300;
-        seed = clamp_range(s_seed_x + predicted_delta, 0, (int)width - 1);
+        /* LOST 重捕获围绕最后可信种子逐步扩大。不要把 NORMAL 的
+         * heading_error 当成像素位移，否则斜线会把搜索点甩到旁边物体。 */
+        seed = s_seed_x;
     }
 
     int corridor_half = positive_percent((int)width,
@@ -767,7 +767,6 @@ static void reset_tracking(void)
     clear_turn_plan();
     s_seed_valid = false;
     s_seed_x = 0;
-    s_seed_heading = 0;
     s_lost_frames = 0;
     s_reacquire_frames = 0;
     s_reacquire_x = 0;
@@ -833,7 +832,6 @@ static void update_seed(const line_observation_t *observation)
         return;
     }
     s_seed_x = observation->seed_x;
-    s_seed_heading = observation->heading_error;
     s_seed_valid = true;
 }
 
@@ -1112,8 +1110,16 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             const int confirm_window = positive_percent((int)width,
                                                         LINE_SEARCH_HALF_PERCENT,
                                                         LINE_SEARCH_HALF_MIN);
-            if (s_reacquire_frames == 0 ||
-                abs(observation.seed_x - s_reacquire_x) <= confirm_window) {
+            /* A LOST candidate must first remain close to the last trusted
+             * seed.  The expanding window is for small real motion, not for
+             * jumping across the image onto a chair leg or other dark object. */
+            const bool near_last_seed =
+                abs(observation.seed_x - s_seed_x) <= confirm_window;
+            if (!near_last_seed) {
+                s_reacquire_frames = 0;
+                s_reacquire_x = s_seed_x;
+            } else if (s_reacquire_frames == 0 ||
+                       abs(observation.seed_x - s_reacquire_x) <= confirm_window) {
                 s_reacquire_x = observation.seed_x;
                 if (s_reacquire_frames < LINE_REACQUIRE_CONFIRM_FRAMES) {
                     ++s_reacquire_frames;
@@ -1135,14 +1141,18 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 drive(forward_speed(observation.lateral_error), turn);
                 goto done;
             }
-            const int correction = direction_of(observation.seed_x - s_seed_x);
-            drive(LINE_FORWARD_CRAWL, -correction * 4);
+            if (near_last_seed) {
+                const int correction = direction_of(observation.seed_x - s_seed_x);
+                drive(LINE_FORWARD_CRAWL, -correction * 4);
+            } else {
+                drive(LINE_FORWARD_CRAWL, 0);
+            }
         } else {
             /* 候选线必须在相邻帧连续出现，任何空帧都重新开始确认。 */
             s_reacquire_frames = 0;
             s_reacquire_x = s_seed_x;
             if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
-                drive(LINE_FORWARD_CRAWL, -s_seed_heading * 3);
+                drive(LINE_FORWARD_CRAWL, 0);
             } else {
                 zero_motor_outputs();
             }
