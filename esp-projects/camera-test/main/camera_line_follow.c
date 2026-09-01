@@ -93,11 +93,15 @@
 #define LINE_ERROR_FILTER_OLD 3
 #define LINE_ERROR_FILTER_NEW 1
 
+/* 起转下限、启动冲量和方向符号全部复用 car-spin 的实车校准值。红外巡线
+ * 工程是在同一台三轮全向车上测过的，这里不要再自行下调：B 轮实测起转
+ * 需要 13，低于该值它完全不转，而卡死的后轮会把旋转中心从几何中心挪到
+ * 后轮接地点，摄像头的横向扫过量随之放大。 */
 #define PWM_MAX 1023U
-#define MOTOR_MIN_RUN_OUTPUT 8
-#define MOTOR_B_MIN_RUN_OUTPUT 0
-#define START_KICK_OUTPUT 18
-#define START_KICK_CYCLES 3U
+#define MOTOR_MIN_RUN_OUTPUT 11
+#define MOTOR_B_MIN_RUN_OUTPUT 13
+#define START_KICK_OUTPUT 32
+#define START_KICK_CYCLES 8U
 #define MAX_OUTPUT 34
 
 /* 方向符号与 car-spin 的实车校准一致。 */
@@ -683,8 +687,7 @@ static void motor_set(const motor_t *motor, int command)
         gpio_set_level(motor->in1, speed > 0);
         gpio_set_level(motor->in2, speed < 0);
         s_last_direction[index] = direction;
-        s_kick_cycles[index] = (direction == 0 || motor->channel == LEDC_CHANNEL_1) ?
-                               0 : START_KICK_CYCLES;
+        s_kick_cycles[index] = direction == 0 ? 0 : START_KICK_CYCLES;
     }
 
     if (direction == 0) {
@@ -702,10 +705,12 @@ static void motor_set(const motor_t *motor, int command)
         output = minimum;
     }
     if (s_kick_cycles[index] > 0) {
-        const int kick_output = s_motor_start_ramp_frames > 0 ?
-                                output_limit : START_KICK_OUTPUT;
-        if (output < kick_output) {
-            output = kick_output;
+        /* car-spin 的实车规则：换向冲量固定为 START_KICK_OUTPUT，B 轮只在
+         * 转向量足够大时才参与冲量。冲量绝对不能被启动 ramp 限幅压低，
+         * 否则首帧的 kick 会变成 12%，等于把破静摩擦的冲量自己抵消掉。 */
+        if ((motor->channel != LEDC_CHANNEL_1 || output > LINE_TURN_MAX) &&
+            output < START_KICK_OUTPUT) {
+            output = START_KICK_OUTPUT;
         }
         --s_kick_cycles[index];
     }
