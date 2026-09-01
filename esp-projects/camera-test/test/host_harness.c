@@ -7,6 +7,7 @@
  * 不能验证真实光照、噪声、镜头畸变和胶带边缘 —— 那些必须用真机采帧回放。
  */
 #include "line_geometry.h"
+#include "line_mixer.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -240,6 +241,66 @@ static void scenario_colour_blob(int w)
           "merged blob+line run means the guard did not fire");
 }
 
+/* 混控层单元测试：等比缩放必须保方向，反解必须能还原车体意图。 */
+static line_mixer_cfg_t mixer_cfg(void)
+{
+    line_mixer_cfg_t cfg = {50, 11, 13, 100, 100};
+    return cfg;
+}
+
+static void scenario_mixer(void)
+{
+    static const struct { int f, t, l; } cases[] = {
+        {26, 0, 0}, {0, 19, 0}, {0, 0, 12}, {20, 8, 0}, {17, 19, 0},
+        {24, 12, 10}, {-20, 0, 0}, {0, -19, 0},
+    };
+    const line_mixer_cfg_t cfg = mixer_cfg();
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const int f = cases[i].f, t = cases[i].t, l = cases[i].l;
+        char name[40];
+        line_mixer_out_t out = {0, 0, 0, false, false};
+        int rf = 0, rt = 0, rl = 0;
+        snprintf(name, sizeof(name), "mix(%d,%d,%d)", f, t, l);
+        line_mixer_solve(f, t, l, &cfg, &out);
+        line_mixer_body(out.a, out.b, out.d, &rf, &rt, &rl);
+        printf("  %-16s a=%4d b=%4d d=%4d  scaled=%d dropped=%d -> (%d,%d,%d)\n",
+               name, out.a, out.b, out.d, out.scaled, out.dropped, rf, rt, rl);
+        check(name, "|wheel|<=ceiling",
+              abs(out.a) <= cfg.ceiling && abs(out.b) <= cfg.ceiling &&
+              abs(out.d) <= cfg.ceiling, "ceiling exceeded");
+        check(name, "no sub-floor output",
+              (out.a == 0 || abs(out.a) >= cfg.floor_ad) &&
+              (out.d == 0 || abs(out.d) >= cfg.floor_ad) &&
+              (out.b == 0 || abs(out.b) >= cfg.floor_b),
+              "a wheel was left below its stiction floor");
+        if (!out.scaled && !out.dropped) {
+            check(name, "round trip", rf == f && rt == t && rl == l,
+                  "inverse mix did not reproduce the intent");
+        }
+        /* 纯直行时后轮必须完全不动，这是 kiwi 混控的正确行为。 */
+        if (t == 0 && l == 0) {
+            check(name, "b idle on straight", out.b == 0,
+                  "rear omni wheel must be idle for pure translation");
+        }
+    }
+
+    /* 单边削顶会旋转指令向量，等比缩放不会：检查 (f,t) 的比例被保住。 */
+    line_mixer_out_t out = {0, 0, 0, false, false};
+    int rf = 0, rt = 0, rl = 0;
+    line_mixer_solve(40, 20, 0, &cfg, &out);
+    line_mixer_body(out.a, out.b, out.d, &rf, &rt, &rl);
+    printf("  %-16s a=%4d b=%4d d=%4d  scaled=%d -> (%d,%d,%d)\n",
+           "mix(40,20,0)", out.a, out.b, out.d, out.scaled, rf, rt, rl);
+    /* 单边削顶会旋转指令向量，等比缩放不会：检查 (f,t) 的比例被保住。
+     * 整数除法会带来几个单位的舍入，所以用交叉乘积的容差判断。 */
+    check("mix-scale", "direction kept",
+          rf > 0 && rt > 0 && abs(rf * 20 - rt * 40) <= 40,
+          "scaling changed the forward:turn ratio");
+    check("mix-scale", "no parasitic strafe", rl == 0,
+          "scaling introduced sideways motion");
+}
+
 int main(int argc, char **argv)
 {
     static const int widths[] = {7, 11, 15};
@@ -287,6 +348,9 @@ int main(int argc, char **argv)
         scenario_finish_t(w);
         scenario_colour_blob(w);
     }
+
+    printf("\n-- mixer --\n");
+    scenario_mixer();
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

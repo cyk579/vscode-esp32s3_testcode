@@ -15,6 +15,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "line_geometry.h"
+#include "line_mixer.h"
 
 /* 电机引脚与已经校准过的 car-spin 工程保持一致。 */
 #define A_PWM GPIO_NUM_9
@@ -55,8 +56,8 @@
 /* 这些值保留原有的上电、限速、换向保护和超时停车行为。 */
 #define LINE_START_DELAY_MS 600U
 #define LINE_ARM_CONFIRM_FRAMES 3U
-#define LINE_MOTOR_START_RAMP_FRAMES 18U
-#define LINE_MOTOR_START_MIN_OUTPUT 12
+#define LINE_MOTOR_START_RAMP_MS 700
+#define LINE_MOTOR_START_MIN_OUTPUT 14
 #define LINE_LOST_HOLD_MS 300U
 #define LINE_LOST_STOP_MS 900U
 #define LINE_FRAME_TIMEOUT_MS 1200U
@@ -90,7 +91,15 @@
 #define MOTOR_B_MIN_RUN_OUTPUT 13
 #define START_KICK_OUTPUT 32
 #define START_KICK_CYCLES 8U
-#define MAX_OUTPUT 34
+/* MOTOR_PWM_CEILING 是硬件/安全上限，只负责给混控留余量；LINE_SPEED_CAP 才
+ * 是"想跑多快"。原来两件事都压在 MAX_OUTPUT=34 上：FORWARD_FAST=30 时转向
+ * 预算只剩 4，LINE_TURN_MAX 19 和 LINE_PID_TURN_MAX 10 在高速下根本到不了，
+ * 而单轮可用区间 11~34 只有 3:1 动态范围，向量混控挤不开。
+ * TODO(实测): ceiling 按实测最高安全轮速调整；trim 按架空/落地直行跑偏配平。 */
+#define MOTOR_PWM_CEILING 50
+#define LINE_SPEED_CAP 26
+#define MOTOR_TRIM_A 100
+#define MOTOR_TRIM_D 100
 
 /* 方向符号与 car-spin 的实车校准一致。 */
 #define MOTOR_A_SIGN 1
@@ -120,7 +129,7 @@ static bool s_armed;
 static bool s_finished;
 static bool s_stby_enabled;
 static uint8_t s_arm_frames;
-static uint8_t s_motor_start_ramp_frames;
+static int64_t s_motor_start_us;
 static uint8_t s_finish_frames;
 static int64_t s_first_frame_us;
 static int64_t s_last_line_us;
@@ -352,8 +361,8 @@ static void set_motor_duty(const motor_t *motor, int output)
     if (output < 0) {
         output = 0;
     }
-    if (output > MAX_OUTPUT) {
-        output = MAX_OUTPUT;
+    if (output > MOTOR_PWM_CEILING) {
+        output = MOTOR_PWM_CEILING;
     }
     const uint32_t duty = PWM_MAX * (uint32_t)output / 100U;
     (void)ledc_set_duty(LEDC_LOW_SPEED_MODE, motor->channel, duty);
@@ -364,15 +373,7 @@ static void motor_set(const motor_t *motor, int command)
 {
     /* command 是混控层有符号 PWM；换向时先清零，避免 TB6612 硬切方向。 */
     const int index = (int)motor->channel;
-    int output_limit = MAX_OUTPUT;
-    if (s_motor_start_ramp_frames > 0) {
-        const uint8_t elapsed = LINE_MOTOR_START_RAMP_FRAMES -
-                                s_motor_start_ramp_frames;
-        output_limit = LINE_MOTOR_START_MIN_OUTPUT +
-                       ((MAX_OUTPUT - LINE_MOTOR_START_MIN_OUTPUT) * elapsed) /
-                       LINE_MOTOR_START_RAMP_FRAMES;
-    }
-    const int speed = clamp_int(command * motor->sign, output_limit);
+    const int speed = clamp_int(command * motor->sign, MOTOR_PWM_CEILING);
     const int direction = (speed > 0) - (speed < 0);
     const bool direction_changed = direction != s_last_direction[index];
 
@@ -392,12 +393,9 @@ static void motor_set(const motor_t *motor, int command)
         return;
     }
 
+    /* 起转值筛选和整向量缩放都在混控层完成，这里不再逐轮抬值：抬值会把
+     * 指令向量整体转向（turn=1 被抬到 13 就是 13 倍偏航）。 */
     int output = abs(speed);
-    const int minimum = motor->channel == LEDC_CHANNEL_1 ?
-                        MOTOR_B_MIN_RUN_OUTPUT : MOTOR_MIN_RUN_OUTPUT;
-    if (output < minimum) {
-        output = minimum;
-    }
     if (s_kick_cycles[index] > 0) {
         /* car-spin 的实车规则：换向冲量固定为 START_KICK_OUTPUT，B 轮只在
          * 转向量足够大时才参与冲量。冲量绝对不能被启动 ramp 限幅压低，
@@ -428,18 +426,39 @@ static void stop_motors(void)
     s_stby_enabled = false;
 }
 
-static void drive(int forward, int turn)
+/* 启动斜坡只压前进量，而且按时间而不是按帧：摄像头协商到别的帧率时，
+ * 按帧计数的斜坡长度会整体变样。转向和横移在起步阶段必须立刻满权限，
+ * 否则起点正好在弯上时转不过去。 */
+static int forward_ramp_cap(int64_t now)
 {
-    /* 直行向量固定为 A=-forward、D=forward；只有 turn 非零才动后轮 B。 */
-    s_command_a = clamp_int(-forward - turn, MAX_OUTPUT);
-    s_command_b = clamp_int(turn, MAX_OUTPUT);
-    s_command_d = clamp_int(forward - turn, MAX_OUTPUT);
+    if (s_motor_start_us == 0) {
+        return LINE_SPEED_CAP;
+    }
+    const int64_t span = (int64_t)LINE_MOTOR_START_RAMP_MS * 1000;
+    const int64_t elapsed = now - s_motor_start_us;
+    if (elapsed >= span || elapsed < 0) {
+        s_motor_start_us = 0;
+        return LINE_SPEED_CAP;
+    }
+    return LINE_MOTOR_START_MIN_OUTPUT +
+           (int)((LINE_SPEED_CAP - LINE_MOTOR_START_MIN_OUTPUT) * elapsed / span);
+}
+
+static void drive(int forward, int turn, int lat)
+{
+    const line_mixer_cfg_t cfg = {
+        MOTOR_PWM_CEILING, MOTOR_MIN_RUN_OUTPUT, MOTOR_B_MIN_RUN_OUTPUT,
+        MOTOR_TRIM_A, MOTOR_TRIM_D,
+    };
+    line_mixer_out_t out = {0, 0, 0, false, false};
+    forward = clamp_int(forward, forward_ramp_cap(esp_timer_get_time()));
+    line_mixer_solve(forward, turn, lat, &cfg, &out);
+    s_command_a = out.a;
+    s_command_b = out.b;
+    s_command_d = out.d;
     motor_set(&motor_a, s_command_a);
     motor_set(&motor_b, s_command_b);
     motor_set(&motor_d, s_command_d);
-    if (s_motor_start_ramp_frames > 0) {
-        --s_motor_start_ramp_frames;
-    }
 }
 
 static void reset_pd(void)
@@ -644,7 +663,7 @@ static void disarm_tracking(void)
     stop_motors();
     s_armed = false;
     s_arm_frames = 0;
-    s_motor_start_ramp_frames = 0;
+    s_motor_start_us = 0;
     s_first_frame_us = 0;
     s_last_line_us = 0;
     reset_tracking();
@@ -703,7 +722,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 reset_pd();
                 update_seed(&observation);
                 s_last_line_us = now;
-                s_motor_start_ramp_frames = LINE_MOTOR_START_RAMP_FRAMES;
+                s_motor_start_us = now;
                 gpio_set_level(STBY_GPIO, 1);
                 s_stby_enabled = true;
                 ESP_LOGI(TAG, "line confirmed; camera steering enabled");
@@ -766,7 +785,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             s_last_line_us = now;
             const int turn = pd_steering(observation.lateral_error,
                                          observation.heading_error);
-            drive(forward_speed(observation.lateral_error), turn);
+            drive(forward_speed(observation.lateral_error), turn, 0);
             goto done;
         }
         if (s_corner_started_us != 0 &&
@@ -775,7 +794,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             ESP_LOGW(TAG, "corner timed out; motors stopped and line confirmation reset");
             goto done;
         }
-        drive(LINE_FORWARD_CRAWL, -s_pending_turn * LINE_TURN_MAX);
+        drive(LINE_FORWARD_CRAWL, -s_pending_turn * LINE_TURN_MAX, 0);
         goto done;
     }
 
@@ -789,7 +808,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             update_seed(&observation);
             const int turn = pd_steering(observation.lateral_error,
                                          observation.heading_error);
-            drive(forward_speed(observation.lateral_error), turn);
+            drive(forward_speed(observation.lateral_error), turn, 0);
             goto done;
         }
 
@@ -798,7 +817,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             ++s_pending_miss_frames;
         }
         if (s_pending_miss_frames < LINE_PENDING_MISS_CONFIRM_FRAMES) {
-            drive(LINE_FORWARD_CRAWL, 0);
+            drive(LINE_FORWARD_CRAWL, 0, 0);
             goto done;
         }
 
@@ -810,7 +829,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         s_corner_origin_x = s_pending_seed_x;
         s_corner_predicted_x = s_pending_seed_x;
         reset_pd();
-        drive(LINE_FORWARD_CRAWL, -s_pending_turn * LINE_TURN_MAX);
+        drive(LINE_FORWARD_CRAWL, -s_pending_turn * LINE_TURN_MAX, 0);
         goto done;
     }
 
@@ -848,21 +867,21 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 update_turn_memory(&observation);
                 const int turn = pd_steering(observation.lateral_error,
                                              observation.heading_error);
-                drive(forward_speed(observation.lateral_error), turn);
+                drive(forward_speed(observation.lateral_error), turn, 0);
                 goto done;
             }
             if (near_last_seed) {
                 const int correction = direction_of(observation.seed_x - s_seed_x);
-                drive(LINE_FORWARD_CRAWL, -correction * 4);
+                drive(LINE_FORWARD_CRAWL, -correction * 4, 0);
             } else {
-                drive(LINE_FORWARD_CRAWL, 0);
+                drive(LINE_FORWARD_CRAWL, 0, 0);
             }
         } else {
             /* 候选线必须在相邻帧连续出现，任何空帧都重新开始确认。 */
             s_reacquire_frames = 0;
             s_reacquire_x = s_seed_x;
             if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
-                drive(LINE_FORWARD_CRAWL, 0);
+                drive(LINE_FORWARD_CRAWL, 0, 0);
             } else {
                 zero_motor_outputs();
             }
@@ -882,7 +901,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         update_seed(&observation);
         const int turn = pd_steering(observation.lateral_error,
                                      observation.heading_error);
-        drive(forward_speed(observation.lateral_error), turn);
+        drive(forward_speed(observation.lateral_error), turn, 0);
         goto done;
     }
 
@@ -893,7 +912,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     reset_pd();
     const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
     if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
-        drive(LINE_FORWARD_CRAWL, 0);
+        drive(LINE_FORWARD_CRAWL, 0, 0);
     } else {
         zero_motor_outputs();
         if (lost_us >= (int64_t)LINE_LOST_STOP_MS * 1000) {
@@ -995,7 +1014,7 @@ esp_err_t camera_line_follow_start(void)
     s_finished = false;
     s_stby_enabled = false;
     s_arm_frames = 0;
-    s_motor_start_ramp_frames = 0;
+    s_motor_start_us = 0;
     s_finish_frames = 0;
     s_first_frame_us = 0;
     s_last_line_us = 0;
