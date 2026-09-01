@@ -31,8 +31,10 @@
 #define CAMERA_LINE_MIRROR_X 0
 
 /* 只从底部种子向上跟踪，固定窗口和固定数组保证单帧时间有界。 */
+#define LINE_ROI_LEFT_PERCENT 20
+#define LINE_ROI_RIGHT_PERCENT 80
 #define LINE_ROI_TOP_PERCENT 30
-#define LINE_ROI_BOTTOM_PERCENT 95
+#define LINE_ROI_BOTTOM_PERCENT 100
 #define LINE_NEAR_TOP_PERCENT 65
 #define LINE_NEAR_BOTTOM_PERCENT 92
 #define LINE_ROW_STEP 4
@@ -334,10 +336,12 @@ static bool scan_segment(const uint8_t *frame,
     }
 
     *segment = (line_segment_t){0};
-    int left = expected_x < 0 ? 0 : expected_x - half_window;
-    int right = expected_x < 0 ? (int)width - 1 : expected_x + half_window;
-    left = left < 0 ? 0 : left;
-    right = right >= (int)width ? (int)width - 1 : right;
+    const int roi_left = (int)width * LINE_ROI_LEFT_PERCENT / 100;
+    const int roi_right = ((int)width * LINE_ROI_RIGHT_PERCENT / 100) - 1;
+    int left = expected_x < 0 ? roi_left : expected_x - half_window;
+    int right = expected_x < 0 ? roi_right : expected_x + half_window;
+    left = left < roi_left ? roi_left : left;
+    right = right > roi_right ? roi_right : right;
     if (left > right) {
         return false;
     }

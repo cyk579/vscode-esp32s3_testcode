@@ -22,7 +22,9 @@
     ((size_t)CAMERA_DECODE_MAX_WIDTH * CAMERA_DECODE_MAX_HEIGHT * 2)
 #define CAMERA_DISPLAY_JPEG_WORK_BYTES (16 * 1024)
 #define CAMERA_BINARY_ROI_TOP_PERCENT 30
-#define CAMERA_BINARY_ROI_BOTTOM_PERCENT 95
+#define CAMERA_BINARY_ROI_BOTTOM_PERCENT 100
+#define CAMERA_BINARY_ROI_LEFT_PERCENT 20
+#define CAMERA_BINARY_ROI_RIGHT_PERCENT 80
 #define CAMERA_BINARY_ROW_STEP 3
 #define CAMERA_BINARY_DARK_PERCENTILE 2
 #define CAMERA_BINARY_LIGHT_PERCENTILE 90
@@ -97,10 +99,12 @@ static uint8_t calculate_binary_threshold(const uint8_t *frame,
     if (bottom >= (int)height) {
         bottom = (int)height - 1;
     }
+    const int left = (int)width * CAMERA_BINARY_ROI_LEFT_PERCENT / 100;
+    const int right = ((int)width * CAMERA_BINARY_ROI_RIGHT_PERCENT / 100) - 1;
 
     uint32_t sample_count = 0;
     for (int y = top; y <= bottom; y += CAMERA_BINARY_ROW_STEP) {
-        for (int x = 0; x < (int)width; x += x_step) {
+        for (int x = left; x <= right; x += x_step) {
             ++histogram[rgb565_luma(frame + (((size_t)y * width + (size_t)x) * 2))];
             ++sample_count;
         }
