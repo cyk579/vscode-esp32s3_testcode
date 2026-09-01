@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "line_geometry.h"
 
 /* 电机引脚与已经校准过的 car-spin 工程保持一致。 */
 #define A_PWM GPIO_NUM_9
@@ -30,39 +31,25 @@
 /* 解码器输出大端字节序 RGB565；画面左右相反时改为 1。 */
 #define CAMERA_LINE_MIRROR_X 0
 
-/* 只从底部种子向上跟踪，固定窗口和固定数组保证单帧时间有界。 */
-#define LINE_ROI_LEFT_PERCENT 20
-#define LINE_ROI_RIGHT_PERCENT 80
-#define LINE_ROI_TOP_PERCENT 30
-#define LINE_ROI_BOTTOM_PERCENT 100
-#define LINE_NEAR_TOP_PERCENT 65
-#define LINE_NEAR_BOTTOM_PERCENT 92
-#define LINE_ROW_STEP 4
-#define LINE_BOTTOM_SKIP_ROWS 1
-#define LINE_SCAN_MAX_ROWS 64
-#define LINE_SEARCH_HALF_PERCENT 20
-#define LINE_SEARCH_HALF_MIN 6
-#define LINE_SEARCH_HALF_MAX 80
+/* ROI、行距、逐行搜索和线段判据全部在 line_geometry.h 里，ESP 端和 host
+ * 回归测试共用同一组常量。这里只保留状态机自己的窗口策略和时序。 */
 #define LINE_LOST_WINDOW_GROW_PERCENT 4
 #define LINE_LOST_WINDOW_MAX_PERCENT 42
 #define LINE_CORNER_WINDOW_START_PERCENT 28
 #define LINE_CORNER_WINDOW_GROW_PERCENT 4
 #define LINE_CORNER_WINDOW_MAX_PERCENT 46
 #define LINE_CORNER_PREDICT_STEP_PERCENT 4
-#define LINE_MAX_CENTER_JUMP_PERCENT 18
-#define LINE_MIN_SEGMENT_WIDTH 3
-#define LINE_MAX_SEGMENT_WIDTH_PERCENT 55
-#define LINE_FINISH_WIDTH_PERCENT 62
-#define LINE_FINISH_MIN_ROWS 2
-#define LINE_MIN_VALID_ROWS 4
-#define LINE_BRANCH_ROWS 3
-#define LINE_BRANCH_OFFSET_PERCENT 14
-#define LINE_BRANCH_WINDOW_PERCENT 12
-#define LINE_BRANCH_MIN_OFFSET_PERCENT 8
 #define LINE_BRANCH_CONFIRM_FRAMES 3U
 #define LINE_PENDING_MISS_CONFIRM_FRAMES 2U
 #define LINE_REACQUIRE_CONFIRM_FRAMES 2U
 #define LINE_CORNER_EXIT_CONFIRM_FRAMES 3U
+
+/* 彩色干扰守卫：赛道板上的深色红球亮度会落进黑线阈值区间，但通道差很大。
+ * 真机采帧确认需要之后再开启，默认关闭以免引入未验证的过滤。 */
+#define LINE_SATURATION_GUARD 0
+#define LINE_SATURATION_MAX 60
+#define LINE_WIDTH_FILTER_OLD 3
+#define LINE_WIDTH_FILTER_NEW 1
 
 /* 这些值保留原有的上电、限速、换向保护和超时停车行为。 */
 #define LINE_START_DELAY_MS 600U
@@ -116,36 +103,11 @@ typedef struct {
     int sign;
 } motor_t;
 
-typedef struct {
-    int x;
-    int y;
-    int width;
-} line_point_t;
-
-typedef struct {
-    int center;
-    int width;
-    bool wide;
-} line_segment_t;
-
 typedef enum {
     LINE_STATE_NORMAL = 0,
     LINE_STATE_CORNER,
     LINE_STATE_LOST,
 } line_state_t;
-
-typedef struct {
-    bool candidate;
-    bool old_line_visible;
-    bool finish_candidate;
-    int seed_x;
-    int lateral_error;
-    int heading_error;
-    int branch_direction;
-    uint8_t valid_rows;
-    uint8_t confidence;
-    int threshold;
-} line_observation_t;
 
 static const char *TAG = "camera_line";
 static const motor_t motor_a = {A_IN1, A_IN2, LEDC_CHANNEL_0, MOTOR_A_SIGN};
@@ -166,6 +128,7 @@ static int64_t s_last_frame_us;
 static line_state_t s_state;
 static bool s_seed_valid;
 static int s_seed_x;
+static int s_line_width;
 static uint32_t s_lost_frames;
 static uint8_t s_reacquire_frames;
 static int s_last_lateral_error;
@@ -243,28 +206,7 @@ static int direction_of(int value)
 
 static int positive_percent(int value, int percent, int minimum)
 {
-    int result = value * percent / 100;
-    return result < minimum ? minimum : result;
-}
-
-static uint8_t rgb565_luma(const uint8_t *pixel)
-{
-    const uint16_t value = ((uint16_t)pixel[0] << 8) | pixel[1];
-    const int red = ((value >> 11) & 0x1F) * 255 / 31;
-    const int green = ((value >> 5) & 0x3F) * 255 / 63;
-    const int blue = (value & 0x1F) * 255 / 31;
-    return (uint8_t)((77 * red + 150 * green + 29 * blue) >> 8);
-}
-
-/* 正值表示赛道在画面中心左侧，便于直接套用整数 PD 符号。 */
-static int line_error(int center, uint16_t width)
-{
-    int error = ((int)width / 2 - center) * 100 / ((int)width / 2);
-    error = clamp_int(error, 100);
-#if CAMERA_LINE_MIRROR_X
-    error = -error;
-#endif
-    return error;
+    return line_geometry_positive_percent(value, percent, minimum);
 }
 
 static void overlay_pixel(uint8_t *frame,
@@ -312,298 +254,39 @@ static void overlay_cross(uint8_t *frame,
 static void render_tracking_overlay(uint8_t *frame,
                                     uint16_t width,
                                     uint16_t height,
-                                    const line_point_t *points,
-                                    int point_count,
-                                    int seed_y)
+                                    const line_observation_t *observation)
 {
-    /* Keep the debug overlay sparse so it is effectively free at 2.5 FPS. */
-    for (int i = 0; i < point_count; i += 2) {
-        overlay_dot(frame, width, height, points[i].x, points[i].y, 0x07e0);
-    }
-    if (point_count == 0) {
+    if (frame == NULL || observation == NULL) {
         return;
     }
-
-    overlay_cross(frame, width, height, points[0].x, seed_y, 0xf800);
+    /* Keep the debug overlay sparse so it is effectively free at 2.5 FPS. */
+    for (int i = 0; i < observation->point_count; i += 2) {
+        overlay_dot(frame, width, height, observation->point_x[i],
+                    observation->point_y[i], 0x07e0);
+    }
+    if (observation->point_count == 0) {
+        return;
+    }
+    /* 红十字画在实际扫描起始行上，方便用地面胶带量出最近扫描行的落地距离。 */
+    overlay_cross(frame, width, height, observation->point_x[0],
+                  observation->scan_bottom_y, 0xf800);
 }
 
-static bool scan_segment(const uint8_t *frame,
-                         uint16_t width,
-                         int y,
-                         int expected_x,
-                         int half_window,
-                         int threshold,
-                         line_segment_t *segment)
+static int state_search_half_percent(void)
 {
-    if (frame == NULL || segment == NULL || y < 0) {
-        return false;
-    }
-
-    *segment = (line_segment_t){0};
-    const int roi_left = (int)width * LINE_ROI_LEFT_PERCENT / 100;
-    const int roi_right = ((int)width * LINE_ROI_RIGHT_PERCENT / 100) - 1;
-    int left = expected_x < 0 ? roi_left : expected_x - half_window;
-    int right = expected_x < 0 ? roi_right : expected_x + half_window;
-    left = left < roi_left ? roi_left : left;
-    right = right > roi_right ? roi_right : right;
-    if (left > right) {
-        return false;
-    }
-
-    const int min_width = LINE_MIN_SEGMENT_WIDTH;
-    const int max_width = positive_percent((int)width,
-                                           LINE_MAX_SEGMENT_WIDTH_PERCENT,
-                                           min_width + 2);
-    /* Finish width is relative to the local window, not the whole image. */
-    const int window_width = right - left + 1;
-    const int finish_width = positive_percent(window_width,
-                                              LINE_FINISH_WIDTH_PERCENT,
-                                              LINE_MIN_SEGMENT_WIDTH + 1);
-    int best_distance = INT_MAX;
-    line_segment_t best = {0};
-    int best_wide_distance = INT_MAX;
-    line_segment_t best_wide = {0};
-    bool in_run = false;
-    int run_start = 0;
-
-    for (int x = left; x <= right + 1; ++x) {
-        const bool dark = x <= right &&
-                          rgb565_luma(frame + (((size_t)y * width + (size_t)x) * 2)) <= threshold;
-        if (dark && !in_run) {
-            in_run = true;
-            run_start = x;
-        }
-        if (!dark && in_run) {
-            const int run_end = x - 1;
-            const int run_width = run_end - run_start + 1;
-            const int run_center = (run_start + run_end) / 2;
-            if (run_width >= finish_width) {
-                const int wide_distance = expected_x < 0 ?
-                                           abs(run_center - (int)width / 2) :
-                                           abs(run_center - expected_x);
-                if (wide_distance < best_wide_distance) {
-                    best_wide_distance = wide_distance;
-                    best_wide.center = run_center;
-                    best_wide.width = run_width;
-                    best_wide.wide = true;
-                }
-            }
-            if (run_width >= min_width && run_width <= max_width) {
-                const int distance = expected_x < 0 ?
-                                     abs(run_center - (int)width / 2) :
-                                     abs(run_center - expected_x);
-                if (distance < best_distance) {
-                    best_distance = distance;
-                    best.center = run_center;
-                    best.width = run_width;
-                    best.wide = run_width >= finish_width;
-                }
-            }
-            in_run = false;
-        }
-    }
-
-    if (best_distance == INT_MAX) {
-        /* A broad local finish bar is still a valid seed for confirmation. */
-        if (best_wide_distance == INT_MAX) {
-            return false;
-        }
-        best = best_wide;
-    }
-    /* Only the selected run may mark a finish candidate.  A separate wide
-     * run elsewhere in the search window must not taint the tracked line. */
-    *segment = best;
-    return true;
-}
-
-static int average_points(const line_point_t *points, int first, int count)
-{
-    if (points == NULL || count <= 0) {
-        return 0;
-    }
-    int total = 0;
-    for (int i = 0; i < count; ++i) {
-        total += points[first + i].x;
-    }
-    return total / count;
-}
-
-static int branch_hint(const uint8_t *frame,
-                       uint16_t width,
-                       int threshold,
-                       const line_point_t *points,
-                       int point_count)
-{
-    if (point_count < LINE_MIN_VALID_ROWS) {
-        return 0;
-    }
-
-    const line_point_t *end = &points[point_count - 1];
-    const int offset = positive_percent((int)width, LINE_BRANCH_OFFSET_PERCENT,
-                                        LINE_SEARCH_HALF_MIN * 2);
-    const int half = positive_percent((int)width, LINE_BRANCH_WINDOW_PERCENT,
-                                      LINE_SEARCH_HALF_MIN);
-    int found_direction = 0;
-    for (int direction = -1; direction <= 1; direction += 2) {
-        int hits = 0;
-        for (int i = 0; i < LINE_BRANCH_ROWS; ++i) {
-            int y = end->y + (i - 1) * LINE_ROW_STEP;
-            if (y < 0) {
-                y = 0;
-            }
-            line_segment_t branch = {0};
-            if (scan_segment(frame, width, y, end->x + direction * offset,
-                             half, threshold, &branch) &&
-                abs(branch.center - end->x) >= offset * LINE_BRANCH_MIN_OFFSET_PERCENT /
-                                                LINE_BRANCH_OFFSET_PERCENT) {
-                ++hits;
-            }
-        }
-        if (hits >= 2) {
-            if (found_direction != 0 && found_direction != direction) {
-                return 0;
-            }
-            found_direction = direction;
-        }
-    }
-
-    return found_direction;
-}
-
-static bool track_line(uint8_t *frame,
-                       uint16_t width,
-                       uint16_t height,
-                       int threshold,
-                       bool use_history,
-                       int seed_x,
-                       int corridor_x,
-                       int corridor_half,
-                       bool draw_overlay,
-                       line_observation_t *observation)
-{
-    if (frame == NULL || observation == NULL || width < 16 || height < 16 || threshold <= 0) {
-        return false;
-    }
-
-    int top = (int)height * LINE_ROI_TOP_PERCENT / 100;
-    int roi_bottom = (int)height * LINE_ROI_BOTTOM_PERCENT / 100;
-    const int near_top = (int)height * LINE_NEAR_TOP_PERCENT / 100;
-    const int near_bottom = (int)height * LINE_NEAR_BOTTOM_PERCENT / 100 -
-                            LINE_BOTTOM_SKIP_ROWS * LINE_ROW_STEP;
-    top = top < 0 ? 0 : top;
-    roi_bottom = roi_bottom >= (int)height ? (int)height - 1 : roi_bottom;
-    const int bottom = use_history ? near_bottom :
-                       roi_bottom - LINE_BOTTOM_SKIP_ROWS * LINE_ROW_STEP;
-    if (bottom <= top) {
-        return false;
-    }
-
-    int search_percent = LINE_SEARCH_HALF_PERCENT;
     if (s_state == LINE_STATE_CORNER) {
-        search_percent = LINE_CORNER_WINDOW_START_PERCENT +
-                         (int)s_corner_frames * LINE_CORNER_WINDOW_GROW_PERCENT;
-        if (search_percent > LINE_CORNER_WINDOW_MAX_PERCENT) {
-            search_percent = LINE_CORNER_WINDOW_MAX_PERCENT;
-        }
-    } else if (s_state == LINE_STATE_LOST) {
-        const int extra = (int)(s_lost_frames * LINE_LOST_WINDOW_GROW_PERCENT);
-        search_percent += extra;
-        if (search_percent > LINE_LOST_WINDOW_MAX_PERCENT) {
-            search_percent = LINE_LOST_WINDOW_MAX_PERCENT;
-        }
+        int percent = LINE_CORNER_WINDOW_START_PERCENT +
+                      (int)s_corner_frames * LINE_CORNER_WINDOW_GROW_PERCENT;
+        return percent > LINE_CORNER_WINDOW_MAX_PERCENT ?
+               LINE_CORNER_WINDOW_MAX_PERCENT : percent;
     }
-    int half_window = positive_percent((int)width, search_percent, LINE_SEARCH_HALF_MIN);
-    if (half_window > LINE_SEARCH_HALF_MAX) {
-        half_window = LINE_SEARCH_HALF_MAX;
+    if (s_state == LINE_STATE_LOST) {
+        const int percent = LINE_SEARCH_HALF_PERCENT +
+                            (int)(s_lost_frames * LINE_LOST_WINDOW_GROW_PERCENT);
+        return percent > LINE_LOST_WINDOW_MAX_PERCENT ?
+               LINE_LOST_WINDOW_MAX_PERCENT : percent;
     }
-
-    int expected = use_history ? seed_x : (int)width / 2;
-    expected = expected < 0 ? 0 : (expected >= (int)width ? (int)width - 1 : expected);
-    line_point_t points[LINE_SCAN_MAX_ROWS];
-    int point_count = 0;
-    int misses = 0;
-    int wide_near_rows = 0;
-    int y = bottom;
-
-    while (y >= top && point_count < LINE_SCAN_MAX_ROWS) {
-        line_segment_t segment = {0};
-        const int row_half = point_count == 0 && !use_history ? (int)width : half_window;
-        const bool found = scan_segment(frame, width, y,
-                                        point_count == 0 && !use_history ? -1 : expected,
-                                        row_half, threshold, &segment);
-        if (!found) {
-            /* Initial acquisition checks a few bottom rows, still using a
-             * full-width nearest-to-centre seed search on each row. */
-            if (point_count == 0 && !use_history && y > near_bottom) {
-                y -= LINE_ROW_STEP;
-                continue;
-            }
-            if (point_count > 0 && misses == 0) {
-                ++misses;
-                y -= LINE_ROW_STEP;
-                continue;
-            }
-            break;
-        }
-        misses = 0;
-
-        const int jump_limit = positive_percent((int)width,
-                                                LINE_MAX_CENTER_JUMP_PERCENT,
-                                                LINE_SEARCH_HALF_MIN * 2);
-        if (point_count > 0 && abs(segment.center - expected) > jump_limit) {
-            break;
-        }
-        if (corridor_x >= 0 && abs(segment.center - corridor_x) > corridor_half) {
-            break;
-        }
-
-        points[point_count++] = (line_point_t){segment.center, y, segment.width};
-        expected = segment.center;
-        if (segment.wide && y >= near_top && y <= near_bottom) {
-            ++wide_near_rows;
-        }
-        y -= LINE_ROW_STEP;
-    }
-
-    observation->valid_rows = (uint8_t)(point_count > UINT8_MAX ? UINT8_MAX : point_count);
-    observation->finish_candidate = wide_near_rows >= LINE_FINISH_MIN_ROWS;
-    if (point_count > 0) {
-        observation->seed_x = points[0].x;
-    }
-    if (point_count < LINE_MIN_VALID_ROWS) {
-        if (draw_overlay) {
-            render_tracking_overlay(frame, width, height, points, point_count, bottom);
-        }
-        return false;
-    }
-
-    const int near_count = point_count < 4 ? point_count : 4;
-    const int far_count = point_count < 4 ? point_count : 4;
-    const int near_center = average_points(points, 0, near_count);
-    const int far_center = average_points(points, point_count - far_count, far_count);
-    observation->candidate = true;
-    observation->old_line_visible = point_count >= LINE_MIN_VALID_ROWS + 1;
-    observation->seed_x = points[0].x;
-    observation->lateral_error = line_error(near_center, width);
-    /* Positive heading means the far path is to the right.  This keeps the
-     * requested -Kh*heading term aligned with the calibrated motor sign. */
-    observation->heading_error = line_error(near_center, width) -
-                                 line_error(far_center, width);
-    observation->confidence = (uint8_t)((point_count * 100) /
-                                        (LINE_MIN_VALID_ROWS + 6));
-    if (observation->confidence > 100) {
-        observation->confidence = 100;
-    }
-    observation->branch_direction = branch_hint(frame, width, threshold,
-                                                 points, point_count);
-    if (observation->finish_candidate &&
-        abs(observation->seed_x - (use_history ? seed_x : (int)width / 2)) > half_window) {
-        observation->finish_candidate = false;
-    }
-    if (draw_overlay) {
-        render_tracking_overlay(frame, width, height, points, point_count, bottom);
-    }
-    return true;
+    return LINE_SEARCH_HALF_PERCENT;
 }
 
 static bool observe_line(uint8_t *frame,
@@ -617,40 +300,50 @@ static bool observe_line(uint8_t *frame,
     if (observation == NULL) {
         return false;
     }
-    *observation = (line_observation_t){0};
+    const line_observation_t empty = {0};
+    *observation = empty;
     observation->threshold = source_threshold;
+    observation->corner_row_y = -1;
+    observation->scan_bottom_y = -1;
     if (source_threshold == 0) {
         return false;
     }
 
-    int seed = s_seed_x;
+    line_scan_cfg_t cfg = {0};
+    cfg.width = width;
+    cfg.height = height;
+    cfg.threshold = source_threshold;
+    cfg.use_history = s_seed_valid;
+    cfg.seed_x = s_seed_x;
+    cfg.search_half_percent = state_search_half_percent();
+    cfg.expected_width = s_line_width;
+    cfg.mirror_x = CAMERA_LINE_MIRROR_X ? true : false;
+    cfg.saturation_guard = LINE_SATURATION_GUARD ? true : false;
+    cfg.saturation_max = LINE_SATURATION_MAX;
+    cfg.corridor_x = remembered_corridor && s_pending_turn != 0 ?
+                     s_pending_seed_x : -1;
+    cfg.corridor_half = positive_percent((int)width, LINE_SEARCH_HALF_PERCENT,
+                                         LINE_SEARCH_HALF_MIN);
+
     if (s_state == LINE_STATE_CORNER && s_pending_turn != 0) {
         const int step = positive_percent((int)width,
                                           LINE_CORNER_PREDICT_STEP_PERCENT, 2);
         const int predicted = s_corner_origin_x +
                               s_pending_turn * step * (int)s_corner_frames;
         s_corner_predicted_x = clamp_range(predicted, 0, (int)width - 1);
-        seed = s_corner_predicted_x;
-    } else if (s_state == LINE_STATE_LOST && s_seed_valid) {
-        /* LOST 重捕获围绕最后可信种子逐步扩大。不要把 NORMAL 的
-         * heading_error 当成像素位移，否则斜线会把搜索点甩到旁边物体。 */
-        seed = s_seed_x;
+        cfg.seed_x = s_corner_predicted_x;
+        cfg.corridor_x = s_corner_predicted_x;
+        cfg.corridor_half = positive_percent((int)width,
+                                             LINE_CORNER_WINDOW_START_PERCENT,
+                                             LINE_SEARCH_HALF_MIN);
     }
 
-    int corridor_half = positive_percent((int)width,
-                                         LINE_SEARCH_HALF_PERCENT,
-                                         LINE_SEARCH_HALF_MIN);
-    int corridor_x = remembered_corridor && s_pending_turn != 0 ?
-                     s_pending_seed_x : -1;
-    if (s_state == LINE_STATE_CORNER && s_pending_turn != 0) {
-        corridor_half = positive_percent((int)width,
-                                         LINE_CORNER_WINDOW_START_PERCENT,
-                                         LINE_SEARCH_HALF_MIN);
-        corridor_x = s_corner_predicted_x;
+    const bool candidate = line_geometry_track(frame, &cfg, observation);
+    observation->threshold = source_threshold;
+    if (draw_overlay) {
+        render_tracking_overlay(frame, width, height, observation);
     }
-    return track_line(frame, width, height, source_threshold,
-                      s_seed_valid, seed, corridor_x,
-                      corridor_half, draw_overlay, observation);
+    return candidate;
 }
 
 static void set_motor_duty(const motor_t *motor, int output)
@@ -776,6 +469,7 @@ static void reset_tracking(void)
     clear_turn_plan();
     s_seed_valid = false;
     s_seed_x = 0;
+    s_line_width = 0;
     s_lost_frames = 0;
     s_reacquire_frames = 0;
     s_reacquire_x = 0;
@@ -842,12 +536,18 @@ static void update_seed(const line_observation_t *observation)
     }
     s_seed_x = observation->seed_x;
     s_seed_valid = true;
+    if (observation->near_width > 0) {
+        s_line_width = s_line_width == 0 ? observation->near_width :
+                       (s_line_width * LINE_WIDTH_FILTER_OLD +
+                        observation->near_width * LINE_WIDTH_FILTER_NEW) /
+                       (LINE_WIDTH_FILTER_OLD + LINE_WIDTH_FILTER_NEW);
+    }
 }
 
 static void update_turn_memory(const line_observation_t *observation)
 {
     if (observation == NULL || !observation->candidate ||
-        observation->branch_direction == 0 || s_pending_turn != 0 ||
+        observation->corner_direction == 0 || s_pending_turn != 0 ||
         s_state != LINE_STATE_NORMAL) {
         if (s_pending_turn == 0) {
             s_hint_direction = 0;
@@ -856,7 +556,7 @@ static void update_turn_memory(const line_observation_t *observation)
         return;
     }
 
-    const int direction = observation->branch_direction;
+    const int direction = observation->corner_direction;
     if (direction != s_hint_direction) {
         s_hint_direction = direction;
         s_hint_frames = 1;
@@ -915,14 +615,14 @@ static void maybe_log_summary(int64_t now)
     ESP_LOGI(TAG,
              "camera_fps=%u processed_fps=%u control_fps=%u frames_dropped=%u "
              "line_us_avg=%u line_us_max=%u state=%s armed=%d candidate=%d "
-             "arm_frames=%u threshold=%d seed_x=%d valid_rows=%u confidence=%u "
-             "lateral_error=%d heading_error=%d pending_turn=%d STBY=%d "
+             "arm_frames=%u threshold=%d seed_x=%d line_w=%d valid_rows=%u "
+             "confidence=%u lateral_error=%d heading_error=%d pending_turn=%d STBY=%d "
              "motor[A,B,D]=[%d,%d,%d]",
              (unsigned)camera_fps, (unsigned)processed_fps,
              (unsigned)s_control_frames, (unsigned)frames_dropped,
              (unsigned)line_us_avg, (unsigned)s_line_us_max, state_name(),
              s_armed, s_last_candidate, (unsigned)s_arm_frames,
-             s_last_threshold, s_last_seed_x,
+             s_last_threshold, s_last_seed_x, s_line_width,
              (unsigned)s_last_valid_rows, (unsigned)s_last_confidence,
              s_last_lateral_error, s_last_heading_error, s_pending_turn,
              s_stby_enabled,

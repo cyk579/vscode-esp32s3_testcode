@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2022 Espressif Systems (Shanghai) CO LTD
 # SPDX-License-Identifier: Unlicense OR CC0-1.0
 import argparse
+import os
 import socket
 import sys
 
@@ -24,10 +25,34 @@ parser.add_argument('--headless', action='store_true',
                     help='Do not open a window; useful for an automatic capture check')
 parser.add_argument('--frames', type=int, default=0,
                     help='Stop after this many valid frames (0 means keep running)')
+parser.add_argument('--save-dir', default=None,
+                    help='Save every received JPEG into this directory, plus a '
+                         'big-endian RGB565 .bin scaled the same way the '
+                         'firmware decodes it. Feed the .bin files to '
+                         'test/harness for offline line-follow regression.')
+parser.add_argument('--save-width', type=int, default=240,
+                    help='Width of the .bin dumps written by --save-dir')
+parser.add_argument('--save-height', type=int, default=160,
+                    help='Height of the .bin dumps written by --save-dir')
 args = parser.parse_args()
 
 if args.frames < 0:
     parser.error('--frames must be zero or greater')
+
+def dump_rgb565(image, path, out_w, out_h):
+    """Write the frame as big-endian RGB565, matching the firmware buffer."""
+    resized = cv2.resize(image, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    blue = resized[:, :, 0].astype(np.uint16)
+    green = resized[:, :, 1].astype(np.uint16)
+    red = resized[:, :, 2].astype(np.uint16)
+    packed = ((red >> 3) << 11) | ((green >> 2) << 5) | (blue >> 3)
+    big_endian = packed.astype('>u2')
+    with open(path, 'wb') as handle:
+        handle.write(big_endian.tobytes())
+
+
+if args.save_dir:
+    os.makedirs(args.save_dir, exist_ok=True)
 
 frame_count = 0
 stream = bytearray()
@@ -94,6 +119,13 @@ try:
                         print(f'First frame saved to {args.save}')
                     else:
                         print(f'Failed to save first frame to {args.save}')
+
+                if args.save_dir:
+                    stem = os.path.join(args.save_dir, f'frame_{frame_count:05d}')
+                    with open(stem + '.jpg', 'wb') as handle:
+                        handle.write(jpg)
+                    dump_rgb565(image, stem + '.bin', args.save_width,
+                                args.save_height)
 
                 frame_count += 1
                 if not args.headless:
