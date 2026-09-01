@@ -18,6 +18,7 @@ void camera_line_follow_stop(void);
 void camera_line_follow_frame_callback(const uint8_t *rgb565_big_endian,
                                        uint16_t width,
                                        uint16_t height,
+                                       uint8_t source_threshold,
                                        void *user_ctx);
 
 #ifdef __cplusplus

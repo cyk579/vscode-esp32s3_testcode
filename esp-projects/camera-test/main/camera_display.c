@@ -17,6 +17,17 @@
 #define CAMERA_DISPLAY_RGB565_BYTES \
     (TFT_ST7735_WIDTH * (TFT_ST7735_HEIGHT - 8) * 2)
 #define CAMERA_DISPLAY_JPEG_WORK_BYTES (16 * 1024)
+#define CAMERA_BINARY_ROI_TOP_PERCENT 30
+#define CAMERA_BINARY_ROI_BOTTOM_PERCENT 95
+#define CAMERA_BINARY_ROW_STEP 3
+#define CAMERA_BINARY_DARK_PERCENTILE 2
+#define CAMERA_BINARY_LIGHT_PERCENTILE 90
+#define CAMERA_BINARY_MIN_CONTRAST 32
+#define CAMERA_BINARY_BLACK_FRACTION_PERCENT 20
+#define CAMERA_BINARY_THRESHOLD_MIN 25
+#define CAMERA_BINARY_THRESHOLD_MAX 120
+/* Set a fixed grayscale threshold for track calibration; 0 keeps adaptive mode. */
+#define CAMERA_BINARY_FIXED_THRESHOLD 70
 
 typedef struct {
     uint8_t *jpeg_slots[CAMERA_DISPLAY_SLOT_COUNT];
@@ -31,12 +42,88 @@ typedef struct {
     void *frame_callback_ctx;
     uint16_t previous_width;
     uint16_t previous_height;
+    uint8_t binary_threshold;
     uint32_t frames_drawn;
     uint32_t frames_dropped;
 } camera_display_state_t;
 
 static const char *TAG = "camera_display";
 static camera_display_state_t s_display;
+
+static uint8_t rgb565_luma(const uint8_t *pixel)
+{
+    const uint16_t value = ((uint16_t)pixel[0] << 8) | pixel[1];
+    const uint8_t red = (uint8_t)(((value >> 11) & 0x1f) * 255U / 31U);
+    const uint8_t green = (uint8_t)(((value >> 5) & 0x3f) * 255U / 63U);
+    const uint8_t blue = (uint8_t)((value & 0x1f) * 255U / 31U);
+    return (uint8_t)((77U * red + 150U * green + 29U * blue) >> 8);
+}
+
+#if CAMERA_BINARY_FIXED_THRESHOLD == 0
+static uint8_t histogram_percentile(const uint16_t histogram[256],
+                                    uint32_t sample_count,
+                                    uint32_t percentile)
+{
+    const uint32_t target = (sample_count * percentile + 99U) / 100U;
+    uint32_t cumulative = 0;
+    for (uint32_t value = 0; value < 256U; ++value) {
+        cumulative += histogram[value];
+        if (cumulative >= target) {
+            return (uint8_t)value;
+        }
+    }
+    return 255;
+}
+#endif
+
+static uint8_t calculate_binary_threshold(const uint8_t *frame,
+                                          uint16_t width,
+                                          uint16_t height)
+{
+#if CAMERA_BINARY_FIXED_THRESHOLD > 0
+    (void)frame;
+    (void)width;
+    (void)height;
+    return CAMERA_BINARY_FIXED_THRESHOLD;
+#else
+    uint16_t histogram[256] = {0};
+    const int x_step = width >= 96 ? 2 : 1;
+    int top = (int)height * CAMERA_BINARY_ROI_TOP_PERCENT / 100;
+    int bottom = (int)height * CAMERA_BINARY_ROI_BOTTOM_PERCENT / 100;
+    if (bottom >= (int)height) {
+        bottom = (int)height - 1;
+    }
+
+    uint32_t sample_count = 0;
+    for (int y = top; y <= bottom; y += CAMERA_BINARY_ROW_STEP) {
+        for (int x = 0; x < (int)width; x += x_step) {
+            ++histogram[rgb565_luma(frame + (((size_t)y * width + (size_t)x) * 2))];
+            ++sample_count;
+        }
+    }
+    if (sample_count == 0) {
+        return 0;
+    }
+
+    const int dark = histogram_percentile(histogram, sample_count,
+                                          CAMERA_BINARY_DARK_PERCENTILE);
+    const int light = histogram_percentile(histogram, sample_count,
+                                           CAMERA_BINARY_LIGHT_PERCENTILE);
+    if (light - dark < CAMERA_BINARY_MIN_CONTRAST) {
+        return 0;
+    }
+
+    int threshold = dark +
+                    (light - dark) * CAMERA_BINARY_BLACK_FRACTION_PERCENT / 100;
+    if (threshold < CAMERA_BINARY_THRESHOLD_MIN) {
+        threshold = CAMERA_BINARY_THRESHOLD_MIN;
+    }
+    if (threshold > CAMERA_BINARY_THRESHOLD_MAX) {
+        threshold = CAMERA_BINARY_THRESHOLD_MAX;
+    }
+    return (uint8_t)threshold;
+#endif
+}
 
 static bool choose_scale(uint16_t source_width,
                          uint16_t source_height,
@@ -65,28 +152,27 @@ static bool choose_scale(uint16_t source_width,
 static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
 {
     static bool logged_format_diagnostic;
-    /* A number of MJPEG UVC devices prepend a private payload prefix even
-     * though they advertise the stream as MJPEG. Trim everything before the
-     * JPEG SOI marker and ignore trailing bytes after EOI. */
-    size_t soi = 0;
-    while (soi + 1 < jpeg_len && !(jpeg[soi] == 0xff && jpeg[soi + 1] == 0xd8)) {
-        ++soi;
-    }
-    if (soi + 1 >= jpeg_len) {
-        ESP_LOGW(TAG, "MJPEG frame has no JPEG SOI marker (len=%u)", (unsigned)jpeg_len);
-        return false;
-    }
-    if (soi > 0) {
-        jpeg += soi;
-        jpeg_len -= soi;
-    }
-
-    for (size_t i = 2; i + 1 < jpeg_len; ++i) {
-        if (jpeg[i] == 0xff && jpeg[i + 1] == 0xd9) {
-            jpeg_len = i + 2;
-            break;
+    /* Recover the newest complete JPEG when a malformed bulk UVC device
+     * concatenates an incomplete frame with the following frame. */
+    size_t candidate_soi = jpeg_len;
+    size_t selected_soi = jpeg_len;
+    size_t selected_end = 0;
+    for (size_t i = 0; i + 1 < jpeg_len; ++i) {
+        if (jpeg[i] == 0xff && jpeg[i + 1] == 0xd8) {
+            candidate_soi = i;
+        } else if (jpeg[i] == 0xff && jpeg[i + 1] == 0xd9 && candidate_soi < i) {
+            selected_soi = candidate_soi;
+            selected_end = i + 2;
+            candidate_soi = jpeg_len;
         }
     }
+    if (selected_soi == jpeg_len) {
+        ESP_LOGW(TAG, "MJPEG frame has no complete JPEG SOI/EOI pair (len=%u)",
+                 (unsigned)jpeg_len);
+        return false;
+    }
+    jpeg += selected_soi;
+    jpeg_len = selected_end - selected_soi;
 
     esp_jpeg_image_cfg_t info_config = {
         .indata = jpeg,
@@ -172,9 +258,20 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
         return false;
     }
 
+    const uint8_t source_threshold =
+        calculate_binary_threshold(s_display.rgb565, output.width, output.height);
+    for (size_t i = 0; i < output.output_len; i += 2) {
+        const uint8_t luma = rgb565_luma(s_display.rgb565 + i);
+        const uint16_t bw = source_threshold != 0 && luma <= source_threshold ?
+                            0x0000 : 0xffff;
+        s_display.rgb565[i] = (uint8_t)(bw >> 8);
+        s_display.rgb565[i + 1] = (uint8_t)bw;
+    }
+    s_display.binary_threshold = source_threshold;
+
     if (s_display.frame_callback != NULL) {
         s_display.frame_callback(s_display.rgb565, output.width, output.height,
-                                 s_display.frame_callback_ctx);
+                                 source_threshold, s_display.frame_callback_ctx);
     }
 
     if (!s_display.tft_ready) {
@@ -182,7 +279,7 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
     }
 
     if (output.width != s_display.previous_width || output.height != s_display.previous_height) {
-        tft_st7735_fill(0x0000);
+        tft_st7735_fill(0xffff);
         s_display.previous_width = output.width;
         s_display.previous_height = output.height;
     }
@@ -213,8 +310,10 @@ static void camera_display_task(void *arg)
 
         const int64_t now = esp_timer_get_time();
         if (now >= next_report_us) {
-            ESP_LOGI(TAG, "Decoded frames=%u, skipped=%u", (unsigned)s_display.frames_drawn,
-                     (unsigned)s_display.frames_dropped);
+            ESP_LOGI(TAG, "Decoded frames=%u, skipped=%u, binary threshold=%u",
+                     (unsigned)s_display.frames_drawn,
+                     (unsigned)s_display.frames_dropped,
+                     (unsigned)s_display.binary_threshold);
             next_report_us = now + 5000000;
         }
     }
@@ -292,7 +391,8 @@ esp_err_t camera_display_start(void)
     }
 
     s_display.started = true;
-    ESP_LOGI(TAG, "Camera decoder started; TFT preview=%s; JPEG frames larger than %u bytes are skipped",
+    ESP_LOGI(TAG, "Camera decoder started; fixed binary threshold=%u, TFT preview=%s; JPEG frames larger than %u bytes are skipped",
+             (unsigned)CAMERA_BINARY_FIXED_THRESHOLD,
              s_display.tft_ready ? "ready" : "disabled",
              CAMERA_DISPLAY_MAX_JPEG_BYTES);
     return ESP_OK;

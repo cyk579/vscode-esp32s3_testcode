@@ -40,35 +40,32 @@
 #define LINE_NEAR_TOP_PERCENT 70
 #define LINE_NEAR_BOTTOM_PERCENT 90
 #define LINE_LOWER_TOP_PERCENT 78
-#define LINE_ROW_STEP 4
+#define LINE_ROW_STEP 3
 #define LINE_BOTTOM_SKIP_ROWS 1
 #define LINE_STRAIGHT_SPAN_PERCENT 14
-#define LINE_MIN_CONTRAST 32
-#define LINE_BLACK_FRACTION_PERCENT 30
-#define LINE_BLACK_THRESHOLD_MIN 35
-#define LINE_BLACK_THRESHOLD_MAX 120
+#define LINE_BINARY_BLACK_MAX 0
 #define LINE_MIN_ROW_SAMPLES 3
-#define LINE_MIN_VALID_ROWS 2
+#define LINE_MIN_VALID_ROWS 3
 #define LINE_STRAIGHT_MIN_ROWS 3
-#define LINE_MIN_DARK_ROWS 2
+#define LINE_MIN_DARK_ROWS 3
 #define LINE_FINISH_ROW_COVERAGE_PERCENT 50
 #define LINE_FINISH_MIN_ROWS 3
 
 /* 弯道采用“先记忆、后触发”：所有判断都要求连续帧，单帧噪声不会转动车体。 */
 #define LINE_START_DELAY_MS 600U
 #define LINE_ARM_CONFIRM_FRAMES 3U
+#define LINE_MOTOR_START_RAMP_FRAMES 18U
+#define LINE_MOTOR_START_MIN_OUTPUT 12
 #define LINE_FAR_HINT_ERROR 18
 #define LINE_FAR_CONFIRM_FRAMES 3U
 #define LINE_STRAIGHT_CORRIDOR_PERCENT 8
-#define LINE_TURN_TRIGGER_ERROR 25
 #define LINE_TURN_TRIGGER_FRAMES 2U
-#define LINE_TURN_EXIT_ERROR 24
-#define LINE_TURN_EXIT_FRAMES 3U
-#define LINE_CORNER_WAIT_STOP_MS 800U
-#define LINE_TURN_TIMEOUT_MS 1600U
-#define LINE_LOST_HOLD_MS 180U
+#define LINE_TURN_EXIT_ERROR 35
+#define LINE_TURN_EXIT_FRAMES 2U
+#define LINE_TURN_TIMEOUT_MS 3000U
+#define LINE_LOST_HOLD_MS 300U
 #define LINE_LOST_STOP_MS 900U
-#define LINE_FRAME_TIMEOUT_MS 450U
+#define LINE_FRAME_TIMEOUT_MS 1200U
 #define LINE_FINISH_CONFIRM_FRAMES 5U
 
 #define LINE_FORWARD_FAST 30   /* 与红外直行速度一致。 */
@@ -138,6 +135,7 @@ static volatile bool s_started;
 static bool s_armed;
 static bool s_finished;
 static uint8_t s_arm_frames;
+static uint8_t s_motor_start_ramp_frames;
 static uint8_t s_finish_frames;
 static int64_t s_first_frame_us;
 static int64_t s_last_line_us;
@@ -155,7 +153,6 @@ static uint8_t s_trigger_frames;
 static uint8_t s_turn_exit_frames;
 static bool s_turning;
 static int s_turn_reference_error;
-static int64_t s_corner_wait_us;
 static int64_t s_turn_started_us;
 static int s_command_a;
 static int s_command_b;
@@ -255,6 +252,7 @@ static void measure_band(const uint8_t *frame,
 static bool observe_line(const uint8_t *frame,
                          uint16_t width,
                          uint16_t height,
+                         uint8_t source_threshold,
                          line_observation_t *observation)
 {
     if (frame == NULL || observation == NULL || width < 16 || height < 16) {
@@ -289,38 +287,10 @@ static bool observe_line(const uint8_t *frame,
         return false;
     }
 
-    const int x_step = width >= 96 ? 2 : 1;
-    const int y_step = LINE_ROW_STEP;
-
-    /* 整个 ROI 只计算一次灰度阈值，避免远近区域各自二值化后标准不一致。 */
-    int minimum = 255;
-    int maximum = 0;
-    int sample_total = 0;
-    for (int y = roi_top; y <= roi_bottom; y += y_step) {
-        for (int x = 0; x < (int)width; x += x_step) {
-            const uint8_t value = rgb565_luma(frame +
-                                              (((size_t)y * (size_t)width + (size_t)x) * 2));
-            if (value < minimum) {
-                minimum = value;
-            }
-            if (value > maximum) {
-                maximum = value;
-            }
-            ++sample_total;
-        }
-    }
-    if (sample_total == 0 || maximum - minimum < LINE_MIN_CONTRAST) {
+    if (source_threshold == 0) {
         return false;
     }
-
-    int threshold = minimum + (maximum - minimum) * LINE_BLACK_FRACTION_PERCENT / 100;
-    if (threshold < LINE_BLACK_THRESHOLD_MIN) {
-        threshold = LINE_BLACK_THRESHOLD_MIN;
-    }
-    if (threshold > LINE_BLACK_THRESHOLD_MAX) {
-        threshold = LINE_BLACK_THRESHOLD_MAX;
-    }
-    observation->threshold = threshold;
+    observation->threshold = source_threshold;
 
     /*
      * far 只负责记忆；lower 同时给直线 PID 和转弯触发；near 只判断线形与终点。
@@ -329,9 +299,9 @@ static bool observe_line(const uint8_t *frame,
     band_measurement_t far = {0};
     band_measurement_t near = {0};
     band_measurement_t lower = {0};
-    measure_band(frame, width, far_top, far_bottom, threshold, &far);
-    measure_band(frame, width, near_top, near_bottom, threshold, &near);
-    measure_band(frame, width, lower_top, near_bottom, threshold, &lower);
+    measure_band(frame, width, far_top, far_bottom, LINE_BINARY_BLACK_MAX, &far);
+    measure_band(frame, width, near_top, near_bottom, LINE_BINARY_BLACK_MAX, &near);
+    measure_band(frame, width, lower_top, near_bottom, LINE_BINARY_BLACK_MAX, &lower);
 
     observation->finish_candidate = near.wide_rows >= LINE_FINISH_MIN_ROWS &&
                                     near.center >= (int)width / 5 &&
@@ -376,7 +346,15 @@ static void motor_set(const motor_t *motor, int command)
 {
     /* command 是混控层的有符号 PWM；换向时先清零，避免 TB6612 硬切方向。 */
     const int index = (int)motor->channel;
-    int speed = clamp_int(command * motor->sign, MAX_OUTPUT);
+    int output_limit = MAX_OUTPUT;
+    if (s_motor_start_ramp_frames > 0) {
+        const uint8_t elapsed = LINE_MOTOR_START_RAMP_FRAMES -
+                                s_motor_start_ramp_frames;
+        output_limit = LINE_MOTOR_START_MIN_OUTPUT +
+                       ((MAX_OUTPUT - LINE_MOTOR_START_MIN_OUTPUT) * elapsed) /
+                       LINE_MOTOR_START_RAMP_FRAMES;
+    }
+    int speed = clamp_int(command * motor->sign, output_limit);
     const int direction = (speed > 0) - (speed < 0);
     const bool direction_changed = direction != s_last_direction[index];
 
@@ -403,8 +381,12 @@ static void motor_set(const motor_t *motor, int command)
     if (output < minimum) {
         output = minimum;
     }
-    if (s_kick_cycles[index] > 0 && output < START_KICK_OUTPUT) {
-        output = START_KICK_OUTPUT;
+    if (s_kick_cycles[index] > 0) {
+        const int kick_output = s_motor_start_ramp_frames > 0 ?
+                                 output_limit : START_KICK_OUTPUT;
+        if (output < kick_output) {
+            output = kick_output;
+        }
     }
     if (s_kick_cycles[index] > 0) {
         --s_kick_cycles[index];
@@ -437,6 +419,9 @@ static void drive(int forward, int turn)
     motor_set(&motor_a, s_command_a);
     motor_set(&motor_b, s_command_b);
     motor_set(&motor_d, s_command_d);
+    if (s_motor_start_ramp_frames > 0) {
+        --s_motor_start_ramp_frames;
+    }
 }
 
 static void reset_pid(void)
@@ -457,7 +442,6 @@ static void clear_turn_plan(void)
     s_turn_exit_frames = 0;
     s_turning = false;
     s_turn_reference_error = 0;
-    s_corner_wait_us = 0;
     s_turn_started_us = 0;
 }
 
@@ -566,7 +550,6 @@ static void update_turn_memory(const line_observation_t *observation)
         s_pending_turn = direction;
         s_turn_reference_error = observation->error;
         s_trigger_frames = 0;
-        s_corner_wait_us = 0;
         ESP_LOGI(TAG, "Remembered upcoming %s turn; near line remains in control",
                  direction < 0 ? "left" : "right");
     }
@@ -622,19 +605,12 @@ static bool measure_remembered_straight(const uint8_t *frame,
     return true;
 }
 
-/* 下方黑重心必须明显偏向已记住的一侧，反向黑块和居中噪声都不能触发。 */
-static bool lower_turn_matches(const line_observation_t *observation)
-{
-    return observation->lower_valid &&
-           abs(observation->lower_error) >= LINE_TURN_TRIGGER_ERROR &&
-           error_direction(observation->lower_error) == s_pending_turn;
-}
-
 static void disarm_tracking(void)
 {
     stop_motors();
     s_armed = false;
     s_arm_frames = 0;
+    s_motor_start_ramp_frames = 0;
     s_first_frame_us = 0;
     s_last_line_us = 0;
     reset_tracking();
@@ -720,6 +696,7 @@ esp_err_t camera_line_follow_start(void)
     s_armed = false;
     s_finished = false;
     s_arm_frames = 0;
+    s_motor_start_ramp_frames = 0;
     s_finish_frames = 0;
     s_first_frame_us = 0;
     s_last_line_us = 0;
@@ -768,7 +745,8 @@ void camera_line_follow_stop(void)
 
 static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
                                              uint16_t width,
-                                             uint16_t height)
+                                             uint16_t height,
+                                             uint8_t source_threshold)
 {
     if (!s_started || s_finished) {
         if (s_started) {
@@ -783,7 +761,8 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
     }
 
     line_observation_t observation = {0};
-    const bool line_seen = observe_line(rgb565_big_endian, width, height, &observation);
+    const bool line_seen = observe_line(rgb565_big_endian, width, height,
+                                        source_threshold, &observation);
     s_last_threshold = observation.threshold;
 
     if (line_seen) {
@@ -801,8 +780,10 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
                 s_armed = true;
                 reset_tracking();
                 s_last_error = observation.error;
+                s_motor_start_ramp_frames = LINE_MOTOR_START_RAMP_FRAMES;
                 gpio_set_level(STBY_GPIO, 1);
-                ESP_LOGI(TAG, "Line confirmed; camera steering enabled");
+                ESP_LOGI(TAG, "Line confirmed; camera steering enabled with %u-frame motor ramp",
+                         (unsigned)LINE_MOTOR_START_RAMP_FRAMES);
             }
         } else if (!line_seen) {
             s_arm_frames = 0;
@@ -838,8 +819,7 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
      * 新直线回到近端中央并稳定 3 帧后退出，随后重新交给小幅 PID。
      */
     if (s_turning) {
-        if (observation.valid && observation.straight_visible &&
-            abs(observation.error) <= LINE_TURN_EXIT_ERROR) {
+        if (observation.valid && abs(observation.error) <= LINE_TURN_EXIT_ERROR) {
             if (s_turn_exit_frames < LINE_TURN_EXIT_FRAMES) {
                 ++s_turn_exit_frames;
             }
@@ -876,9 +856,8 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
     if (s_pending_turn != 0) {
         int straight_error = 0;
         if (measure_remembered_straight(rgb565_big_endian, width, height,
-                                        observation.threshold, &straight_error)) {
+                                        LINE_BINARY_BLACK_MAX, &straight_error)) {
             s_trigger_frames = 0;
-            s_corner_wait_us = 0;
             const int turn = pid_steering(straight_error);
             drive(forward_speed(s_tracking_error), turn);
             log_state("STRAIGHT-MEM", &observation);
@@ -886,15 +865,8 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
         }
 
         reset_pid();
-        if (s_corner_wait_us == 0) {
-            s_corner_wait_us = now;
-        }
-        if (lower_turn_matches(&observation)) {
-            if (s_trigger_frames < LINE_TURN_TRIGGER_FRAMES) {
-                ++s_trigger_frames;
-            }
-        } else {
-            s_trigger_frames = 0;
+        if (s_trigger_frames < LINE_TURN_TRIGGER_FRAMES) {
+            ++s_trigger_frames;
         }
 
         if (s_trigger_frames >= LINE_TURN_TRIGGER_FRAMES) {
@@ -903,13 +875,9 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
             s_turn_exit_frames = 0;
             drive(LINE_FORWARD_CRAWL, -s_pending_turn * LINE_TURN_MAX);
             log_state("TURN-START", &observation);
-        } else if (now - s_corner_wait_us <=
-                   (int64_t)LINE_CORNER_WAIT_STOP_MS * 1000) {
-            drive(LINE_FORWARD_CRAWL, 0);
-            log_state("CORNER-WAIT", &observation);
         } else {
-            zero_motor_outputs();
-            log_state("CORNER-WAIT-STOP", &observation);
+            drive(LINE_FORWARD_CRAWL, -s_pending_turn * LINE_TURN_MAX);
+            log_state("CORNER-TURN-ARM", &observation);
         }
         return;
     }
@@ -961,6 +929,7 @@ static void camera_line_follow_watchdog_task(void *arg)
 void camera_line_follow_frame_callback(const uint8_t *rgb565_big_endian,
                                        uint16_t width,
                                        uint16_t height,
+                                       uint8_t source_threshold,
                                        void *user_ctx)
 {
     (void)user_ctx;
@@ -972,7 +941,8 @@ void camera_line_follow_frame_callback(const uint8_t *rgb565_big_endian,
         return;
     }
     s_last_frame_us = esp_timer_get_time();
-    camera_line_follow_process_frame(rgb565_big_endian, width, height);
+    camera_line_follow_process_frame(rgb565_big_endian, width, height,
+                                     source_threshold);
     if (s_control_mutex != NULL) {
         (void)xSemaphoreGive(s_control_mutex);
     }

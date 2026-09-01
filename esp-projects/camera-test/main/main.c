@@ -115,7 +115,7 @@ typedef struct {
 } uvc_stream_profile_t;
 
 uvc_stream_profile_t uvc_stream_profiles[EXAMPLE_UVC_PROTOCOL_AUTO_COUNT] = {
-    {UVC_FRAME_FORMAT_MJPEG, 480, 320, 25, "480x320, fps 25"},
+    {UVC_FRAME_FORMAT_MJPEG, 480, 320, 15, "480x320, fps 15"},
     {UVC_FRAME_FORMAT_MJPEG, 480, 320,  0, "480x320, any fps"},
     {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, "320x240, fps 30"},
     {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, "640x480, fps 15"},
