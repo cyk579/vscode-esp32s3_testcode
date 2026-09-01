@@ -62,11 +62,19 @@ static bool pixel_is_dark(const uint8_t *pixel, const line_scan_cfg_t *cfg)
     return true;
 }
 
+/*
+ * 单行搜索：返回离 reference 最近的合理黑段，并按"相对近场线宽"给出形状分类。
+ *
+ * 关键点：被搜索窗口边界截断的黑段，其质心由窗口位置决定而不是由赛道决定。
+ * 直角弯的横条、终点 T 的横杆、大片阴影都会命中这种情况。调用方必须先看
+ * kind，NORMAL 之外的行不能当成赛道中心点使用。
+ */
 static bool scan_segment(const uint8_t *frame,
                          const line_scan_cfg_t *cfg,
                          int y,
                          int expected_x,
                          int half_window,
+                         int width_reference,
                          line_segment_t *segment)
 {
     const int width = (int)cfg->width;
@@ -74,7 +82,7 @@ static bool scan_segment(const uint8_t *frame,
         return false;
     }
 
-    const line_segment_t empty = {0, 0, 0, 0, false, false, false, LINE_ROW_NORMAL};
+    const line_segment_t empty = {0, 0, 0, 0, false, false, LINE_ROW_NORMAL};
     *segment = empty;
     const int roi_left = width * LINE_ROI_LEFT_PERCENT / 100;
     const int roi_right = (width * LINE_ROI_RIGHT_PERCENT / 100) - 1;
@@ -88,18 +96,13 @@ static bool scan_segment(const uint8_t *frame,
 
     const int reference = expected_x < 0 ? width / 2 : expected_x;
     const int min_width = LINE_MIN_SEGMENT_WIDTH;
+    /* 上界只用来挡掉"整条 ROI 都是黑的"这种帧：那既不是线也不是可用事件。 */
     const int max_width = line_geometry_positive_percent(width,
                                                          LINE_MAX_SEGMENT_WIDTH_PERCENT,
                                                          min_width + 2);
-    /* Finish width is relative to the local window, not the whole image. */
-    const int window_width = right - left + 1;
-    const int finish_width = line_geometry_positive_percent(window_width,
-                                                            LINE_FINISH_WIDTH_PERCENT,
-                                                            LINE_MIN_SEGMENT_WIDTH + 1);
     int best_distance = INT_MAX;
-    line_segment_t best = empty;
-    int best_wide_distance = INT_MAX;
-    line_segment_t best_wide = empty;
+    int best_start = 0;
+    int best_end = 0;
     bool in_run = false;
     int run_start = 0;
 
@@ -114,41 +117,40 @@ static bool scan_segment(const uint8_t *frame,
         if (!dark && in_run) {
             const int run_end = x - 1;
             const int run_width = run_end - run_start + 1;
-            const int run_center = (run_start + run_end) / 2;
-            const int distance = abs(run_center - reference);
-            if (run_width >= finish_width && distance < best_wide_distance) {
-                best_wide_distance = distance;
-                best_wide.center = run_center;
-                best_wide.width = run_width;
-                best_wide.ext_left = reference - run_start;
-                best_wide.ext_right = run_end - reference;
-                best_wide.clipped_left = run_start == left;
-                best_wide.clipped_right = run_end == right;
-                best_wide.wide = true;
-            }
+            const int distance = abs((run_start + run_end) / 2 - reference);
             if (run_width >= min_width && run_width <= max_width &&
                 distance < best_distance) {
                 best_distance = distance;
-                best.center = run_center;
-                best.width = run_width;
-                best.ext_left = reference - run_start;
-                best.ext_right = run_end - reference;
-                best.clipped_left = run_start == left;
-                best.clipped_right = run_end == right;
-                best.wide = run_width >= finish_width;
+                best_start = run_start;
+                best_end = run_end;
             }
             in_run = false;
         }
     }
 
     if (best_distance == INT_MAX) {
-        /* A broad local finish bar is still a valid seed for confirmation. */
-        if (best_wide_distance == INT_MAX) {
-            return false;
-        }
-        best = best_wide;
+        return false;
     }
-    *segment = best;
+
+    const int w_ref = width_reference < min_width ? min_width : width_reference;
+    segment->center = (best_start + best_end) / 2;
+    segment->width = best_end - best_start + 1;
+    segment->ext_left = reference - best_start;
+    segment->ext_right = best_end - reference;
+    segment->clipped_left = best_start == left;
+    segment->clipped_right = best_end == right;
+    if (segment->width > LINE_WIDE_RATIO * w_ref) {
+        const int open = LINE_WIDE_OPEN_RATIO * w_ref;
+        const bool open_left = segment->ext_left >= open;
+        const bool open_right = segment->ext_right >= open;
+        if (open_left && open_right) {
+            segment->kind = LINE_ROW_WIDE_BOTH;
+        } else if (open_left) {
+            segment->kind = LINE_ROW_WIDE_LEFT;
+        } else if (open_right) {
+            segment->kind = LINE_ROW_WIDE_RIGHT;
+        }
+    }
     return true;
 }
 
@@ -162,57 +164,6 @@ static int average_points(const int16_t *xs, int first, int count)
         total += xs[first + i];
     }
     return total / count;
-}
-
-/* 旧的支路探测：只在中心线最顶端点两侧各扫 3 行。对本赛道来说，唯一真正
- * 的"支路"是终点 T 口；所有拐角都是单侧事件，不该走这条路径。 */
-static int branch_hint(const uint8_t *frame,
-                       const line_scan_cfg_t *cfg,
-                       const int16_t *xs,
-                       const int16_t *ys,
-                       int point_count)
-{
-    if (point_count < LINE_MIN_VALID_ROWS) {
-        return 0;
-    }
-
-    const int end_x = xs[point_count - 1];
-    const int end_y = ys[point_count - 1];
-    const int offset = line_geometry_positive_percent((int)cfg->width,
-                                                      LINE_BRANCH_OFFSET_PERCENT,
-                                                      LINE_SEARCH_HALF_MIN * 2);
-    const int half = line_geometry_positive_percent((int)cfg->width,
-                                                    LINE_BRANCH_WINDOW_PERCENT,
-                                                    LINE_SEARCH_HALF_MIN);
-    const int min_offset = offset * LINE_BRANCH_MIN_OFFSET_PERCENT /
-                           LINE_BRANCH_OFFSET_PERCENT;
-    int found_direction = 0;
-    for (int direction = -1; direction <= 1; direction += 2) {
-        int hits = 0;
-        for (int i = 0; i < LINE_BRANCH_ROWS; ++i) {
-            int y = end_y + (i - 1) * LINE_ROW_STEP;
-            if (y < 0) {
-                y = 0;
-            }
-            if (y >= (int)cfg->height) {
-                y = (int)cfg->height - 1;
-            }
-            line_segment_t branch;
-            if (scan_segment(frame, cfg, y, end_x + direction * offset, half,
-                             &branch) &&
-                abs(branch.center - end_x) >= min_offset) {
-                ++hits;
-            }
-        }
-        if (hits >= 2) {
-            if (found_direction != 0 && found_direction != direction) {
-                return 0;
-            }
-            found_direction = direction;
-        }
-    }
-
-    return found_direction;
 }
 
 bool line_geometry_track(const uint8_t *frame,
@@ -235,13 +186,13 @@ bool line_geometry_track(const uint8_t *frame,
 
     int top = height * LINE_ROI_TOP_PERCENT / 100;
     int roi_bottom = height * LINE_ROI_BOTTOM_PERCENT / 100;
-    const int near_bottom = height * LINE_NEAR_BOTTOM_PERCENT / 100 -
-                            LINE_BOTTOM_SKIP_ROWS * LINE_ROW_STEP;
     const int near_top = height * LINE_NEAR_TOP_PERCENT / 100;
     top = top < 0 ? 0 : top;
     roi_bottom = roi_bottom >= height ? height - 1 : roi_bottom;
-    const int bottom = cfg->use_history ? near_bottom :
-                       roi_bottom - LINE_BOTTOM_SKIP_ROWS * LINE_ROW_STEP;
+    /* 首次获取和历史跟踪用同一个扫描底行。原来跟踪时从 92% 起扫，等于把
+     * 离车最近的整整 10% 画面丢掉，"近点"其实一点也不近。 */
+    const int bottom = roi_bottom - LINE_BOTTOM_SKIP_ROWS * LINE_ROW_STEP;
+    const int seed_floor = bottom - LINE_SEED_MISS_ROWS * LINE_ROW_STEP;
     if (bottom <= top) {
         return false;
     }
@@ -253,32 +204,33 @@ bool line_geometry_track(const uint8_t *frame,
     if (half_window > LINE_SEARCH_HALF_MAX) {
         half_window = LINE_SEARCH_HALF_MAX;
     }
-
-    int expected = cfg->use_history ? cfg->seed_x : width / 2;
-    expected = expected < 0 ? 0 : (expected >= width ? width - 1 : expected);
-    int point_count = 0;
-    int misses = 0;
-    int wide_near_rows = 0;
-    int y = bottom;
-
     const int jump_limit = line_geometry_positive_percent(width,
                                                          LINE_MAX_CENTER_JUMP_PERCENT,
                                                          LINE_SEARCH_HALF_MIN * 2);
+
+    int expected = cfg->use_history ? cfg->seed_x : width / 2;
+    expected = expected < 0 ? 0 : (expected >= width ? width - 1 : expected);
+    int w_ref = cfg->expected_width > 0 ? cfg->expected_width :
+                line_geometry_positive_percent(width, LINE_WIDTH_FALLBACK_PERCENT,
+                                               LINE_MIN_SEGMENT_WIDTH);
+    int slope = 0;
+    int point_count = 0;
+    int misses = 0;
+    int near_normal_rows = 0;
+    int y = bottom;
+
     while (y >= top && point_count < LINE_SCAN_MAX_ROWS) {
-        const bool seed_row = point_count == 0 && !cfg->use_history;
+        const bool seed_row = point_count == 0;
+        const bool blind_seed = seed_row && !cfg->use_history;
         line_segment_t segment;
-        const bool found = scan_segment(frame, cfg, y,
-                                        seed_row ? -1 : expected,
-                                        seed_row ? width : half_window,
-                                        &segment);
-        if (!found) {
-            /* Initial acquisition checks a few bottom rows, still using a
-             * full-width nearest-to-centre seed search on each row. */
-            if (seed_row && y > near_bottom) {
+        if (!scan_segment(frame, cfg, y, blind_seed ? -1 : expected,
+                          blind_seed ? width : half_window, w_ref, &segment)) {
+            /* 底部若干行都允许没找到，之后每个空隙只容忍一行。 */
+            if (seed_row && y > seed_floor) {
                 y -= LINE_ROW_STEP;
                 continue;
             }
-            if (point_count > 0 && misses == 0) {
+            if (!seed_row && misses == 0) {
                 ++misses;
                 y -= LINE_ROW_STEP;
                 continue;
@@ -287,7 +239,22 @@ bool line_geometry_track(const uint8_t *frame,
         }
         misses = 0;
 
-        if (point_count > 0 && abs(segment.center - expected) > jump_limit) {
+        if (segment.kind != LINE_ROW_NORMAL) {
+            /* 形状事件：质心不可用，记下方向和所在行就结束向上跟踪。
+             * 双侧敞开 = 终点 T / 十字；单侧敞开 = 直角或锐角弯。 */
+            observation->corner_row_y = y;
+            if (segment.kind == LINE_ROW_WIDE_BOTH) {
+                observation->finish_candidate = point_count >= LINE_FINISH_STEM_ROWS &&
+                                                y >= near_top;
+            } else {
+                observation->corner_direction =
+                    segment.kind == LINE_ROW_WIDE_LEFT ? -1 : 1;
+            }
+            break;
+        }
+
+        const int predicted = point_count >= 2 ? expected + slope : expected;
+        if (!seed_row && abs(segment.center - predicted) > jump_limit) {
             break;
         }
         if (cfg->corridor_x >= 0 &&
@@ -295,22 +262,29 @@ bool line_geometry_track(const uint8_t *frame,
             break;
         }
 
-        if (point_count == 0) {
+        if (seed_row) {
             observation->near_width = segment.width;
+            w_ref = (w_ref + segment.width) / 2;
+            if (w_ref < LINE_MIN_SEGMENT_WIDTH) {
+                w_ref = LINE_MIN_SEGMENT_WIDTH;
+            }
+        } else {
+            slope = clamp_int(segment.center - expected, jump_limit);
         }
         observation->point_x[point_count] = (int16_t)segment.center;
         observation->point_y[point_count] = (int16_t)y;
         ++point_count;
         expected = segment.center;
-        if (segment.wide && y >= near_top && y <= near_bottom) {
-            ++wide_near_rows;
+        if (y >= near_top) {
+            ++near_normal_rows;
         }
         y -= LINE_ROW_STEP;
     }
 
     observation->point_count = point_count;
     observation->valid_rows = (uint8_t)(point_count > 255 ? 255 : point_count);
-    observation->finish_candidate = wide_near_rows >= LINE_FINISH_MIN_ROWS;
+    observation->near_normal_rows = (uint8_t)(near_normal_rows > 255 ? 255 :
+                                              near_normal_rows);
     if (point_count > 0) {
         observation->seed_x = observation->point_x[0];
     }
@@ -318,30 +292,37 @@ bool line_geometry_track(const uint8_t *frame,
         return false;
     }
 
-    const int near_count = point_count < 4 ? point_count : 4;
-    const int far_count = near_count;
+    const int near_count = point_count < LINE_NEAR_ROWS ? point_count : LINE_NEAR_ROWS;
     const int near_center = average_points(observation->point_x, 0, near_count);
-    const int far_center = average_points(observation->point_x,
-                                         point_count - far_count, far_count);
+    const int near_error = line_geometry_error(near_center, width, cfg->mirror_x);
+    /* heading 取固定行号并按实际基线归一化：同一个物理姿态必须给出同一个
+     * 数值。原来 far 取 points[] 末端，基线随跟踪长度变化，前馈增益会漂移，
+     * point_count==4 时甚至恒等于 0。 */
+    int heading_index = point_count - 1;
+    if (heading_index > LINE_HEADING_ROWS) {
+        heading_index = LINE_HEADING_ROWS;
+    }
+    int heading = 0;
+    if (heading_index > 0) {
+        const int local = line_geometry_error(observation->point_x[heading_index],
+                                              width, cfg->mirror_x);
+        heading = (near_error - local) * LINE_HEADING_ROWS / heading_index;
+    }
+    int far_index = point_count - 1;
+    if (far_index > LINE_FAR_ROWS) {
+        far_index = LINE_FAR_ROWS;
+    }
+
     observation->candidate = true;
-    observation->old_line_visible = point_count >= LINE_MIN_VALID_ROWS + 1;
-    observation->lateral_error = line_geometry_error(near_center, width, cfg->mirror_x);
-    observation->heading_error = observation->lateral_error -
-                                 line_geometry_error(far_center, width, cfg->mirror_x);
+    observation->near_line_visible = near_normal_rows >= 2;
+    observation->lateral_error = near_error;
+    observation->heading_error = clamp_int(heading, 100);
+    observation->far_error = line_geometry_error(observation->point_x[far_index],
+                                                width, cfg->mirror_x);
     observation->confidence = (uint8_t)((point_count * 100) /
                                        (LINE_MIN_VALID_ROWS + 6));
     if (observation->confidence > 100) {
         observation->confidence = 100;
-    }
-    observation->corner_direction = branch_hint(frame, cfg, observation->point_x,
-                                                observation->point_y, point_count);
-    if (observation->corner_direction != 0) {
-        observation->corner_row_y = observation->point_y[point_count - 1];
-    }
-    if (observation->finish_candidate &&
-        abs(observation->seed_x - (cfg->use_history ? cfg->seed_x : width / 2)) >
-            half_window) {
-        observation->finish_candidate = false;
     }
     return true;
 }

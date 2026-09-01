@@ -43,6 +43,7 @@
 #define LINE_PENDING_MISS_CONFIRM_FRAMES 2U
 #define LINE_REACQUIRE_CONFIRM_FRAMES 2U
 #define LINE_CORNER_EXIT_CONFIRM_FRAMES 3U
+#define LINE_CORNER_MIN_SHIFT_PERCENT 8
 
 /* 彩色干扰守卫：赛道板上的深色红球亮度会落进黑线阈值区间，但通道差很大。
  * 真机采帧确认需要之后再开启，默认关闭以免引入未验证的过滤。 */
@@ -737,7 +738,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         if (new_line_candidate && s_pending_turn != 0) {
             const int displacement = observation.seed_x - s_corner_origin_x;
             const int minimum_shift = positive_percent((int)width,
-                                                       LINE_BRANCH_MIN_OFFSET_PERCENT,
+                                                       LINE_CORNER_MIN_SHIFT_PERCENT,
                                                        LINE_SEARCH_HALF_MIN);
             const int prediction_window = positive_percent((int)width,
                                                             LINE_CORNER_WINDOW_START_PERCENT,
@@ -779,7 +780,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     }
 
     if (s_pending_turn != 0) {
-        if (candidate && observation.old_line_visible) {
+        if (candidate && observation.near_line_visible) {
             s_state = LINE_STATE_NORMAL;
             s_pending_miss_frames = 0;
             s_lost_frames = 0;

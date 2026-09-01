@@ -28,16 +28,27 @@ extern "C" {
 #define LINE_SEARCH_HALF_PERCENT 20
 #define LINE_SEARCH_HALF_MIN 6
 #define LINE_SEARCH_HALF_MAX 80
-#define LINE_MAX_CENTER_JUMP_PERCENT 18
+/* 逐行搜索用上一行的斜率做预测，所以跳变门限可以比原来紧。 */
+#define LINE_MAX_CENTER_JUMP_PERCENT 12
 #define LINE_MIN_SEGMENT_WIDTH 3
 #define LINE_MAX_SEGMENT_WIDTH_PERCENT 55
-#define LINE_FINISH_WIDTH_PERCENT 62
-#define LINE_FINISH_MIN_ROWS 2
 #define LINE_MIN_VALID_ROWS 4
-#define LINE_BRANCH_ROWS 3
-#define LINE_BRANCH_OFFSET_PERCENT 14
-#define LINE_BRANCH_WINDOW_PERCENT 12
-#define LINE_BRANCH_MIN_OFFSET_PERCENT 8
+#define LINE_SEED_MISS_ROWS 3
+
+/* 近场取样窗口全部用固定行数，避免"基线随跟踪长度变化"导致前馈增益漂移。 */
+#define LINE_NEAR_ROWS 3
+#define LINE_HEADING_ROWS 10
+#define LINE_FAR_ROWS 14
+
+/* 线段形状分类的相对门限，全部以近场线宽 w 为基准：
+ *   宽黑区   run_width  > LINE_WIDE_RATIO * w
+ *   某侧敞开 ext_side  >= LINE_WIDE_OPEN_RATIO * w
+ * 实测胶带约 1.5 cm、终点横杆 10 cm，两侧各外伸约 3.3w，落在 2w 门限之上；
+ * 直角弯的横条只有一侧敞开。两个门限之间有 4 倍余量，所以 w 估偏也不翻判。 */
+#define LINE_WIDE_RATIO 3
+#define LINE_WIDE_OPEN_RATIO 2
+#define LINE_WIDTH_FALLBACK_PERCENT 4
+#define LINE_FINISH_STEM_ROWS 3
 
 /* 单行黑色线段的形状分类。WIDE_* 表示该行的黑区宽度远超正常线宽，
  * 其质心是搜索窗口的产物而不是赛道位置，不能用于转向。 */
@@ -55,7 +66,6 @@ typedef struct {
     int ext_right;       /* 向右的延伸量（px） */
     bool clipped_left;   /* 黑区触到搜索窗口/ROI 左边界 */
     bool clipped_right;
-    bool wide;           /* 旧的"局部窗口宽黑段"判据，仅供终点检测使用 */
     line_row_kind_t kind;
 } line_segment_t;
 
@@ -76,14 +86,16 @@ typedef struct {
 
 typedef struct {
     bool candidate;
-    bool old_line_visible;
+    bool near_line_visible;
     bool finish_candidate;
     int seed_x;
     int lateral_error;
     int heading_error;
     int corner_direction;    /* -1 左 / +1 右 / 0 无 */
     int corner_row_y;        /* 事件所在行，用于判断远近；-1 表示无 */
+    int far_error;           /* 远端取样点误差，只用于限速 */
     int near_width;          /* 最底行的黑段宽度（px） */
+    uint8_t near_normal_rows;/* 近场里形状正常的行数 */
     uint8_t valid_rows;
     uint8_t confidence;
     int threshold;

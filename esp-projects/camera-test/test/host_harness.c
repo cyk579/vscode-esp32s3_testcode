@@ -157,17 +157,21 @@ static void scenario_offset(int w)
     check(name, "no finish", !obs.finish_candidate, "phantom finish");
 }
 
-static void scenario_tilted(int w)
+/* heading 的绝对标度由 LINE_HEADING_ROWS 定义，控制器的 KH 必须跟它配套；
+ * 这里断言的是符号和单调性，以及陡斜线能给出可用的量级。 */
+static int scenario_tilted(int w, int dx)
 {
-    char name[32];
+    char name[40];
     line_observation_t obs;
-    snprintf(name, sizeof(name), "tilt-left/w=%d", w);
+    snprintf(name, sizeof(name), "tilt%d/w=%d", -dx, w);
     fill_frame(240, 240, 240);
-    draw_segment(LINE_X, FRAME_H - 1, LINE_X - 40, 36, w, 0, 0, 0);
+    draw_segment(LINE_X, FRAME_H - 1, LINE_X + dx, 36, w, 0, 0, 0);
     run_case(name, w, &obs, false);
     check(name, "candidate", obs.candidate, "no line found");
-    check(name, "eth<=-10", obs.heading_error <= -10, "far end left must give eth<0");
+    check(name, "eth<0", obs.heading_error < 0, "far end left must give eth<0");
     check(name, "no finish", !obs.finish_candidate, "phantom finish on a tilt");
+    check(name, "no corner", obs.corner_direction == 0, "a tilt is not a corner");
+    return obs.heading_error;
 }
 
 static void scenario_corner(int w, int direction)
@@ -269,7 +273,15 @@ int main(int argc, char **argv)
         printf("\n-- line width %d px --\n", w);
         scenario_straight(w);
         scenario_offset(w);
-        scenario_tilted(w);
+        {
+            const int steep = scenario_tilted(w, -40);
+            const int shallow = scenario_tilted(w, -20);
+            char name[24];
+            snprintf(name, sizeof(name), "tilt-scale/w=%d", w);
+            check(name, "steep<=-8", steep <= -8, "steep tilt heading too weak");
+            check(name, "steep<shallow", steep < shallow,
+                  "heading must grow with slope");
+        }
         scenario_corner(w, -1);
         scenario_corner(w, +1);
         scenario_finish_t(w);
