@@ -177,19 +177,23 @@ ESP32-S3 是 USB Full Speed Host，程序依次尝试 MJPEG `480×320@25 FPS`、
 
 ## 摄像头巡黑线
 
-`Enable camera black-line following` 默认开启。程序不是统计“左边黑像素多还是右边黑像素多”，而是按下面的顺序找黑线中心：
+`Enable camera black-line following` 默认开启。当前算法不是用整幅图比较“左边黑像素多还是右边多”，而是先用自适应灰度阈值二值化，再把画面固定分成三个小区域：
 
-1. 在 ROI 内用自适应灰度阈值二值化；
-2. 从控制区底部略过一行遮挡后向上扫描，第一段窄黑线作为近端锚点；
-3. 后续行必须与上一行中心连续，且只累计最近的 4 行；行间跳变或宽黑块立即停止累计；
-4. 近端中心误差才进入低精度定点 PID；终点宽黑条也要进入中近景控制区才确认，远处行不改变方向或停车。
+| 区域 | 默认位置 | 唯一用途 |
+| --- | ---: | --- |
+| 远端区 | 高度 `35%~60%` | 看见未来支路时，连续 3 帧记住左弯或右弯；不控制电机 |
+| 近端区 | 高度 `70%~87%` | 判断眼前线是否稳定、识别宽黑终点条 |
+| 下方区 | 高度 `78%~87%` | 计算当前线中心供 PID 使用；当前直线消失后再确认转弯时机 |
 
-这对应 [参考文章](https://blog.csdn.net/weixin_28285943/article/details/164210989) 中“底部向上扫描、底部少量行不信、拒绝相邻行突变”的做法，但去掉了浮点前馈和复杂赛道状态机，适合本工程的 ESP32-S3 与低分辨率 RGB565 帧。控制输出带积分限幅、死区和每帧斜率限幅，让后轮转向量平滑变化；中心死区内固定直行混控 `A=-22、B=0、D=22`，Motor B 保持 0。相机的 104° 广角镜头必须刚性朝下安装，车体中心线与镜头中心尽量重合，并让黑线进入画面下半部；不要让车头、轮胎或支架遮住控制区域。
+弯道只有一个很小的状态机：远端支路相对眼前线明显偏向一侧时先保存方向；只要下方仍能看到保存方向前的那条直线，就继续按这条直线做 PID，远端弯线不参与输出；原直线消失后 Motor B 保持 `0` 并低速前探；直到下方黑像素重心连续 2 帧明显偏向已保存的一侧，才以固定转向量进入弯道。转过弯后，新直线回到近端中央并稳定 3 帧，清除记忆并恢复直线 PID。
+
+这保留了[参考文章](https://blog.csdn.net/weixin_28285943/article/details/164210989)“控制优先看车前近处”的核心，但删掉了跨帧锚点、浮点前馈和盲目丢线旋转。实现只包含三个区域的整数黑像素重心和一个弯向记忆，适合低分辨率 RGB565 与单片机。直线 PID 最大只输出 8，每帧最多变化 2；中心死区内固定为 `A=-22、B=0、D=22`。相机应刚性朝下，车体中心线与镜头中心尽量重合，并让当前线落在画面下方区。
 
 启动和停车条件如下：
 
 - 复位后电机保持 `STBY=0`；第一帧到达后等待约 0.6 s，并连续确认 3 帧有效黑线才启动。
-- 普通偏差降低前进速度，急弯使用更大的旋转量；短暂丢线先低速保持，随后沿最后方向搜索，约 0.9 s 仍丢线则停车并重新等待确认。
+- 未记住弯向却丢线时只允许约 0.18 s 的低速直行，不再按旧误差原地搜索；约 0.9 s 仍无近端线就停车并重新确认。
+- 已记住弯向但触发条件尚未满足时先低速直行，0.8 s 后仍不满足则停车观察；真正转弯超过 1.6 s 仍未找到新直线则停车复位巡线状态。
 - 画面下方连续出现宽黑色终点条并确认 5 帧后停车。若赛道把宽线当作普通标记，可在源码中增大 `LINE_FINISH_CONFIRM_FRAMES` 或关闭该判断。
 
 所有需要实车调节的值在 `main/camera_line_follow.c` 文件顶部：
@@ -197,26 +201,25 @@ ESP32-S3 是 USB Full Speed Host，程序依次尝试 MJPEG `480×320@25 FPS`、
 | 参数 | 默认值 | 作用 |
 | --- | ---: | --- |
 | `CAMERA_LINE_MIRROR_X` | `0` | 画面左右相反时改为 `1` |
-| `LINE_ROI_TOP_PERCENT` / `LINE_ROI_BOTTOM_PERCENT` | `45` / `95` | 自适应阈值取样范围；终点最终仍受控制区限制 |
-| `LINE_CONTROL_TOP_PERCENT` / `LINE_CONTROL_BOTTOM_PERCENT` | `65` / `90` | 近端控制范围；仍提前响应远处弯道时调大 TOP，底部被车体挡住时调小 BOTTOM |
+| `LINE_ROI_TOP_PERCENT` / `LINE_ROI_BOTTOM_PERCENT` | `30` / `95` | 自适应灰度阈值的取样范围 |
+| `LINE_FAR_TOP_PERCENT` / `LINE_FAR_BOTTOM_PERCENT` | `35` / `60` | 只负责提前记忆弯向；调整它不会直接改变 PID |
+| `LINE_NEAR_TOP_PERCENT` / `LINE_NEAR_BOTTOM_PERCENT` | `70` / `90` | 近端线形和终点判断范围；底部会再跳过一条遮挡扫描线 |
+| `LINE_LOWER_TOP_PERCENT` | `78` | PID 与转弯触发的最近区域；仍转早时增大，转得太晚时略减小 |
 | `LINE_ROW_STEP` | `4` | 相邻扫描行的垂直间隔；数值越大越省算力，但过大会漏掉窄线 |
 | `LINE_BOTTOM_SKIP_ROWS` | `1` | 从控制区底部跳过的遮挡行数；底部有车体阴影时可改为 `2` |
-| `LINE_NEAR_BAND_ROWS` / `LINE_NEAR_ROWS` | `6` / `4` | 近端候选带宽和实际累计行数；远处干扰多时减小带宽，线抖时保持至少 3 行 |
-| `LINE_ANCHOR_SEARCH_ROWS` | `4` | 允许向上寻找近端锚点的最大行数；不要设得过大，否则会重新接纳远处支路 |
-| `LINE_MAX_CENTER_STEP_PERCENT` | `14` | 同一帧相邻行中心最大横移；误检跳变多时调小，急弯真实斜率过大时略调大 |
-| `LINE_MAX_ERROR_STEP` | `45` | 相邻帧误差最大变化（归一化百分比）；防止一帧突然跳到远处支路 |
 | `LINE_MIN_CONTRAST` | `32` | 低于此帧对比度时判定为无可靠线 |
 | `LINE_BLACK_THRESHOLD_MIN/MAX` | `35` / `120` | 自适应黑色阈值上下限，降低灰色阴影误检 |
-| `LINE_MIN_RUN_SAMPLES` / `LINE_MIN_VALID_ROWS` | `3` / `3` | 连续黑像素和有效扫描行的最小数量 |
-| `LINE_MAX_RUN_PERCENT` | `45` | 控制用黑段的最大宽度；宽横条不用于转向，只交给终点检测 |
+| `LINE_FAR_HINT_ERROR` / `LINE_FAR_CONFIRM_FRAMES` | `18` / `3` | 远端相对近端的最小偏移与记忆确认帧数 |
+| `LINE_STRAIGHT_CORRIDOR_PERCENT` | `8` | 保存弯向后只在原直线左右各 8% 画宽内找线和做 PID；区域外支路不能参与微调 |
+| `LINE_TURN_TRIGGER_ERROR` / `LINE_TURN_TRIGGER_FRAMES` | `25` / `2` | 原直线消失后，下方同向黑重心的转弯门槛与确认帧数 |
 | `LINE_FORWARD_FAST/MEDIUM/SLOW/CRAWL` | `22/14/9/7` | 摄像头巡线前进速度；比红外对应速度低 8 个 PWM 点（直线为 `30-8=22`） |
-| `LINE_TURN_MAX` | `15` | 丢线搜索和旋转的最大转向量 |
+| `LINE_TURN_MAX` / `LINE_PID_TURN_MAX` | `15` / `8` | 真正过弯的固定转向量 / 直线 PID 最大微调量 |
 | `LINE_ERROR_DEADBAND/MEDIUM/LARGE` | `18/35/60` | PID 死区和前进降速阈值；死区内 Motor B 保持 0 |
-| `LINE_PID_KP/KI/KD` | `15/1/3` | 定点 PID 增益；低精度场景以 P+D 为主，积分项很小 |
-| `LINE_PID_INTEGRAL_LIMIT` / `LINE_PID_SLEW_PER_FRAME` | `60` / `4` | 积分限幅和每帧输出变化上限 |
-| `LINE_ERROR_FILTER_OLD/NEW` | `2/1` | 整数低通权重，抑制摄像头帧间抖动 |
+| `LINE_PID_KP/KI/KD` | `12/1/4` | 直线定点 PID；减弱 P、保留极小 I、增加 D 抑制来回摆动 |
+| `LINE_PID_INTEGRAL_LIMIT` / `LINE_PID_SLEW_PER_FRAME` | `40` / `2` | 积分限幅和每帧输出变化上限 |
+| `LINE_ERROR_FILTER_OLD/NEW` | `3/1` | 整数低通权重，降低摄像头延迟与帧间噪声造成的振荡 |
 
-第一次地面测试建议按以下顺序：架空车轮确认 Motor A/D 直行方向；把车放在长直段，确认日志中的 `line=1`、`rows=4`、`err`、`filt` 和 `motor[A,B,D]`，直行时应看到 `B=0`；再逐步调整 `LINE_FORWARD_FAST`。如果黑线在屏幕右侧而车向左修正，先把 `CAMERA_LINE_MIRROR_X` 改为 `1`，不要先改电机方向。若仍提前响应远处弯道，先把 `LINE_CONTROL_TOP_PERCENT` 调大或把 `LINE_NEAR_BAND_ROWS` 调小；若近端黑线被车体挡住，把 `LINE_CONTROL_BOTTOM_PERCENT` 调小或把 `LINE_BOTTOM_SKIP_ROWS` 调大。若直线左右摆动，先降低 `LINE_FORWARD_FAST`，再检查 `LINE_ERROR_DEADBAND` 和 `LINE_PID_KP`，不要同时改多个参数。
+第一次地面测试建议先看日志状态：长直段应为 `LINE`，看见上方弯道后变为 `STRAIGHT-MEM`，但此时 `motor B` 仍应为 `0` 或很小的 PID 值；当前直线消失后先出现 `CORNER-WAIT`，下方黑线同向偏移连续两帧才进入 `TURN`。如果画面弯向与实车相反，只改 `CAMERA_LINE_MIRROR_X`；仍转早时只增大 `LINE_LOWER_TOP_PERCENT`，转晚时只减小它或略降 `LINE_TURN_TRIGGER_ERROR`。直线仍摆动时先降低 `LINE_FORWARD_FAST`，再小幅降低 `LINE_PID_KP`，每次只改一个参数。
 
 需要只测试摄像头而不让车动时，在 `idf.py menuconfig -> Example Configuration` 关闭 `Enable camera black-line following`，并把 TB6612 的 `STBY` 固定拉低。不要同时开启舵机测试：舵机配置会与整车接线/LEDC 资源冲突。
 
