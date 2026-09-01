@@ -123,6 +123,38 @@ bool tft_st7735_draw_rgb565(const uint8_t *rgb565_big_endian,
     return true;
 }
 
+bool tft_st7735_draw_rgb565_2x(const uint8_t *rgb565_big_endian,
+                              uint16_t source_width,
+                              uint16_t source_height)
+{
+    const uint16_t width = source_width / 2;
+    const uint16_t height = source_height / 2;
+    if (!s_initialized || rgb565_big_endian == NULL || width == 0 || height == 0 ||
+        width > TFT_ST7735_WIDTH || height > TFT_ST7735_HEIGHT) {
+        return false;
+    }
+
+    const uint16_t x0 = (TFT_ST7735_WIDTH - width) / 2;
+    const uint16_t y0 = (TFT_ST7735_HEIGHT - height) / 2;
+    if (set_window(x0, y0, x0 + width - 1, y0 + height - 1) != ESP_OK) {
+        return false;
+    }
+
+    uint8_t line[TFT_ST7735_WIDTH * 2];
+    for (uint16_t y = 0; y < height; ++y) {
+        const uint8_t *source = rgb565_big_endian +
+                                (size_t)(y * 2) * source_width * 2;
+        for (uint16_t x = 0; x < width; ++x) {
+            line[x * 2] = source[x * 4];
+            line[x * 2 + 1] = source[x * 4 + 1];
+        }
+        if (write_data(line, (size_t)width * 2) != ESP_OK) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool tft_st7735_init(void)
 {
     if (s_initialized) {

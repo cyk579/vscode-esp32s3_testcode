@@ -149,6 +149,7 @@ static const motor_t motor_d = {D_IN1, D_IN2, LEDC_CHANNEL_2, MOTOR_D_SIGN};
 static volatile bool s_started;
 static bool s_armed;
 static bool s_finished;
+static bool s_stby_enabled;
 static uint8_t s_arm_frames;
 static uint8_t s_motor_start_ramp_frames;
 static uint8_t s_finish_frames;
@@ -167,6 +168,8 @@ static int s_last_heading_error;
 static uint8_t s_last_valid_rows;
 static uint8_t s_last_confidence;
 static int s_last_threshold;
+static bool s_last_candidate;
+static int s_last_seed_x;
 
 static bool s_error_filter_initialized;
 static int s_tracking_error;
@@ -257,6 +260,66 @@ static int line_error(int center, uint16_t width)
     error = -error;
 #endif
     return error;
+}
+
+static void overlay_pixel(uint8_t *frame,
+                          uint16_t width,
+                          uint16_t height,
+                          int x,
+                          int y,
+                          uint16_t color)
+{
+    if (frame == NULL || x < 0 || y < 0 || x >= (int)width || y >= (int)height) {
+        return;
+    }
+    uint8_t *pixel = frame + (((size_t)y * width + (size_t)x) * 2);
+    pixel[0] = (uint8_t)(color >> 8);
+    pixel[1] = (uint8_t)color;
+}
+
+static void overlay_dot(uint8_t *frame,
+                        uint16_t width,
+                        uint16_t height,
+                        int x,
+                        int y,
+                        uint16_t color)
+{
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            overlay_pixel(frame, width, height, x + dx, y + dy, color);
+        }
+    }
+}
+
+static void overlay_cross(uint8_t *frame,
+                          uint16_t width,
+                          uint16_t height,
+                          int x,
+                          int y,
+                          uint16_t color)
+{
+    for (int offset = -5; offset <= 5; ++offset) {
+        overlay_pixel(frame, width, height, x + offset, y, color);
+        overlay_pixel(frame, width, height, x, y + offset, color);
+    }
+}
+
+static void render_tracking_overlay(uint8_t *frame,
+                                    uint16_t width,
+                                    uint16_t height,
+                                    const line_point_t *points,
+                                    int point_count,
+                                    int seed_y)
+{
+    /* Keep the debug overlay sparse so it is effectively free at 2.5 FPS. */
+    for (int i = 0; i < point_count; i += 2) {
+        overlay_dot(frame, width, height, points[i].x, points[i].y, 0x07e0);
+    }
+    if (point_count == 0) {
+        return;
+    }
+
+    overlay_cross(frame, width, height, points[0].x, seed_y, 0xf800);
 }
 
 static bool scan_segment(const uint8_t *frame,
@@ -362,8 +425,7 @@ static int branch_hint(const uint8_t *frame,
                        uint16_t width,
                        int threshold,
                        const line_point_t *points,
-                       int point_count,
-                       int heading_error)
+                       int point_count)
 {
     if (point_count < LINE_MIN_VALID_ROWS) {
         return 0;
@@ -398,18 +460,10 @@ static int branch_hint(const uint8_t *frame,
         }
     }
 
-    if (found_direction != 0) {
-        return found_direction;
-    }
-
-    /* 连续斜线没有清晰分叉时，仅把明显的中远场方向作为弱提示。 */
-    if (abs(heading_error) >= 38) {
-        return heading_error > 0 ? 1 : -1;
-    }
-    return 0;
+    return found_direction;
 }
 
-static bool track_line(const uint8_t *frame,
+static bool track_line(uint8_t *frame,
                        uint16_t width,
                        uint16_t height,
                        int threshold,
@@ -417,6 +471,7 @@ static bool track_line(const uint8_t *frame,
                        int seed_x,
                        int corridor_x,
                        int corridor_half,
+                       bool draw_overlay,
                        line_observation_t *observation)
 {
     if (frame == NULL || observation == NULL || width < 16 || height < 16 || threshold <= 0) {
@@ -424,15 +479,14 @@ static bool track_line(const uint8_t *frame,
     }
 
     int top = (int)height * LINE_ROI_TOP_PERCENT / 100;
-    int bottom = (int)height * LINE_ROI_BOTTOM_PERCENT / 100;
+    int roi_bottom = (int)height * LINE_ROI_BOTTOM_PERCENT / 100;
     const int near_top = (int)height * LINE_NEAR_TOP_PERCENT / 100;
     const int near_bottom = (int)height * LINE_NEAR_BOTTOM_PERCENT / 100 -
                             LINE_BOTTOM_SKIP_ROWS * LINE_ROW_STEP;
     top = top < 0 ? 0 : top;
-    bottom = bottom >= (int)height ? (int)height - 1 : bottom;
-    if (bottom > near_bottom) {
-        bottom = near_bottom;
-    }
+    roi_bottom = roi_bottom >= (int)height ? (int)height - 1 : roi_bottom;
+    const int bottom = use_history ? near_bottom :
+                       roi_bottom - LINE_BOTTOM_SKIP_ROWS * LINE_ROW_STEP;
     if (bottom <= top) {
         return false;
     }
@@ -471,6 +525,12 @@ static bool track_line(const uint8_t *frame,
                                         point_count == 0 && !use_history ? -1 : expected,
                                         row_half, threshold, &segment);
         if (!found) {
+            /* Initial acquisition checks a few bottom rows, still using a
+             * full-width nearest-to-centre seed search on each row. */
+            if (point_count == 0 && !use_history && y > near_bottom) {
+                y -= LINE_ROW_STEP;
+                continue;
+            }
             if (point_count > 0 && misses == 0) {
                 ++misses;
                 y -= LINE_ROW_STEP;
@@ -500,7 +560,13 @@ static bool track_line(const uint8_t *frame,
 
     observation->valid_rows = (uint8_t)(point_count > UINT8_MAX ? UINT8_MAX : point_count);
     observation->finish_candidate = wide_near_rows >= LINE_FINISH_MIN_ROWS;
+    if (point_count > 0) {
+        observation->seed_x = points[0].x;
+    }
     if (point_count < LINE_MIN_VALID_ROWS) {
+        if (draw_overlay) {
+            render_tracking_overlay(frame, width, height, points, point_count, bottom);
+        }
         return false;
     }
 
@@ -522,20 +588,23 @@ static bool track_line(const uint8_t *frame,
         observation->confidence = 100;
     }
     observation->branch_direction = branch_hint(frame, width, threshold,
-                                                 points, point_count,
-                                                 observation->heading_error);
+                                                 points, point_count);
     if (observation->finish_candidate &&
         abs(observation->seed_x - (use_history ? seed_x : (int)width / 2)) > half_window) {
         observation->finish_candidate = false;
     }
+    if (draw_overlay) {
+        render_tracking_overlay(frame, width, height, points, point_count, bottom);
+    }
     return true;
 }
 
-static bool observe_line(const uint8_t *frame,
+static bool observe_line(uint8_t *frame,
                          uint16_t width,
                          uint16_t height,
                          uint8_t source_threshold,
                          bool remembered_corridor,
+                         bool draw_overlay,
                          line_observation_t *observation)
 {
     if (observation == NULL) {
@@ -573,7 +642,7 @@ static bool observe_line(const uint8_t *frame,
     }
     return track_line(frame, width, height, source_threshold,
                       s_seed_valid, seed, corridor_x,
-                      corridor_half, observation);
+                      corridor_half, draw_overlay, observation);
 }
 
 static void set_motor_duty(const motor_t *motor, int output)
@@ -653,6 +722,7 @@ static void stop_motors(void)
 {
     zero_motor_outputs();
     gpio_set_level(STBY_GPIO, 0);
+    s_stby_enabled = false;
 }
 
 static void drive(int forward, int turn)
@@ -837,15 +907,18 @@ static void maybe_log_summary(int64_t now)
                                  s_line_us_sum / s_control_frames;
     ESP_LOGI(TAG,
              "camera_fps=%u processed_fps=%u control_fps=%u frames_dropped=%u "
-             "line_us_avg=%u line_us_max=%u state=%s threshold=%d seed_x=%d "
-             "valid_rows=%u confidence=%u lateral_error=%d heading_error=%d "
-             "pending_turn=%d motor[A,B,D]=[%d,%d,%d]",
+             "line_us_avg=%u line_us_max=%u state=%s armed=%d candidate=%d "
+             "arm_frames=%u threshold=%d seed_x=%d valid_rows=%u confidence=%u "
+             "lateral_error=%d heading_error=%d pending_turn=%d STBY=%d "
+             "motor[A,B,D]=[%d,%d,%d]",
              (unsigned)camera_fps, (unsigned)processed_fps,
              (unsigned)s_control_frames, (unsigned)frames_dropped,
              (unsigned)line_us_avg, (unsigned)s_line_us_max, state_name(),
-             s_last_threshold, s_seed_valid ? s_seed_x : -1,
+             s_armed, s_last_candidate, (unsigned)s_arm_frames,
+             s_last_threshold, s_last_seed_x,
              (unsigned)s_last_valid_rows, (unsigned)s_last_confidence,
              s_last_lateral_error, s_last_heading_error, s_pending_turn,
+             s_stby_enabled,
              s_command_a, s_command_b, s_command_d);
 
     s_summary_camera_frames = camera_frames;
@@ -870,10 +943,11 @@ static void disarm_tracking(void)
     s_state = LINE_STATE_LOST;
 }
 
-static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
+static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                                              uint16_t width,
                                              uint16_t height,
-                                             uint8_t source_threshold)
+                                             uint8_t source_threshold,
+                                             bool draw_overlay)
 {
     const int64_t line_start_us = esp_timer_get_time();
     const int64_t now = line_start_us;
@@ -898,8 +972,11 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
                                      s_state != LINE_STATE_CORNER;
     const bool candidate = observe_line(rgb565_big_endian, width, height,
                                         source_threshold, remembered_corridor,
+                                        draw_overlay,
                                         &observation);
     s_last_threshold = observation.threshold;
+    s_last_candidate = candidate;
+    s_last_seed_x = observation.valid_rows > 0 ? observation.seed_x : -1;
     s_last_valid_rows = observation.valid_rows;
     s_last_confidence = observation.confidence;
     if (candidate) {
@@ -920,6 +997,7 @@ static void camera_line_follow_process_frame(const uint8_t *rgb565_big_endian,
                 s_last_line_us = now;
                 s_motor_start_ramp_frames = LINE_MOTOR_START_RAMP_FRAMES;
                 gpio_set_level(STBY_GPIO, 1);
+                s_stby_enabled = true;
                 ESP_LOGI(TAG, "line confirmed; camera steering enabled");
             }
         } else if (!candidate) {
@@ -1195,6 +1273,7 @@ esp_err_t camera_line_follow_start(void)
     s_started = true;
     s_armed = false;
     s_finished = false;
+    s_stby_enabled = false;
     s_arm_frames = 0;
     s_motor_start_ramp_frames = 0;
     s_finish_frames = 0;
@@ -1207,6 +1286,8 @@ esp_err_t camera_line_follow_start(void)
     s_last_valid_rows = 0;
     s_last_confidence = 0;
     s_last_threshold = 0;
+    s_last_candidate = false;
+    s_last_seed_x = -1;
     s_last_direction[0] = 0;
     s_last_direction[1] = 0;
     s_last_direction[2] = 0;
@@ -1255,10 +1336,11 @@ void camera_line_follow_stop(void)
     }
 }
 
-void camera_line_follow_frame_callback(const uint8_t *rgb565_big_endian,
+void camera_line_follow_frame_callback(uint8_t *rgb565_big_endian,
                                        uint16_t width,
                                        uint16_t height,
                                        uint8_t source_threshold,
+                                       bool draw_overlay,
                                        void *user_ctx)
 {
     (void)user_ctx;
@@ -1272,7 +1354,7 @@ void camera_line_follow_frame_callback(const uint8_t *rgb565_big_endian,
     }
     s_last_frame_us = esp_timer_get_time();
     camera_line_follow_process_frame(rgb565_big_endian, width, height,
-                                     source_threshold);
+                                     source_threshold, draw_overlay);
     if (s_control_mutex != NULL) {
         (void)xSemaphoreGive(s_control_mutex);
     }

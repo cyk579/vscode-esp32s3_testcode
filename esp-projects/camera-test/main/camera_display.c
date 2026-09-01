@@ -5,6 +5,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -32,14 +33,9 @@
 #define CAMERA_BINARY_THRESHOLD_SLEW 8
 #define CAMERA_BINARY_THRESHOLD_FILTER_OLD 3
 #define CAMERA_BINARY_THRESHOLD_FILTER_NEW 1
-
-#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
-#define CAMERA_OUTPUT_MAX_WIDTH TFT_ST7735_WIDTH
-#define CAMERA_OUTPUT_MAX_HEIGHT (TFT_ST7735_HEIGHT - 8)
-#else
 #define CAMERA_OUTPUT_MAX_WIDTH CAMERA_DECODE_MAX_WIDTH
 #define CAMERA_OUTPUT_MAX_HEIGHT CAMERA_DECODE_MAX_HEIGHT
-#endif
+#define CAMERA_TFT_REFRESH_US 400000
 
 typedef struct {
     uint8_t *jpeg_slots[CAMERA_DISPLAY_SLOT_COUNT];
@@ -54,6 +50,7 @@ typedef struct {
     void *frame_callback_ctx;
     uint16_t previous_width;
     uint16_t previous_height;
+    int64_t last_preview_us;
     uint8_t binary_threshold;
     bool threshold_initialized;
     uint8_t threshold_filtered;
@@ -300,13 +297,22 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
     const uint8_t source_threshold = filter_binary_threshold(threshold_candidate);
     s_display.binary_threshold = source_threshold;
 
+    bool draw_preview = false;
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+    const int64_t now = esp_timer_get_time();
+    draw_preview = s_display.tft_ready &&
+                   (s_display.last_preview_us == 0 ||
+                    now - s_display.last_preview_us >= CAMERA_TFT_REFRESH_US);
+#endif
+
     if (s_display.frame_callback != NULL) {
         s_display.frame_callback(s_display.rgb565, output.width, output.height,
-                                 source_threshold, s_display.frame_callback_ctx);
+                                 source_threshold, draw_preview,
+                                 s_display.frame_callback_ctx);
     }
 
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
-    if (!s_display.tft_ready) {
+    if (!draw_preview) {
         return true;
     }
     if (output.width != s_display.previous_width || output.height != s_display.previous_height) {
@@ -314,10 +320,11 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
         s_display.previous_width = output.width;
         s_display.previous_height = output.height;
     }
-    if (!tft_st7735_draw_rgb565(s_display.rgb565, output.width, output.height)) {
+    if (!tft_st7735_draw_rgb565_2x(s_display.rgb565, output.width, output.height)) {
         ESP_LOGW(TAG, "TFT draw failed");
         return false;
     }
+    s_display.last_preview_us = now;
 #endif
     return true;
 }
@@ -373,6 +380,7 @@ esp_err_t camera_display_start(void)
     s_display.binary_threshold = 0;
     s_display.threshold_initialized = false;
     s_display.threshold_filtered = 0;
+    s_display.last_preview_us = 0;
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
     s_display.tft_ready = tft_st7735_init();
     if (!s_display.tft_ready) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -15,10 +16,11 @@ esp_err_t camera_line_follow_start(void);
 void camera_line_follow_stop(void);
 
 /* Called by the JPEG decoder task with one decoded RGB565 frame. */
-void camera_line_follow_frame_callback(const uint8_t *rgb565_big_endian,
+void camera_line_follow_frame_callback(uint8_t *rgb565_big_endian,
                                        uint16_t width,
                                        uint16_t height,
                                        uint8_t source_threshold,
+                                       bool draw_overlay,
                                        void *user_ctx);
 
 #ifdef __cplusplus

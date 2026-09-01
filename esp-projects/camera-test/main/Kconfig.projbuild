@@ -7,11 +7,11 @@ menu "Example Configuration"
 
     config EXAMPLE_ENABLE_TFT_PREVIEW
         bool "Enable TFT preview"
-        default n
+        default y
         help
-            Enables the ST7735 preview.  Leave this disabled for competition
-            mode so JPEG decoding and line-follow control are not slowed by SPI
-            display transfers.
+            Enables a throttled ST7735 debug preview at about 2.5 FPS. Camera
+            decoding and line-following remain at up to 320x240 and are not
+            resized to the TFT resolution.
 
     config EXAMPLE_ENABLE_CAMERA_LINE_FOLLOW
         bool "Enable camera black-line following"

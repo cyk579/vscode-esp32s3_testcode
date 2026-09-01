@@ -13,3 +13,8 @@ bool tft_st7735_fill(uint16_t color);
 bool tft_st7735_draw_rgb565(const uint8_t *rgb565_big_endian,
                              uint16_t width,
                              uint16_t height);
+
+/* Draw a source up to 320x240 by sampling every second row and column. */
+bool tft_st7735_draw_rgb565_2x(const uint8_t *rgb565_big_endian,
+                              uint16_t source_width,
+                              uint16_t source_height);

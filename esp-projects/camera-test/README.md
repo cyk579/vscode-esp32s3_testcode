@@ -7,8 +7,7 @@
 3. 默认从解码后的画面识别白底黑线，并驱动三轮 TB6612 小车巡线；
 4. 可选通过 Wi-Fi 回传到电脑，实时预览并保存第一张有效照片。
 
-默认比赛配置为：巡线开启、TFT preview 关闭、Wi-Fi streaming 关闭、舵机测试关闭。
-默认关闭 TFT 和 Wi-Fi，仅运行摄像头解码、赛道识别和电机控制；调试通过低频串口统计进行。
+当前实车调试配置为：巡线和 TFT preview 开启，Wi-Fi streaming 与舵机测试关闭。TFT 只以约 2.5 FPS 显示原始彩色画面和稀疏巡线标记。
 
 关闭 `Enable camera black-line following` 后，本工程仍可作为单纯的摄像头解码/枚举测试使用。
 
@@ -53,7 +52,7 @@ ESP32-S3 原生 USB OTG 的引脚固定如下：
 
 ### ST7735 显示屏
 
-本仓库已经按 `LQ_TFT18SPIV33`、常见 `ST7735`、`128x160` 分辨率适配。程序以横屏方式工作，摄像头的 `320x240` 帧会在解码时缩小为 `160x120`，保留画面比例并在上下各留 4 像素黑边。`Example Configuration -> Enable TFT preview` 默认关闭；关闭时不会初始化 ST7735，也不会执行 SPI 刷屏，解码和巡线仍正常运行。只有显式打开该选项才会显示画面。
+本仓库已经按 `LQ_TFT18SPIV33`、常见 `ST7735`、`128x160` 分辨率适配。程序以横屏方式工作。巡线始终使用最高 `320x240` 的解码画面；TFT 刷新时才逐行 2:1 抽样为 `160x120`，不分配第二张完整图像。`Example Configuration -> Enable TFT preview` 当前默认开启用于实车诊断。
 
 | ESP32-S3 | TFT | 说明 |
 | --- | --- | --- |
@@ -131,7 +130,7 @@ idf.py -p COM6 -b 115200 flash
 
 ## 查看图像：屏幕和电脑
 
-显式打开 `Enable TFT preview` 并接好屏幕后，摄像头一旦开始 `Streaming...`，屏幕会显示横向实时画面；不需要电脑连接 Wi-Fi。预览使用只保留最新帧的异步队列，但 SPI 刷屏仍会占用解码任务时间，因此比赛时应保持该选项关闭。关闭或未接 TFT 时，不会初始化屏幕，也不会为显示生成额外的整幅二值图，解码和巡线回调仍会运行。
+接好屏幕后，摄像头一旦开始 `Streaming...`，屏幕会以约 2.5 FPS 显示原始彩色画面；绿色稀疏点是实际中心点序列，红色十字是底部 seed。巡线回调仍按摄像头处理帧率运行，只有待刷新的帧才绘制 overlay 并逐行下采样到 TFT，不生成整幅二值图或第二张 framebuffer。
 
 建议按以下顺序做首次功能验证：
 
@@ -187,14 +186,14 @@ UVC MJPEG -> 最新帧覆盖队列 -> JPEG 解码 RGB565 -> 一次自适应阈�
            -> 局部巡线扫描 -> 整数 PD -> TB6612 电机控制
 ```
 
-解码后保留原始 RGB565，巡线只扫描底部种子和相邻搜索窗口，不生成整幅二值图，也不对全宽黑像素做主要重心定位。阈值从 ROI 直方图计算，并用整数帧间低通/变化限幅抑制光照抖动；每个被扫描像素只计算一次亮度并与阈值比较。TFT preview 若开启，显示处理放在巡线回调之后，不影响比赛默认链路。
+解码后保留原始 RGB565，巡线只扫描底部种子和相邻搜索窗口，不生成整幅二值图，也不对全宽黑像素做主要重心定位。阈值从 ROI 直方图计算，并用整数帧间低通/变化限幅抑制光照抖动；每个被扫描像素只计算一次亮度并与阈值比较。TFT 的低频 overlay 和 2:1 逐行下采样均发生在本帧巡线判断之后。
 
 赛道跟踪从画面底部开始：有历史时只在上一帧 `seed_x` 附近找线，无历史时选择靠近画面中心的合理黑线段。后续扫描行只在上一中心点固定窗口内寻找连续线段，并检查线宽和相邻中心点的最大横向跳变。这样侧面或远处的大片黑块不会抢走当前赛道。
 
 状态只保留 `NORMAL`、`CORNER`、`LOST`：
 
-- `NORMAL` 用近场中心计算 `lateral_error`，用中远场中心序列计算 `heading_error`，控制只使用整数 PD（P、heading 前馈和 D），并保留 turn/slew 限幅。
-- 在线末端附近发现连续新支路后，连续 2~3 帧确认并保存 `pending_turn`；旧直线仍可见时继续沿旧线控制，旧线消失后才进入 `CORNER`。`CORNER` 低速强转，直到底部连续 2~3 帧得到新的中心线后回到 `NORMAL`。斜弯、锐角和 90° 直角使用同一套逻辑。
+- `NORMAL` 用近场中心计算 `lateral_error`，用中远场中心序列计算 `heading_error`，控制只使用整数 PD（P、heading 前馈和 D），并保留 turn/slew 限幅。斜线始终是 `NORMAL`，`heading_error` 不会触发转弯状态。
+- 只有在线末端附近检测到明确新支路，连续 2~3 帧确认后才保存 `pending_turn`；旧直线仍可见时继续沿旧线控制，旧线消失后才进入 `CORNER`。`CORNER` 低速强转，直到底部连续 2~3 帧得到新的中心线后回到 `NORMAL`。
 - `LOST` 保存最后的种子和方向，从预测位置附近重新搜索，窗口随丢线帧数扩大；候选线必须连续确认，超时仍使用现有停车和重新布防保护，不会退回全图找最大黑块。
 
 宽黑终点线只在当前种子附近的近场区域确认，侧面或远处黑块不能触发停车。上电后 `STBY` 保持低电平，黑线连续确认后才使能电机；watchdog、方向换向保护和超时停车逻辑保持有效。
@@ -205,13 +204,14 @@ UVC MJPEG -> 最新帧覆盖队列 -> JPEG 解码 RGB565 -> 一次自适应阈�
 
 ```text
 camera_fps processed_fps control_fps frames_dropped
-line_us_avg line_us_max state threshold seed_x valid_rows confidence
-lateral_error heading_error pending_turn motor[A,B,D]
+line_us_avg line_us_max state armed candidate arm_frames threshold
+seed_x valid_rows confidence lateral_error heading_error pending_turn
+STBY motor[A,B,D]
 ```
 
 其中 `camera_fps` 是 UVC 输入帧率，`processed_fps` 是实际完成解码/巡线的帧率，`control_fps` 是电机控制刷新率；`line_us_avg/max` 用 `esp_timer_get_time()` 统计单帧巡线耗时。比赛时通过 UART 观察这些统计，不依赖 TFT 或 Wi-Fi。
 
-需要只测试摄像头而不让车动时，在 `idf.py menuconfig -> Example Configuration` 关闭 `Enable camera black-line following`，并把 TB6612 的 `STBY` 固定拉低。需要查看画面时再显式打开 `Enable TFT preview`；不要同时开启舵机测试，舵机配置会与整车接线/LEDC 资源冲突。
+需要只测试摄像头而不让车动时，在 `idf.py menuconfig -> Example Configuration` 关闭 `Enable camera black-line following`，并把 TB6612 的 `STBY` 固定拉低。调试完成后可关闭 `Enable TFT preview`；不要同时开启舵机测试，舵机配置会与整车接线/LEDC 资源冲突。
 
 ## 舵机测试动作
 
