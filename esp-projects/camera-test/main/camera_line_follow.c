@@ -112,8 +112,9 @@
  * 落在起转值以下会被混控丢掉，只剩后轮在推。
  * TODO(实测): LINE_CAM_PIVOT_PERCENT 用尺子量 a 和 L 后填 a*100/(2L)。 */
 #define LINE_PIVOT_TURN 26
-/* 实测 a=7~8 cm、L=9~10 cm -> a/(2L) 约 40%。 */
-#define LINE_CAM_PIVOT_PERCENT 40
+/* 低速调试时优先保证三轮都超过各自起转阈值；此前叠加 40% 横移后，
+ * 在 18% 总上限下 A/D 被缩放掉，锐角阶段实际只剩 B 轮。 */
+#define LINE_CAM_PIVOT_PERCENT 0
 #define LINE_ALERT_MS 900U
 
 /* 校准模式：置 1 后不跑视觉，直接按脚本输出电机命令并打日志。
