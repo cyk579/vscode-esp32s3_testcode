@@ -7,7 +7,7 @@
 3. 默认从解码后的画面识别白底黑线，并驱动三轮 TB6612 小车巡线；
 4. 可选通过 Wi-Fi 回传到电脑，实时预览并保存第一张有效照片。
 
-当前实车调试配置为：巡线和 TFT preview 开启，Wi-Fi streaming 与舵机测试关闭。TFT 只以约 2.5 FPS 显示原始彩色画面和稀疏巡线标记。
+当前默认配置为：巡线开启，TFT preview、Wi-Fi streaming 与舵机测试关闭。需要观察画面时可在 menuconfig 手动开启 TFT；开启后只以约 2.5 FPS 显示原始彩色画面和稀疏巡线标记。
 
 关闭 `Enable camera black-line following` 后，本工程仍可作为单纯的摄像头解码/枚举测试使用。
 
@@ -52,7 +52,7 @@ ESP32-S3 原生 USB OTG 的引脚固定如下：
 
 ### ST7735 显示屏
 
-本仓库已经按 `LQ_TFT18SPIV33`、常见 `ST7735`、`128x160` 分辨率适配。程序以横屏方式工作。控制链路将当前 `480x320` JPEG 缩放为约 `120x80`；TFT 预览独立解码为 `240x160`，再逐行 2:1 抽样到屏幕，不占用控制缓冲。`Example Configuration -> Enable TFT preview` 当前默认开启用于实车诊断。
+本仓库已经按 `LQ_TFT18SPIV33`、常见 `ST7735`、`128x160` 分辨率适配。程序以横屏方式工作。控制链路将当前 `480x320` JPEG 缩放为约 `120x80`；TFT 预览独立解码为 `240x160`，再逐行 2:1 抽样到屏幕，不占用控制缓冲。`Example Configuration -> Enable TFT preview` 默认关闭，开启后才会初始化屏幕。
 
 | ESP32-S3 | TFT | 说明 |
 | --- | --- | --- |
