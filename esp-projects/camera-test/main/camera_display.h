@@ -44,6 +44,11 @@ void camera_display_get_counters(uint32_t *camera_frames,
                                  uint32_t *processed_frames,
                                  uint32_t *dropped_frames);
 
+/* 最近一次解码、阈值计算和 TFT 传输耗时（微秒），用于低频诊断。 */
+void camera_display_get_timing(uint32_t *decode_us,
+                               uint32_t *threshold_us,
+                               uint32_t *tft_us);
+
 #ifdef __cplusplus
 }
 #endif

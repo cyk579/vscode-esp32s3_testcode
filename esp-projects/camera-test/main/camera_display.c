@@ -63,6 +63,9 @@ typedef struct {
     volatile uint32_t camera_frames;
     volatile uint32_t processed_frames;
     volatile uint32_t frames_dropped;
+    volatile uint32_t last_decode_us;
+    volatile uint32_t last_threshold_us;
+    volatile uint32_t last_tft_us;
 } camera_display_state_t;
 
 static const char *TAG = "camera_display";
@@ -193,6 +196,7 @@ static bool choose_scale(uint16_t source_width,
 static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
 {
     static bool logged_format_diagnostic;
+    const int64_t decode_start_us = esp_timer_get_time();
     /* Recover the newest complete JPEG when a malformed bulk UVC device
      * concatenates an incomplete frame with the following frame. */
     size_t candidate_soi = jpeg_len;
@@ -299,10 +303,14 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
                  (unsigned)output.width, (unsigned)output.height, (unsigned)output.output_len);
         return false;
     }
+    s_display.last_decode_us = (uint32_t)(esp_timer_get_time() - decode_start_us);
 
+    const int64_t threshold_start_us = esp_timer_get_time();
     const uint8_t threshold_candidate =
         calculate_binary_threshold(s_display.rgb565, output.width, output.height);
     const uint8_t source_threshold = filter_binary_threshold(threshold_candidate);
+    s_display.last_threshold_us =
+        (uint32_t)(esp_timer_get_time() - threshold_start_us);
     s_display.binary_threshold = source_threshold;
 
     bool draw_preview = false;
@@ -336,12 +344,14 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
                                            CAMERA_TFT_CROP_RIGHT_PERCENT / 100) - 1);
     const uint16_t crop_bottom = (uint16_t)((output.height *
                                             CAMERA_TFT_CROP_BOTTOM_PERCENT / 100) - 1);
+    const int64_t tft_start_us = esp_timer_get_time();
     if (!tft_st7735_draw_rgb565_2x_crop(s_display.rgb565, output.width,
                                         output.height, crop_left, crop_top,
                                         crop_right, crop_bottom, 0xffff)) {
         ESP_LOGW(TAG, "TFT draw failed");
         return false;
     }
+    s_display.last_tft_us = (uint32_t)(esp_timer_get_time() - tft_start_us);
     s_display.last_preview_us = now;
 #endif
     return true;
@@ -398,6 +408,9 @@ esp_err_t camera_display_start(void)
     s_display.binary_threshold = 0;
     s_display.threshold_initialized = false;
     s_display.threshold_filtered = 0;
+    s_display.last_decode_us = 0;
+    s_display.last_threshold_us = 0;
+    s_display.last_tft_us = 0;
     s_display.last_preview_us = 0;
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
     s_display.tft_ready = tft_st7735_init();
@@ -526,5 +539,20 @@ void camera_display_get_counters(uint32_t *camera_frames,
     }
     if (dropped_frames != NULL) {
         *dropped_frames = s_display.frames_dropped;
+    }
+}
+
+void camera_display_get_timing(uint32_t *decode_us,
+                               uint32_t *threshold_us,
+                               uint32_t *tft_us)
+{
+    if (decode_us != NULL) {
+        *decode_us = s_display.last_decode_us;
+    }
+    if (threshold_us != NULL) {
+        *threshold_us = s_display.last_threshold_us;
+    }
+    if (tft_us != NULL) {
+        *tft_us = s_display.last_tft_us;
     }
 }

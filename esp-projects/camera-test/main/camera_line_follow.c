@@ -195,6 +195,15 @@ static uint8_t s_last_confidence;
 static int s_last_threshold;
 static bool s_last_candidate;
 static int s_last_seed_x;
+static uint16_t s_last_frame_width;
+static uint16_t s_last_frame_height;
+static int s_last_scan_bottom_y;
+static int s_last_point_count;
+static int s_last_near_normal_rows;
+static int s_last_far_error;
+static int s_last_corner_direction;
+static int s_last_corner_row_y;
+static bool s_last_near_line_visible;
 
 static int s_lat_accum;
 static int s_yaw_accum;
@@ -205,6 +214,25 @@ static int s_lateral_control_error;
 static int s_heading_control_error;
 static int s_lateral_error_rate;
 static int s_heading_error_rate;
+static int s_last_lateral_raw;
+static int s_last_lateral_filtered;
+static int s_last_lateral_delta;
+static int s_last_heading_raw;
+static int s_last_heading_filtered;
+static int s_last_heading_delta;
+static int s_last_forward_target;
+static int s_last_forward_ramped;
+static int s_last_drive_forward;
+static int s_last_drive_turn;
+static int s_last_drive_lat;
+static int s_mix_pre_a;
+static int s_mix_pre_b;
+static int s_mix_pre_d;
+static int s_mix_post_a;
+static int s_mix_post_b;
+static int s_mix_post_d;
+static bool s_mix_scaled;
+static bool s_mix_dropped;
 
 static int s_turn_direction;
 static uint8_t s_turn_hint_frames;
@@ -497,11 +525,25 @@ static void drive(int forward, int turn, int lat)
         MOTOR_TRIM_A, MOTOR_TRIM_D,
     };
     line_mixer_out_t out = {0, 0, 0, false, false};
+    s_last_drive_forward = forward;
+    s_last_drive_turn = turn;
+    s_last_drive_lat = lat;
     forward = clamp_int(forward, forward_ramp_cap(esp_timer_get_time()));
+    s_last_forward_ramped = forward;
+    const int forward_a = forward * MOTOR_TRIM_A / 100;
+    const int forward_d = forward * MOTOR_TRIM_D / 100;
+    s_mix_pre_a = -forward_a - turn + lat;
+    s_mix_pre_b = turn + 2 * lat;
+    s_mix_pre_d = forward_d - turn + lat;
     line_mixer_solve(forward, turn, lat, &cfg, &out);
     s_command_a = out.a;
     s_command_b = out.b;
     s_command_d = out.d;
+    s_mix_post_a = out.a;
+    s_mix_post_b = out.b;
+    s_mix_post_d = out.d;
+    s_mix_scaled = out.scaled;
+    s_mix_dropped = out.dropped;
     motor_set(&motor_a, s_command_a);
     motor_set(&motor_b, s_command_b);
     motor_set(&motor_d, s_command_d);
@@ -573,6 +615,7 @@ static void drive_normal(const line_observation_t *observation, int64_t now)
     const line_control_cfg_t cfg = control_cfg();
     const bool alert = s_alert_until_us != 0 && now < s_alert_until_us;
     const int target = line_control_speed(&cfg, observation, alert);
+    s_last_forward_target = target;
     const int delta = target - s_forward_output;
     if (delta > LINE_FORWARD_SLEW) {
         s_forward_output += LINE_FORWARD_SLEW;
@@ -593,6 +636,12 @@ static void drive_normal(const line_observation_t *observation, int64_t now)
                               heading_error - previous_heading : 0;
     s_lateral_error_rate = (s_lateral_error_rate * 2 + lateral_delta) / 3;
     s_heading_error_rate = (s_heading_error_rate * 2 + heading_delta) / 3;
+    s_last_lateral_raw = observation->lateral_error;
+    s_last_lateral_filtered = lateral_error;
+    s_last_lateral_delta = s_lateral_error_rate;
+    s_last_heading_raw = observation->heading_error;
+    s_last_heading_filtered = heading_error;
+    s_last_heading_delta = s_heading_error_rate;
     s_error_filter_initialized = true;
     s_turn_output = line_control_yaw_pd(&cfg, heading_error,
                                         s_heading_error_rate,
@@ -665,20 +714,55 @@ static void maybe_log_summary(int64_t now)
                                      s_summary_callback_dropped_frames);
     const uint32_t line_us_avg = s_control_frames == 0 ? 0 :
                                  s_line_us_sum / s_control_frames;
+    uint32_t decode_us = 0;
+    uint32_t threshold_us = 0;
+    uint32_t tft_us = 0;
+    camera_display_get_timing(&decode_us, &threshold_us, &tft_us);
+    const int64_t line_age_ms = s_last_line_us == 0 ? -1 :
+                                (now - s_last_line_us) / 1000;
     ESP_LOGI(TAG,
-             "camera_fps=%u processed_fps=%u control_fps=%u frames_dropped=%u "
-             "line_us_avg=%u line_us_max=%u state=%s armed=%d candidate=%d "
-             "arm_frames=%u threshold=%d seed_x=%d line_w=%d valid_rows=%u "
-             "confidence=%u lateral_error=%d heading_error=%d pending_turn=%d STBY=%d "
-             "motor[A,B,D]=[%d,%d,%d]",
+             "fps camera=%u processed=%u control=%u drop=%u callback_drop=%u "
+             "frame=%ux%u timing_us[decode,threshold,tft]=[%u,%u,%u] "
+             "line_us[avg,max]=[%u,%u]",
              (unsigned)camera_fps, (unsigned)processed_fps,
              (unsigned)s_control_frames, (unsigned)frames_dropped,
-             (unsigned)line_us_avg, (unsigned)s_line_us_max, state_name(),
-             s_armed, s_last_candidate, (unsigned)s_arm_frames,
-             s_last_threshold, s_last_seed_x, s_line_width,
-             (unsigned)s_last_valid_rows, (unsigned)s_last_confidence,
-             s_last_lateral_error, s_last_heading_error, s_turn_direction,
-             s_stby_enabled,
+             (unsigned)(s_callback_dropped_frames -
+                        s_summary_callback_dropped_frames),
+             (unsigned)s_last_frame_width, (unsigned)s_last_frame_height,
+             (unsigned)decode_us, (unsigned)threshold_us, (unsigned)tft_us,
+             (unsigned)line_us_avg, (unsigned)s_line_us_max);
+    ESP_LOGI(TAG,
+             "vision state=%s armed=%d STBY=%d candidate=%d arm=%u lost=%u "
+             "reacq=%u/%u seed_valid=%d threshold=%d seed_x=%d line_w=%d "
+             "scan_bottom=%d points=%d valid_rows=%u near_rows=%d confidence=%u "
+             "near_line=%d far_error=%d corner=%d@%d line_age_ms=%lld",
+             state_name(), s_armed, s_stby_enabled, s_last_candidate,
+             (unsigned)s_arm_frames, (unsigned)s_lost_frames,
+             (unsigned)s_reacquire_frames, (unsigned)LINE_REACQUIRE_CONFIRM_FRAMES,
+             s_seed_valid, s_last_threshold, s_last_seed_x, s_line_width,
+             s_last_scan_bottom_y, s_last_point_count,
+             (unsigned)s_last_valid_rows, s_last_near_normal_rows,
+             (unsigned)s_last_confidence, s_last_near_line_visible,
+             s_last_far_error, s_last_corner_direction, s_last_corner_row_y,
+             (long long)line_age_ms);
+    ESP_LOGI(TAG,
+             "control forward[target,ramped]=[%d,%d] drive[in f,t,l]=[%d,%d,%d] "
+             "lat[raw,filtered,delta,cmd]=[%d,%d,%d,%d] "
+             "head[raw,filtered,delta,cmd]=[%d,%d,%d,%d] "
+             "mix_pre[A,B,D]=[%d,%d,%d] mix_post[A,B,D]=[%d,%d,%d] "
+             "scaled=%d dropped=%d kick[A,B,D]=[%u,%u,%u] "
+             "dir[A,B,D]=[%d,%d,%d] motor[A,B,D]=[%d,%d,%d]",
+             s_last_forward_target, s_last_forward_ramped,
+             s_last_drive_forward, s_last_drive_turn, s_last_drive_lat,
+             s_last_lateral_raw, s_last_lateral_filtered, s_last_lateral_delta,
+             s_last_drive_lat, s_last_heading_raw, s_last_heading_filtered,
+             s_last_heading_delta, s_last_drive_turn,
+             s_mix_pre_a, s_mix_pre_b, s_mix_pre_d,
+             s_mix_post_a, s_mix_post_b, s_mix_post_d,
+             s_mix_scaled, s_mix_dropped,
+             (unsigned)s_kick_cycles[0], (unsigned)s_kick_cycles[1],
+             (unsigned)s_kick_cycles[2], s_last_direction[0],
+             s_last_direction[1], s_last_direction[2],
              s_command_a, s_command_b, s_command_d);
 
     s_summary_camera_frames = camera_frames;
@@ -745,6 +829,8 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     }
 
     line_observation_t observation = {0};
+    s_last_frame_width = width;
+    s_last_frame_height = height;
     if (s_state == LINE_STATE_TURN && s_turn_frames < UINT32_MAX) {
         ++s_turn_frames;
     }
@@ -754,6 +840,13 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     const bool candidate = observe_line(rgb565_big_endian, width, height,
                                         source_threshold, draw_overlay,
                                         &observation);
+    s_last_scan_bottom_y = observation.scan_bottom_y;
+    s_last_point_count = observation.point_count;
+    s_last_near_normal_rows = observation.near_normal_rows;
+    s_last_far_error = observation.far_error;
+    s_last_corner_direction = observation.corner_direction;
+    s_last_corner_row_y = observation.corner_row_y;
+    s_last_near_line_visible = observation.near_line_visible;
     s_last_threshold = observation.threshold;
     s_last_candidate = candidate;
     s_last_seed_x = observation.valid_rows > 0 ? observation.seed_x : -1;
