@@ -34,7 +34,7 @@ extern "C" {
 #define LINE_MAX_SEGMENT_WIDTH_PERCENT 55
 #define LINE_MIN_VALID_ROWS 4
 #define LINE_CORNER_MIN_VALID_ROWS 2
-#define LINE_SEED_MISS_ROWS 3
+#define LINE_SEED_MISS_ROWS 6
 
 /* 近场取样窗口全部用固定行数，避免"基线随跟踪长度变化"导致前馈增益漂移。 */
 #define LINE_NEAR_ROWS 3

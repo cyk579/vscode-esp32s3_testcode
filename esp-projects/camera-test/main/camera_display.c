@@ -609,6 +609,11 @@ static void camera_decode_task(void *arg)
 #else
         release_jpeg_slot(frame.slot);
 #endif
+
+        /* Keep the latest-frame pipeline responsive while allowing the idle
+         * task on CPU0 to run; this also prevents the decode loop from
+         * tripping the task watchdog under sustained camera input. */
+        vTaskDelay(1);
     }
 }
 

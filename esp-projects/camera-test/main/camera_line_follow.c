@@ -82,7 +82,7 @@
 
 /* 误差门限。|error| 被 ROI 夹在 55 以内（center 只能落在 48..191），所以
  * 原来的 LINE_ERROR_LARGE=60 在 NORMAL 里永远不可达，CRAWL 那一档是死的。 */
-#define LINE_ERROR_DEADBAND 8
+#define LINE_ERROR_DEADBAND 12
 #define LINE_ERROR_MEDIUM 25
 #define LINE_ERROR_LARGE 45
 #define LINE_HEADING_DEADBAND 3
@@ -113,10 +113,11 @@
 /* 绕摄像头旋转：lat = turn * a/(2L)。偏航量必须够大，否则 a/d = lat - turn
  * 落在起转值以下会被混控丢掉，只剩后轮在推。
  * TODO(实测): LINE_CAM_PIVOT_PERCENT 用尺子量 a 和 L 后填 a*100/(2L)。 */
-#define LINE_PIVOT_TURN 17
-#define LINE_TURN_A_SPEED 17
-#define LINE_TURN_B_SPEED 16
-#define LINE_TURN_D_SPEED 17
+#define LINE_PIVOT_TURN 15
+#define LINE_TURN_A_SPEED 14
+#define LINE_TURN_B_SPEED 13
+#define LINE_TURN_D_SPEED 15
+#define LINE_TURN_PENDING_MS 500U
 /* 低速调试时优先保证三轮都超过各自起转阈值；此前叠加 40% 横移后，
  * 在较低总上限下 A/D 被缩放掉，锐角阶段实际只剩 B 轮。 */
 #define LINE_CAM_PIVOT_PERCENT 0
@@ -166,9 +167,8 @@ typedef struct {
 
 typedef enum {
     LINE_STATE_NORMAL = 0,
-    LINE_STATE_TURN,
+    LINE_STATE_CORNER,
     LINE_STATE_LOST,
-    LINE_STATE_FINISH,
 } line_state_t;
 
 static const char *TAG = "camera_line";
@@ -241,6 +241,7 @@ static bool s_mix_dropped;
 
 static int s_turn_direction;
 static uint8_t s_turn_hint_frames;
+static int64_t s_turn_pending_until_us;
 static uint8_t s_turn_exit_frames;
 static uint32_t s_turn_frames;
 static int64_t s_turn_started_us;
@@ -320,6 +321,13 @@ static int clamp_range(int value, int low, int high)
 static int direction_of(int value)
 {
     return (value > 0) - (value < 0);
+}
+
+static bool turn_pending_active(int64_t now)
+{
+    return s_turn_direction != 0 &&
+           s_turn_hint_frames >= LINE_TURN_HINT_FRAMES &&
+           s_turn_pending_until_us > now;
 }
 
 static int positive_percent(int value, int percent, int minimum)
@@ -481,7 +489,7 @@ static void render_preview_overlay(uint8_t *frame, uint16_t width, uint16_t heig
 
 static int state_search_half_percent(void)
 {
-    if (s_state == LINE_STATE_TURN) {
+    if (s_state == LINE_STATE_CORNER) {
         const int percent = LINE_CORNER_WINDOW_START_PERCENT +
                             (int)s_turn_frames * LINE_CORNER_WINDOW_GROW_PERCENT;
         return percent > LINE_CORNER_WINDOW_MAX_PERCENT ?
@@ -522,8 +530,8 @@ static bool observe_line(uint8_t *frame,
     cfg.threshold = source_threshold;
     /* 折角旋转时不要用旧种子：新赛道会从侧面转到中间来，应该在整条 ROI 底部
      * 重新找最靠中心的黑线，而不是围着入弯前的位置猜。 */
-    cfg.use_history = s_seed_valid && s_state != LINE_STATE_TURN;
-    cfg.seed_x = s_state == LINE_STATE_TURN ? (int)width / 2 : s_seed_x;
+    cfg.use_history = s_seed_valid && s_state != LINE_STATE_CORNER;
+    cfg.seed_x = s_state == LINE_STATE_CORNER ? (int)width / 2 : s_seed_x;
     cfg.search_half_percent = state_search_half_percent();
     cfg.expected_width = s_line_width;
     cfg.rotation = CAMERA_LINE_ROTATION;
@@ -736,6 +744,7 @@ static void reset_tracking(void)
     s_reacquire_x = 0;
     s_turn_direction = 0;
     s_turn_hint_frames = 0;
+    s_turn_pending_until_us = 0;
     s_turn_exit_frames = 0;
     s_turn_frames = 0;
     s_turn_started_us = 0;
@@ -806,13 +815,21 @@ static void drive_normal(const line_observation_t *observation, int64_t now)
     s_last_heading_filtered = heading_error;
     s_last_heading_delta = s_heading_error_rate;
     s_error_filter_initialized = true;
-    s_turn_output = line_control_yaw_pd(&cfg, heading_error,
-                                        s_heading_error_rate,
+    /* 正常巡线只用车体转向校正，不用横移硬拉回数学中心线。
+     * lateral 正值表示线在左侧，因此折算成负 heading，yaw PD 输出左转。
+     * 死区内保留有宽度的中心区域，避免小车左右来回校正。 */
+    const int lateral_for_steer = abs(lateral_error) <= LINE_ERROR_DEADBAND ?
+                                   0 : lateral_error;
+    const int steer_error = heading_error -
+                            (LINE_PID_KP_LAT * lateral_for_steer) /
+                            (LINE_PID_KH > 0 ? LINE_PID_KH : 1);
+    const int steer_rate = s_heading_error_rate -
+                           (LINE_PID_KP_LAT * s_lateral_error_rate) /
+                           (LINE_PID_KH > 0 ? LINE_PID_KH : 1);
+    s_turn_output = line_control_yaw_pd(&cfg, steer_error, steer_rate,
                                         LINE_PD_KD_HEADING, &s_yaw_accum);
-    drive(s_forward_output, s_turn_output,
-          line_control_strafe_pd(&cfg, lateral_error,
-                                 s_lateral_error_rate,
-                                 LINE_PD_KD_LAT, &s_lat_accum));
+    s_lat_accum = 0;
+    drive(s_forward_output, s_turn_output, 0);
 }
 
 static void update_seed(const line_observation_t *observation)
@@ -840,12 +857,10 @@ static void update_seed(const line_observation_t *observation)
 static const char *state_name(void)
 {
     switch (s_state) {
-    case LINE_STATE_TURN:
-        return "TURN";
+    case LINE_STATE_CORNER:
+        return "CORNER";
     case LINE_STATE_LOST:
         return "LOST";
-    case LINE_STATE_FINISH:
-        return "FINISH";
     case LINE_STATE_NORMAL:
     default:
         return "NORMAL";
@@ -883,6 +898,9 @@ static void maybe_log_summary(int64_t now)
                                 (now - s_last_line_us) / 1000;
     const int64_t frame_age_ms = pipeline.last_control_age_us == 0 ? (int64_t)-1 :
                                  (int64_t)(pipeline.last_control_age_us / 1000U);
+    const bool pending = turn_pending_active(now);
+    const int64_t pending_ms = pending ?
+                               (s_turn_pending_until_us - now) / 1000 : 0;
     ESP_LOGI(TAG,
              "fps camera=%u decoded=%u control=%u preview=%u drop=%u "
              "control_drop=%u preview_drop=%u callback_drop=%u frame=%ux%u "
@@ -906,7 +924,8 @@ static void maybe_log_summary(int64_t now)
              "vision state=%s armed=%d STBY=%d candidate=%d arm_frames=%u lost=%u "
              "reacq=%u/%u seed_valid=%d threshold=%d seed_x=%d line_w=%d "
              "scan_bottom=%d points=%d valid_rows=%u near_rows=%d confidence=%u "
-             "near_line=%d far_error=%d corner=%d@%d line_age_ms=%lld",
+             "near_line=%d far_error=%d corner=%d@%d pending=%d/%lldms "
+             "line_age_ms=%lld",
              state_name(), s_armed, s_stby_enabled, s_last_candidate,
              (unsigned)s_arm_frames, (unsigned)s_lost_frames,
              (unsigned)s_reacquire_frames, (unsigned)LINE_REACQUIRE_CONFIRM_FRAMES,
@@ -915,7 +934,7 @@ static void maybe_log_summary(int64_t now)
              (unsigned)s_last_valid_rows, s_last_near_normal_rows,
              (unsigned)s_last_confidence, s_last_near_line_visible,
              s_last_far_error, s_last_corner_direction, s_last_corner_row_y,
-             (long long)line_age_ms);
+             pending, (long long)pending_ms, (long long)line_age_ms);
     ESP_LOGI(TAG,
              "control forward[target,ramped]=[%d,%d] drive[in f,t,l]=[%d,%d,%d] "
              "lat[raw,filtered,delta,cmd]=[%d,%d,%d,%d] "
@@ -1004,7 +1023,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     line_observation_t observation = {0};
     s_last_frame_width = width;
     s_last_frame_height = height;
-    if (s_state == LINE_STATE_TURN && s_turn_frames < UINT32_MAX) {
+    if (s_state == LINE_STATE_CORNER && s_turn_frames < UINT32_MAX) {
         ++s_turn_frames;
     }
     if (s_state == LINE_STATE_LOST && s_lost_frames < UINT32_MAX) {
@@ -1067,7 +1086,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         }
         if (s_finish_frames >= LINE_FINISH_CONFIRM_FRAMES) {
             s_finished = true;
-            s_state = LINE_STATE_FINISH;
+            s_state = LINE_STATE_NORMAL;
             stop_motors();
             ESP_LOGW(TAG, "finish T confirmed at row %d; motors stopped",
                      observation.corner_row_y);
@@ -1079,7 +1098,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     }
 
     /* ---- 折角：绕摄像头原地旋转，用近场闭环退出 ---- */
-    if (s_state == LINE_STATE_TURN) {
+    if (s_state == LINE_STATE_CORNER) {
         const bool settled = s_turn_started_us != 0 &&
                              now - s_turn_started_us >=
                                  (int64_t)LINE_TURN_MIN_MS * 1000;
@@ -1165,12 +1184,12 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 goto done;
             }
             if (near_last_seed) {
-                /* 已经看见线但还没确认：用横移把它拉回中间，不要转车身。 */
-                /* seed_x 是原始图像坐标，控制量要按镜像设置翻一次。 */
+                /* 重捕获阶段也沿用红外巡线式转向，避免横移把车推离赛道。 */
                 const int mirror = CAMERA_LINE_MIRROR_X ? -1 : 1;
                 const int correction =
                     mirror * direction_of(observation.seed_x - s_seed_x);
-                drive(LINE_FORWARD_CRAWL, 0, correction * LINE_LAT_MIN_OUTPUT);
+                drive(LINE_FORWARD_CRAWL,
+                      -correction * LINE_YAW_MIN_OUTPUT, 0);
             } else {
                 drive(LINE_FORWARD_CRAWL, 0, 0);
             }
@@ -1197,7 +1216,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         s_last_line_us = now;
         update_seed(&observation);
 
-        /* 近场折角事件才动手；远处的同一个事件只在 forward_speed 里降速。 */
+        /* 近场折角先挂起；只有旧线随后消失才进入 CORNER 原地慢转。 */
         const int trigger_y = (int)height * LINE_TURN_TRIGGER_PERCENT / 100;
         if (observation.corner_direction != 0 &&
             observation.corner_row_y >= trigger_y) {
@@ -1208,26 +1227,31 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             } else {
                 s_turn_direction = observation.corner_direction;
                 s_turn_hint_frames = 1;
+                s_turn_pending_until_us = 0;
             }
             if (s_turn_hint_frames >= LINE_TURN_HINT_FRAMES) {
-                s_state = LINE_STATE_TURN;
-                s_turn_frames = 0;
-                s_turn_exit_frames = 0;
-                s_turn_hint_frames = 0;
-                s_turn_started_us = now;
-                reset_control();
-                ESP_LOGI(TAG, "corner %s at row %d; pivoting about the camera",
-                         s_turn_direction < 0 ? "left" : "right",
-                         observation.corner_row_y);
-                const int turn = -s_turn_direction * LINE_PIVOT_TURN;
-                drive_slow_spin(turn);
-                goto done;
+                s_turn_pending_until_us = now +
+                                           (int64_t)LINE_TURN_PENDING_MS * 1000;
             }
-        } else {
+        } else if (!turn_pending_active(now)) {
             s_turn_hint_frames = 0;
             s_turn_direction = 0;
+            s_turn_pending_until_us = 0;
         }
         drive_normal(&observation, now);
+        goto done;
+    }
+
+    if (turn_pending_active(now)) {
+        s_state = LINE_STATE_CORNER;
+        s_turn_frames = 0;
+        s_turn_exit_frames = 0;
+        s_turn_started_us = now;
+        s_turn_pending_until_us = 0;
+        reset_control();
+        ESP_LOGI(TAG, "corner %s confirmed after old line loss; pivoting",
+                 s_turn_direction < 0 ? "left" : "right");
+        drive_slow_spin(-s_turn_direction * LINE_PIVOT_TURN);
         goto done;
     }
 
