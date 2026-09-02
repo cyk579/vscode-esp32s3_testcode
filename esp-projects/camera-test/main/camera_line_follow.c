@@ -32,6 +32,8 @@
 
 /* 解码器输出大端字节序 RGB565；画面左右相反时改为 1。 */
 #define CAMERA_LINE_MIRROR_X 0
+/* Negative values shift the desired track center left in the camera image. */
+#define CAMERA_LINE_CENTER_BIAS_PX (-4)
 
 /* 摄像头相对车体的安装旋转。扫描坐标系永远是车体视角（sy 越大越靠近车），
  * 缓冲区按这个值反查，不做整帧旋转拷贝，所以改它不增加单帧耗时。
@@ -54,7 +56,7 @@
 #define LINE_SATURATION_MAX 60
 #define LINE_WIDTH_FILTER_OLD 3
 #define LINE_WIDTH_FILTER_NEW 1
-#define LINE_ERROR_FILTER_OLD 6
+#define LINE_ERROR_FILTER_OLD 2
 #define LINE_ERROR_FILTER_NEW 4
 #define LINE_PD_KD_LAT 20
 #define LINE_PD_KD_HEADING 50
@@ -72,11 +74,11 @@
 #define LINE_FINISH_ENABLE 1
 
 /* 22% 是 car-spin 已验证的低速可持续区间；斜坡仍按控制周期平滑上升。 */
-#define LINE_FORWARD_FAST 22
-#define LINE_FORWARD_MEDIUM 22
-#define LINE_FORWARD_SLOW 22
-#define LINE_FORWARD_CRAWL 22
-#define LINE_FORWARD_SLEW 2
+#define LINE_FORWARD_FAST 30
+#define LINE_FORWARD_MEDIUM 28
+#define LINE_FORWARD_SLOW 24
+#define LINE_FORWARD_CRAWL 18
+#define LINE_FORWARD_SLEW 8
 
 /* 误差门限。|error| 被 ROI 夹在 55 以内（center 只能落在 48..191），所以
  * 原来的 LINE_ERROR_LARGE=60 在 NORMAL 里永远不可达，CRAWL 那一档是死的。 */
@@ -93,7 +95,7 @@
 #define LINE_PID_KP_LAT 45
 #define LINE_PID_KH 130
 #define LINE_PID_SCALE 100
-#define LINE_TURN_MAX 19
+#define LINE_TURN_MAX 16
 #define LINE_YAW_MIN_OUTPUT 13
 #define LINE_LAT_MAX 16
 #define LINE_LAT_MIN_OUTPUT 11
@@ -111,7 +113,10 @@
 /* 绕摄像头旋转：lat = turn * a/(2L)。偏航量必须够大，否则 a/d = lat - turn
  * 落在起转值以下会被混控丢掉，只剩后轮在推。
  * TODO(实测): LINE_CAM_PIVOT_PERCENT 用尺子量 a 和 L 后填 a*100/(2L)。 */
-#define LINE_PIVOT_TURN 26
+#define LINE_PIVOT_TURN 17
+#define LINE_TURN_A_SPEED 17
+#define LINE_TURN_B_SPEED 16
+#define LINE_TURN_D_SPEED 17
 /* 低速调试时优先保证三轮都超过各自起转阈值；此前叠加 40% 横移后，
  * 在较低总上限下 A/D 被缩放掉，锐角阶段实际只剩 B 轮。 */
 #define LINE_CAM_PIVOT_PERCENT 0
@@ -139,12 +144,12 @@
 #define PWM_MAX 1023U
 #define MOTOR_MIN_RUN_OUTPUT 11
 #define MOTOR_B_MIN_RUN_OUTPUT 13
-#define START_KICK_OUTPUT 24
+#define START_KICK_OUTPUT 20
 #define START_KICK_CYCLES 3U
 /* 正常巡航保持 22%，只给短暂起转脉冲留到 24%，避免再次卡在静摩擦区。 */
-#define MOTOR_PWM_CEILING 24
-#define LINE_SPEED_CAP 22
-#define MOTOR_TRIM_A 100
+#define MOTOR_PWM_CEILING 30
+#define LINE_SPEED_CAP 30
+#define MOTOR_TRIM_A 90
 #define MOTOR_TRIM_D 100
 
 /* 方向符号与 car-spin 的实车校准一致。 */
@@ -530,6 +535,16 @@ static bool observe_line(uint8_t *frame,
 
     const bool candidate = line_geometry_track(frame, &cfg, observation);
     observation->threshold = source_threshold;
+    if (candidate && CAMERA_LINE_CENTER_BIAS_PX != 0 && width >= 2) {
+        /* Shift only the lateral reference. Heading is a difference of two
+         * errors, so the same optical offset cancels out there. */
+        const int bias = CAMERA_LINE_CENTER_BIAS_PX * 100 / ((int)width / 2);
+        const int signed_bias = CAMERA_LINE_MIRROR_X ? -bias : bias;
+        observation->lateral_error = clamp_int(observation->lateral_error +
+                                               signed_bias, 100);
+        observation->far_error = clamp_int(observation->far_error +
+                                           signed_bias, 100);
+    }
     if (draw_overlay) {
         render_tracking_overlay(frame, &cfg, observation);
     }
@@ -653,6 +668,48 @@ static void drive(int forward, int turn, int lat)
     motor_set(&motor_a, s_command_a);
     motor_set(&motor_b, s_command_b);
     motor_set(&motor_d, s_command_d);
+}
+
+/* Use the low-speed IR spin calibration in TURN.  The direct wheel commands
+ * avoid the normal direction-change kick, which otherwise makes the camera
+ * sweep past the line before the next frame is processed. */
+static void drive_slow_spin(int turn)
+{
+    const int direction = direction_of(turn);
+    if (direction == 0) {
+        zero_motor_outputs();
+        return;
+    }
+
+    const int a = -direction * LINE_TURN_A_SPEED;
+    const int b = direction * LINE_TURN_B_SPEED;
+    const int d = -direction * LINE_TURN_D_SPEED;
+    s_last_forward_target = 0;
+    s_last_forward_ramped = 0;
+    s_last_drive_forward = 0;
+    s_last_drive_turn = turn;
+    s_last_drive_lat = 0;
+    s_mix_pre_a = a;
+    s_mix_pre_b = b;
+    s_mix_pre_d = d;
+    s_mix_post_a = a;
+    s_mix_post_b = b;
+    s_mix_post_d = d;
+    s_mix_scaled = false;
+    s_mix_dropped = false;
+    s_command_a = a;
+    s_command_b = b;
+    s_command_d = d;
+
+    const bool saved_suppress_kick = s_suppress_kick;
+    s_suppress_kick = true;
+    motor_set(&motor_a, a);
+    motor_set(&motor_b, b);
+    motor_set(&motor_d, d);
+    s_kick_cycles[0] = 0;
+    s_kick_cycles[1] = 0;
+    s_kick_cycles[2] = 0;
+    s_suppress_kick = saved_suppress_kick;
 }
 
 static void reset_control(void)
@@ -1070,7 +1127,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
          * 叠加 lat = turn * a/(2L) 就变成绕镜头旋转，全程保住近场视野。 */
         {
             const int turn = -s_turn_direction * LINE_PIVOT_TURN;
-            drive(0, turn, turn * LINE_CAM_PIVOT_PERCENT / 100);
+            drive_slow_spin(turn);
         }
         goto done;
     }
@@ -1163,7 +1220,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                          s_turn_direction < 0 ? "left" : "right",
                          observation.corner_row_y);
                 const int turn = -s_turn_direction * LINE_PIVOT_TURN;
-                drive(0, turn, turn * LINE_CAM_PIVOT_PERCENT / 100);
+                drive_slow_spin(turn);
                 goto done;
             }
         } else {
