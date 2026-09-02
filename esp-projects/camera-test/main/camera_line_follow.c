@@ -33,8 +33,12 @@
 
 /* 解码器输出大端字节序 RGB565；画面左右相反时改为 1。 */
 #define CAMERA_LINE_MIRROR_X 0
-/* Negative values shift the desired track center left in the camera image. */
-#define CAMERA_LINE_CENTER_BIAS_PX (-4)
+/*
+ * The chassis center is about 5 cm left of the tape in the real vehicle.
+ * A negative image offset makes the NORMAL controller steer right until the
+ * tape is about 18 pixels right of the optical center (the tuned 120x80 view).
+ */
+#define CAMERA_LINE_CENTER_BIAS_PX (-18)
 
 /* 摄像头相对车体的安装旋转。扫描坐标系永远是车体视角（sy 越大越靠近车），
  * 缓冲区按这个值反查，不做整帧旋转拷贝，所以改它不增加单帧耗时。
@@ -72,6 +76,10 @@
 #define LINE_LOST_STOP_MS 1800U
 #define LINE_FRAME_TIMEOUT_MS 1200U
 #define LINE_FINISH_CONFIRM_FRAMES 5U
+/* At a T finish, keep crawling and use heading only to leave the nose
+ * pointing forward before the confirmation stop. */
+#define LINE_FINISH_ALIGN_HEADING_ERROR 8
+#define LINE_FINISH_ALIGN_TIMEOUT_MS 1500U
 /* 终点 T 停车。调巡线时可以临时置 0，避免把"误停"当成"丢线"。 */
 #define LINE_FINISH_ENABLE 1
 
@@ -184,13 +192,12 @@
 #define AVOID_RIGHT_A_SPEED 15
 #define AVOID_RIGHT_B_SPEED 25
 #define AVOID_RIGHT_D_SPEED 20
-#define AVOID_LEFT_MIN_MS 250U
-#define AVOID_LEFT_TIMEOUT_MS 6000U
+#define AVOID_LEFT_MS 2500U
 #define AVOID_FORWARD_A_SPEED 25
 #define AVOID_FORWARD_D_SPEED 20
-#define AVOID_FORWARD_MS 1800U
+#define AVOID_FORWARD_MS 2000U
 /* No IR sensor is available here: finish the return strafe by time. */
-#define AVOID_RIGHT_MS 1000U
+#define AVOID_RIGHT_MS 2500U
 #define AVOID_REACQUIRE_GRACE_MS 1000U
 #define AVOID_COOLDOWN_MS 1200U
 
@@ -238,6 +245,7 @@ static bool s_obstacle_ready;
 static uint8_t s_arm_frames;
 static int64_t s_motor_start_us;
 static uint8_t s_finish_frames;
+static int64_t s_finish_align_start_us;
 static int64_t s_first_frame_us;
 static int64_t s_last_line_us;
 static int64_t s_last_frame_us;
@@ -943,6 +951,7 @@ static void reset_tracking(void)
     s_turn_started_us = 0;
     s_alert_until_us = 0;
     s_finish_frames = 0;
+    s_finish_align_start_us = 0;
     s_have_last_good_observation = false;
     s_candidate_miss_frames = 0;
     s_overlay_miss_frames = 0;
@@ -1033,7 +1042,7 @@ static void obstacle_finish(int64_t now, uint16_t width)
     s_last_line_us = now;
     s_reacquire_x = (int)width / 2;
     zero_motor_outputs();
-    ESP_LOGI(TAG, "obstacle right timed out at %ums; visual reacquire enabled",
+    ESP_LOGI(TAG, "obstacle fixed route complete (right %ums); visual reacquire enabled",
              (unsigned)AVOID_RIGHT_MS);
 }
 
@@ -1067,19 +1076,13 @@ static bool obstacle_step(int64_t now, uint16_t width, bool line_available)
 
     case OBSTACLE_LEFT: {
         obstacle_drive_lateral(true);
-        const float distance = s_ultrasonic_distance_cm;
-        const bool clear = s_ultrasonic_valid &&
-                           distance > OBSTACLE_CLEAR_CM;
-        if ((elapsed >= AVOID_LEFT_MIN_MS && clear) ||
-            elapsed >= AVOID_LEFT_TIMEOUT_MS) {
+        /* The side sensor is not a reliable stop signal while the chassis is
+         * moving alongside an obstacle.  Use the validated fixed route time. */
+        if (elapsed >= AVOID_LEFT_MS) {
             s_obstacle_state = OBSTACLE_FORWARD;
             s_obstacle_phase_start_us = now;
-            if (elapsed >= AVOID_LEFT_TIMEOUT_MS && !clear) {
-                ESP_LOGW(TAG, "left shift timeout without clear echo; continuing");
-            } else {
-                ESP_LOGI(TAG, "left shift complete after %ums clear echo",
-                         (unsigned)elapsed);
-            }
+            ESP_LOGI(TAG, "left shift complete after fixed %ums; forward start",
+                     (unsigned)elapsed);
         }
         break;
     }
@@ -1501,21 +1504,50 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     /* ---- 终点 T：双侧敞开的横杆 + 下方仍有立柱 ---- */
     if (!observation.finish_candidate) {
         s_finish_frames = 0;
+        s_finish_align_start_us = 0;
     } else if (LINE_FINISH_ENABLE && candidate && s_state == LINE_STATE_NORMAL) {
-        if (s_finish_frames < LINE_FINISH_CONFIRM_FRAMES) {
-            ++s_finish_frames;
+        if (s_finish_align_start_us == 0) {
+            s_finish_align_start_us = now;
+            /* Do not let the preceding line-follow derivative kick turn the
+             * chassis while the T stem is being aligned. */
+            reset_control(false);
         }
-        if (s_finish_frames >= LINE_FINISH_CONFIRM_FRAMES) {
+
+        const bool heading_aligned = observation.near_line_visible &&
+                                     abs(observation.heading_error) <=
+                                         LINE_FINISH_ALIGN_HEADING_ERROR;
+        if (heading_aligned) {
+            if (s_finish_frames < LINE_FINISH_CONFIRM_FRAMES) {
+                ++s_finish_frames;
+            }
+        } else {
+            s_finish_frames = 0;
+        }
+
+        const int64_t align_us = now - s_finish_align_start_us;
+        if (s_finish_frames >= LINE_FINISH_CONFIRM_FRAMES ||
+            align_us >= (int64_t)LINE_FINISH_ALIGN_TIMEOUT_MS * 1000) {
             s_finished = true;
             s_state = LINE_STATE_NORMAL;
             stop_motors();
-            ESP_LOGW(TAG, "finish T confirmed at row %d; motors stopped",
-                     observation.corner_row_y);
+            ESP_LOGW(TAG, "finish T stopped at row %d; heading=%d aligned=%d",
+                     observation.corner_row_y, observation.heading_error,
+                     heading_aligned);
             goto done;
         }
-        /* 确认期间继续爬行，让车停在横杆上而不是提前刹住。 */
-        drive(LINE_FORWARD_CRAWL, 0, 0);
+        /* Keep the T stem as the forward reference.  Ignore the lateral
+         * offset used for normal tracking so the nose, rather than the
+         * camera's optical center, is aligned before stopping. */
+        line_observation_t finish_control = observation;
+        finish_control.lateral_error = 0;
+        finish_control.far_error = 0;
+        finish_control.corner_direction = 0;
+        finish_control.finish_candidate = true;
+        drive_normal(&finish_control, now);
         goto done;
+    } else {
+        s_finish_frames = 0;
+        s_finish_align_start_us = 0;
     }
 
     /* ---- 折角：绕摄像头原地旋转，用近场闭环退出 ---- */
