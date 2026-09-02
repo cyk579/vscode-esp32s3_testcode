@@ -271,6 +271,7 @@ bool line_geometry_track(const uint8_t *frame,
     int point_count = 0;
     int misses = 0;
     int near_normal_rows = 0;
+    int shape_event_rows = 0;
     int y = bottom;
 
     while (y >= top && point_count < LINE_SCAN_MAX_ROWS) {
@@ -304,6 +305,14 @@ bool line_geometry_track(const uint8_t *frame,
                 /* corner_direction 是控制量，直接给出控制系方向。 */
                 const int raw = segment.kind == LINE_ROW_WIDE_LEFT ? -1 : 1;
                 observation->corner_direction = cfg->mirror_x ? -raw : raw;
+                /* 锐角处底部几行可能仍是弯道横向投影，不能因第一行宽线
+                 * 就结束跟踪；跳过少量形状事件，继续向上找真正的赛道段。 */
+                if (point_count < LINE_MIN_VALID_ROWS &&
+                    shape_event_rows < LINE_SEED_MISS_ROWS * 2) {
+                    ++shape_event_rows;
+                    y -= LINE_ROW_STEP;
+                    continue;
+                }
             }
             break;
         }

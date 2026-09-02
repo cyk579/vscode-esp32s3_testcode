@@ -121,7 +121,7 @@
 #define LINE_CALIB_SETTLE_MS 3000U
 #define LINE_CALIB_STEP_MS 1500U
 #define LINE_CALIB_STEP_FROM 4
-#define LINE_CALIB_STEP_TO 26
+#define LINE_CALIB_STEP_TO 18
 #define LINE_CALIB_RUN_MS 3000U
 #define LINE_CALIB_SPIN_MS 10000U
 
@@ -136,14 +136,11 @@
 #define PWM_MAX 1023U
 #define MOTOR_MIN_RUN_OUTPUT 11
 #define MOTOR_B_MIN_RUN_OUTPUT 13
-#define START_KICK_OUTPUT 32
+#define START_KICK_OUTPUT 15
 #define START_KICK_CYCLES 8U
-/* MOTOR_PWM_CEILING 是硬件/安全上限，只负责给混控留余量；LINE_SPEED_CAP 才
- * 是"想跑多快"。原来两件事都压在 MAX_OUTPUT=34 上：FORWARD_FAST=30 时转向
- * 预算只剩 4，LINE_TURN_MAX 19 和 LINE_PID_TURN_MAX 10 在高速下根本到不了，
- * 而单轮可用区间 11~34 只有 3:1 动态范围，向量混控挤不开。
- * TODO(实测): ceiling 按实测最高安全轮速调整；trim 按架空/落地直行跑偏配平。 */
-#define MOTOR_PWM_CEILING 30
+/* 调试阶段把所有实际轮端输出限制在 18 以内：前进量为 15，启动冲量也不
+ * 超过 15，转弯混控最多只到 18，避免日志里出现 30 级的突然冲刺。 */
+#define MOTOR_PWM_CEILING 18
 #define LINE_SPEED_CAP 15
 #define MOTOR_TRIM_A 100
 #define MOTOR_TRIM_D 100
@@ -989,7 +986,7 @@ done:
  *
  * 两件事都必须做，否则测出来的不是真实静摩擦：
  *   - 混控会把低于 11/13 的分量直接置零，阶梯永远"从地板值开始动"；
- *   - 换向冲量按调用次数衰减，而阶梯每级只调用一次，8 级都会被抬到 32。
+ *   - 换向冲量按调用次数衰减，而阶梯每级只调用一次，8 级都会被抬到启动上限。
  */
 static void calibration_drive_raw(int forward, int turn, int lat)
 {
