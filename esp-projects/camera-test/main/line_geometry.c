@@ -247,8 +247,9 @@ bool line_geometry_track(const uint8_t *frame,
                 observation->finish_candidate = point_count >= LINE_FINISH_STEM_ROWS &&
                                                 y >= near_top;
             } else {
-                observation->corner_direction =
-                    segment.kind == LINE_ROW_WIDE_LEFT ? -1 : 1;
+                /* corner_direction 是控制量，直接给出控制系方向。 */
+                const int raw = segment.kind == LINE_ROW_WIDE_LEFT ? -1 : 1;
+                observation->corner_direction = cfg->mirror_x ? -raw : raw;
             }
             break;
         }

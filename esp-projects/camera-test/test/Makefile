@@ -1,8 +1,8 @@
 CC ?= gcc
 CFLAGS ?= -std=c11 -O1 -g -Wall -Wextra -Wno-unused-parameter -I../main
 
-harness: host_harness.c ../main/line_geometry.c ../main/line_mixer.c
-	$(CC) $(CFLAGS) -o harness host_harness.c ../main/line_geometry.c ../main/line_mixer.c
+harness: host_harness.c ../main/line_geometry.c ../main/line_mixer.c ../main/line_control.c
+	$(CC) $(CFLAGS) -o harness host_harness.c ../main/line_geometry.c ../main/line_mixer.c ../main/line_control.c
 
 .PHONY: run clean
 run: harness

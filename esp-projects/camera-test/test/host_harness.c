@@ -6,6 +6,7 @@
  * 合成帧能验证几何判据与状态语义（直线/偏移/斜线/90°弯/终点 T/彩色干扰），
  * 不能验证真实光照、噪声、镜头畸变和胶带边缘 —— 那些必须用真机采帧回放。
  */
+#include "line_control.h"
 #include "line_geometry.h"
 #include "line_mixer.h"
 
@@ -339,6 +340,101 @@ static void scenario_pivot(void)
           "expected the weak pivot to drop A and D");
 }
 
+/*
+ * 全链路符号测试：几何 -> 控制律 -> 混控 -> 车体速度。
+ *
+ * 这是最容易写错、而且在"误差为 0 的合成图"上完全看不出来的地方：转向和
+ * 平移是两个不同的执行器，它们和误差符号的关系不一样。
+ */
+static line_control_cfg_t control_cfg(void)
+{
+    const line_control_cfg_t cfg = {
+        130, 45, 100, 19, 13, 16, 11, 3, 8, 25, 45, 12, 35,
+        26, 22, 18, 15, LINE_MIN_VALID_ROWS,
+    };
+    return cfg;
+}
+
+static void scenario_signs(int w)
+{
+    const line_control_cfg_t ccfg = control_cfg();
+    const line_mixer_cfg_t mcfg = mixer_cfg();
+    char name[32];
+    line_observation_t obs;
+    int accum = 0;
+
+    /* 线偏左：车在线的右边，必须向左平移。 */
+    snprintf(name, sizeof(name), "sign-left/w=%d", w);
+    fill_frame(240, 240, 240);
+    draw_segment(LINE_X - 20, FRAME_H - 1, LINE_X - 20, 36, w, 0, 0, 0);
+    run_case(name, w, &obs, false);
+    check(name, "ey>0", obs.lateral_error > 0,
+          "a line left of centre must give a positive lateral error");
+    {
+        int lat = 0;
+        for (int i = 0; i < 8 && lat == 0; ++i) {
+            lat = line_control_strafe(&ccfg, obs.lateral_error, &accum);
+        }
+        line_mixer_out_t out = {0, 0, 0, false, false};
+        int bf = 0, bt = 0, bl = 0;
+        line_mixer_solve(ccfg.speed_crawl, 0, lat, &mcfg, &out);
+        line_mixer_body(out.a, out.b, out.d, &bf, &bt, &bl);
+        printf("  %-18s ey=%d -> lat=%d -> body vx sign %s\n", name,
+               obs.lateral_error, lat, bl < 0 ? "left" : (bl > 0 ? "right" : "none"));
+        check(name, "strafe goes left", lat < 0,
+              "strafe sign is inverted: the car would run away from the line");
+        check(name, "body moves left", bl <= 0, "mixer flipped the strafe");
+    }
+
+    /* 线远端偏左：必须左转（逆时针，turn > 0）。 */
+    snprintf(name, sizeof(name), "sign-tilt/w=%d", w);
+    fill_frame(240, 240, 240);
+    draw_segment(LINE_X, FRAME_H - 1, LINE_X - 60, 36, w, 0, 0, 0);
+    run_case(name, w, &obs, false);
+    check(name, "eth<0", obs.heading_error < 0,
+          "a line whose far end is left must give a negative heading error");
+    {
+        int yaw_accum = 0;
+        int turn = 0;
+        for (int i = 0; i < 8 && turn == 0; ++i) {
+            turn = line_control_yaw(&ccfg, obs.heading_error, &yaw_accum);
+        }
+        line_mixer_out_t out = {0, 0, 0, false, false};
+        int bf = 0, bt = 0, bl = 0;
+        line_mixer_solve(ccfg.speed_crawl, turn, 0, &mcfg, &out);
+        line_mixer_body(out.a, out.b, out.d, &bf, &bt, &bl);
+        printf("  %-18s eth=%d -> turn=%d -> body yaw %s\n", name,
+               obs.heading_error, turn,
+               bt > 0 ? "ccw/left" : (bt < 0 ? "cw/right" : "none"));
+        check(name, "yaw goes left", turn > 0,
+              "yaw sign is inverted: the car would turn away from the line");
+        check(name, "body yaws left", bt > 0, "mixer flipped the yaw");
+    }
+}
+
+/* 抖动的等效平均值必须等于需求值，否则小幅纠偏会有系统性偏差。 */
+static void scenario_dither(void)
+{
+    const line_control_cfg_t cfg = control_cfg();
+    const int error = 12;                       /* 需求 -5，低于 lat_min 11 */
+    const int expected = -cfg.kp_lat * error / cfg.scale;
+    int accum = 0;
+    int total = 0;
+    const int frames = 60;
+
+    for (int i = 0; i < frames; ++i) {
+        total += line_control_strafe(&cfg, error, &accum);
+    }
+    const int average = total / frames;
+    printf("  %-18s demand=%d over %d frames -> average=%d\n",
+           "dither", expected, frames, average);
+    check("dither", "average tracks demand", abs(average - expected) <= 1,
+          "dithered strafe does not average out to the demand");
+    check("dither", "deadband silent",
+          line_control_strafe(&cfg, cfg.error_deadband, &accum) == 0,
+          "strafe should be silent inside the deadband");
+}
+
 int main(int argc, char **argv)
 {
     static const int widths[] = {7, 11, 15};
@@ -385,11 +481,13 @@ int main(int argc, char **argv)
         scenario_corner(w, +1);
         scenario_finish_t(w);
         scenario_colour_blob(w);
+        scenario_signs(w);
     }
 
     printf("\n-- mixer --\n");
     scenario_mixer();
     scenario_pivot();
+    scenario_dither();
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

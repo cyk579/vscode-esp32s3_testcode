@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "line_control.h"
 #include "line_geometry.h"
 #include "line_mixer.h"
 
@@ -72,6 +73,7 @@
 #define LINE_ERROR_DEADBAND 8
 #define LINE_ERROR_MEDIUM 25
 #define LINE_ERROR_LARGE 45
+#define LINE_HEADING_DEADBAND 3
 #define LINE_HEADING_SLOW 12
 #define LINE_FAR_SLOW 35
 
@@ -176,6 +178,7 @@ static bool s_last_candidate;
 static int s_last_seed_x;
 
 static int s_lat_accum;
+static int s_yaw_accum;
 static int s_forward_output;
 static int s_turn_output;
 
@@ -472,6 +475,7 @@ static void drive(int forward, int turn, int lat)
 static void reset_control(void)
 {
     s_lat_accum = 0;
+    s_yaw_accum = 0;
     s_forward_output = 0;
     s_turn_output = 0;
 }
@@ -494,94 +498,25 @@ static void reset_tracking(void)
     s_state = LINE_STATE_NORMAL;
 }
 
-/*
- * 偏航通道：只做粗对正。
- *
- * B 轮实测起转值 13，而 kiwi 混控下后轮只承担 turn，所以偏航指令要么是 0，
- * 要么必须大到让 B 真的转起来 —— 小幅偏航在这台车上物理上不存在。因此这里
- * 是一个带死区的粗环，位置精修交给横移通道。赛道全部由直线段和折角组成，
- * 直线段上把车身姿态保持在十几度以内就足够了。
- */
-static int yaw_command(int heading_error)
+static line_control_cfg_t control_cfg(void)
 {
-    int target = LINE_PID_KH * heading_error / LINE_PID_SCALE;
-    target = clamp_int(target, LINE_TURN_MAX);
-    if (abs(target) < LINE_YAW_MIN_OUTPUT) {
-        return 0;
-    }
-    return target;
-}
-
-/*
- * 横移通道：一阶纠偏，外加时间抖动。
- *
- * 纯横移要求 |lat| >= 11（A/D 也各承担一份 lat，低于起转值会被混控丢弃），
- * 所以小幅横移只能靠"攒够了发一个整脉冲"。15 FPS 下这是几 Hz 的脉冲串，
- * 车体本身把它积分掉，等效平均值就是需求值。
- */
-static int strafe_command(int lateral_error)
-{
-    int demand = LINE_PID_KP_LAT * lateral_error / LINE_PID_SCALE;
-    demand = clamp_int(demand, LINE_LAT_MAX);
-    if (abs(lateral_error) <= LINE_ERROR_DEADBAND) {
-        demand = 0;
-    }
-    if (demand == 0) {
-        s_lat_accum = 0;
-        return 0;
-    }
-    if (abs(demand) >= LINE_LAT_MIN_OUTPUT) {
-        s_lat_accum = 0;
-        return demand;
-    }
-    s_lat_accum += demand;
-    if (abs(s_lat_accum) >= LINE_LAT_MIN_OUTPUT) {
-        const int pulse = s_lat_accum > 0 ? LINE_LAT_MIN_OUTPUT : -LINE_LAT_MIN_OUTPUT;
-        s_lat_accum -= pulse;
-        return pulse;
-    }
-    return 0;
-}
-
-static int min_int(int a, int b)
-{
-    return a < b ? a : b;
-}
-
-/* 速度取所有限制里最小的一个。远端只在这里起作用，绝不参与转向。 */
-static int forward_speed(const line_observation_t *observation, int64_t now)
-{
-    int speed = LINE_FORWARD_FAST;
-    const int magnitude = abs(observation->lateral_error);
-    if (magnitude >= LINE_ERROR_LARGE) {
-        speed = min_int(speed, LINE_FORWARD_CRAWL);
-    } else if (magnitude >= LINE_ERROR_MEDIUM) {
-        speed = min_int(speed, LINE_FORWARD_SLOW);
-    } else if (magnitude > LINE_ERROR_DEADBAND) {
-        speed = min_int(speed, LINE_FORWARD_MEDIUM);
-    }
-    if (abs(observation->heading_error) >= LINE_HEADING_SLOW) {
-        speed = min_int(speed, LINE_FORWARD_SLOW);
-    }
-    if (abs(observation->far_error) >= LINE_FAR_SLOW) {
-        speed = min_int(speed, LINE_FORWARD_SLOW);
-    }
-    if (observation->corner_direction != 0 || observation->finish_candidate) {
-        speed = min_int(speed, LINE_FORWARD_CRAWL);
-    }
-    if (observation->valid_rows < LINE_MIN_VALID_ROWS + 2) {
-        speed = min_int(speed, LINE_FORWARD_MEDIUM);
-    }
-    if (s_alert_until_us != 0 && now < s_alert_until_us) {
-        speed = min_int(speed, LINE_FORWARD_SLOW);
-    }
-    return speed;
+    const line_control_cfg_t cfg = {
+        LINE_PID_KH, LINE_PID_KP_LAT, LINE_PID_SCALE, LINE_TURN_MAX,
+        LINE_YAW_MIN_OUTPUT, LINE_LAT_MAX, LINE_LAT_MIN_OUTPUT,
+        LINE_HEADING_DEADBAND, LINE_ERROR_DEADBAND, LINE_ERROR_MEDIUM,
+        LINE_ERROR_LARGE, LINE_HEADING_SLOW, LINE_FAR_SLOW,
+        LINE_FORWARD_FAST, LINE_FORWARD_MEDIUM, LINE_FORWARD_SLOW,
+        LINE_FORWARD_CRAWL, LINE_MIN_VALID_ROWS,
+    };
+    return cfg;
 }
 
 /* forward 单独限速率，避免速度档位在门限附近来回跳造成推力抖动。 */
 static void drive_normal(const line_observation_t *observation, int64_t now)
 {
-    const int target = forward_speed(observation, now);
+    const line_control_cfg_t cfg = control_cfg();
+    const bool alert = s_alert_until_us != 0 && now < s_alert_until_us;
+    const int target = line_control_speed(&cfg, observation, alert);
     const int delta = target - s_forward_output;
     if (delta > LINE_FORWARD_SLEW) {
         s_forward_output += LINE_FORWARD_SLEW;
@@ -590,9 +525,10 @@ static void drive_normal(const line_observation_t *observation, int64_t now)
     } else {
         s_forward_output = target;
     }
-    s_turn_output = yaw_command(observation->heading_error);
+    s_turn_output = line_control_yaw(&cfg, observation->heading_error,
+                                     &s_yaw_accum);
     drive(s_forward_output, s_turn_output,
-          strafe_command(observation->lateral_error));
+          line_control_strafe(&cfg, observation->lateral_error, &s_lat_accum));
 }
 
 static void update_seed(const line_observation_t *observation)
@@ -882,7 +818,10 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             }
             if (near_last_seed) {
                 /* 已经看见线但还没确认：用横移把它拉回中间，不要转车身。 */
-                const int correction = direction_of(observation.seed_x - s_seed_x);
+                /* seed_x 是原始图像坐标，控制量要按镜像设置翻一次。 */
+                const int mirror = CAMERA_LINE_MIRROR_X ? -1 : 1;
+                const int correction =
+                    mirror * direction_of(observation.seed_x - s_seed_x);
                 drive(LINE_FORWARD_CRAWL, 0, correction * LINE_LAT_MIN_OUTPUT);
             } else {
                 drive(LINE_FORWARD_CRAWL, 0, 0);
