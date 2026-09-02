@@ -103,6 +103,10 @@
 #define LINE_CAM_PIVOT_PERCENT 50
 #define LINE_ALERT_MS 900U
 
+/* 扫描几何按这个解码尺寸调过；协商到别的分辨率时绝对像素量的含义会变。 */
+#define LINE_EXPECTED_WIDTH 240
+#define LINE_EXPECTED_HEIGHT 160
+
 /* 起转下限、启动冲量和方向符号全部复用 car-spin 的实车校准值。红外巡线
  * 工程是在同一台三轮全向车上测过的，这里不要再自行下调：B 轮实测起转
  * 需要 13，低于该值它完全不转，而卡死的后轮会把旋转中心从几何中心挪到
@@ -201,6 +205,7 @@ static uint32_t s_summary_callback_dropped_frames;
 
 static SemaphoreHandle_t s_control_mutex;
 static bool s_watchdog_created;
+static bool s_logged_frame_size;
 
 static void camera_line_follow_watchdog_task(void *arg);
 
@@ -706,6 +711,20 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     }
     if (s_first_frame_us == 0) {
         s_first_frame_us = now;
+    }
+    if (!s_logged_frame_size) {
+        s_logged_frame_size = true;
+        if (width != LINE_EXPECTED_WIDTH || height != LINE_EXPECTED_HEIGHT) {
+            ESP_LOGW(TAG,
+                     "decoded frame is %ux%u but the scan geometry was tuned for "
+                     "%dx%d; row step, minimum segment width and window limits "
+                     "are absolute pixels",
+                     (unsigned)width, (unsigned)height,
+                     LINE_EXPECTED_WIDTH, LINE_EXPECTED_HEIGHT);
+        } else {
+            ESP_LOGI(TAG, "decoded frame %ux%u matches the tuned scan geometry",
+                     (unsigned)width, (unsigned)height);
+        }
     }
 
     line_observation_t observation = {0};
