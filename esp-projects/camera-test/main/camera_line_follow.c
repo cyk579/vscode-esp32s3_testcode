@@ -39,12 +39,7 @@
 #define LINE_CORNER_WINDOW_START_PERCENT 28
 #define LINE_CORNER_WINDOW_GROW_PERCENT 4
 #define LINE_CORNER_WINDOW_MAX_PERCENT 46
-#define LINE_CORNER_PREDICT_STEP_PERCENT 4
-#define LINE_BRANCH_CONFIRM_FRAMES 3U
-#define LINE_PENDING_MISS_CONFIRM_FRAMES 2U
 #define LINE_REACQUIRE_CONFIRM_FRAMES 2U
-#define LINE_CORNER_EXIT_CONFIRM_FRAMES 3U
-#define LINE_CORNER_MIN_SHIFT_PERCENT 8
 
 /* 彩色干扰守卫：赛道板上的深色红球亮度会落进黑线阈值区间，但通道差很大。
  * 真机采帧确认需要之后再开启，默认关闭以免引入未验证的过滤。 */
@@ -61,26 +56,52 @@
 #define LINE_LOST_HOLD_MS 300U
 #define LINE_LOST_STOP_MS 900U
 #define LINE_FRAME_TIMEOUT_MS 1200U
-#define LINE_CORNER_TIMEOUT_MS 3000U
 #define LINE_FINISH_CONFIRM_FRAMES 5U
+/* 终点 T 停车。调巡线时可以临时置 0，避免把"误停"当成"丢线"。 */
+#define LINE_FINISH_ENABLE 1
 
-#define LINE_FORWARD_FAST 30
+/* 速度四档现在互不相同（原来 MEDIUM 和 SLOW 都是 22，等于少一档）。 */
+#define LINE_FORWARD_FAST 26
 #define LINE_FORWARD_MEDIUM 22
-#define LINE_FORWARD_SLOW 22
-#define LINE_FORWARD_CRAWL 17
-#define LINE_TURN_MAX 19
-#define LINE_PID_TURN_MAX 10
-#define LINE_ERROR_DEADBAND 18
-#define LINE_ERROR_MEDIUM 35
-#define LINE_ERROR_LARGE 60
-#define LINE_PID_KP 12
-#define LINE_PID_KH 8
-#define LINE_PID_KD 4
+#define LINE_FORWARD_SLOW 18
+#define LINE_FORWARD_CRAWL 15
+#define LINE_FORWARD_SLEW 4
+
+/* 误差门限。|error| 被 ROI 夹在 55 以内（center 只能落在 48..191），所以
+ * 原来的 LINE_ERROR_LARGE=60 在 NORMAL 里永远不可达，CRAWL 那一档是死的。 */
+#define LINE_ERROR_DEADBAND 8
+#define LINE_ERROR_MEDIUM 25
+#define LINE_ERROR_LARGE 45
+#define LINE_HEADING_SLOW 12
+#define LINE_FAR_SLOW 35
+
+/* 偏航只做粗对正，横移做精修。两个增益都要等实测速度标定。
+ * TODO(实测): KP_LAT 按"1 单位 lat 对应多少 cm/s 侧移"标定；
+ * TODO(实测): KH 按"1 单位 heading 对应多少度"标定。 */
+#define LINE_PID_KP_LAT 45
+#define LINE_PID_KH 130
 #define LINE_PID_SCALE 100
-#define LINE_PID_SLEW_PER_FRAME 2
-#define LINE_PID_OUTPUT_DEADBAND 1
-#define LINE_ERROR_FILTER_OLD 3
-#define LINE_ERROR_FILTER_NEW 1
+#define LINE_TURN_MAX 19
+#define LINE_YAW_MIN_OUTPUT 13
+#define LINE_LAT_MAX 16
+#define LINE_LAT_MIN_OUTPUT 11
+#define LINE_SEED_SLEW_PX 12
+
+/* 折角：事件行落到画面下方 80% 以内才动手，之前只降速。 */
+#define LINE_TURN_TRIGGER_PERCENT 80
+#define LINE_TURN_HINT_FRAMES 2U
+#define LINE_TURN_EXIT_FRAMES 2U
+/* 旋转至少持续这么久才接受退出，否则第一帧还在看入弯前那条线就会假退出，
+ * 然后立刻又检测到同一个折角，来回抖。 */
+#define LINE_TURN_MIN_MS 250U
+#define LINE_TURN_EXIT_ERROR 30
+#define LINE_TURN_TIMEOUT_MS 2500U
+/* 绕摄像头旋转：lat = turn * a/(2L)。偏航量必须够大，否则 a/d = lat - turn
+ * 落在起转值以下会被混控丢掉，只剩后轮在推。
+ * TODO(实测): LINE_CAM_PIVOT_PERCENT 用尺子量 a 和 L 后填 a*100/(2L)。 */
+#define LINE_PIVOT_TURN 26
+#define LINE_CAM_PIVOT_PERCENT 50
+#define LINE_ALERT_MS 900U
 
 /* 起转下限、启动冲量和方向符号全部复用 car-spin 的实车校准值。红外巡线
  * 工程是在同一台三轮全向车上测过的，这里不要再自行下调：B 轮实测起转
@@ -115,8 +136,9 @@ typedef struct {
 
 typedef enum {
     LINE_STATE_NORMAL = 0,
-    LINE_STATE_CORNER,
+    LINE_STATE_TURN,
     LINE_STATE_LOST,
+    LINE_STATE_FINISH,
 } line_state_t;
 
 static const char *TAG = "camera_line";
@@ -149,21 +171,16 @@ static int s_last_threshold;
 static bool s_last_candidate;
 static int s_last_seed_x;
 
-static bool s_error_filter_initialized;
-static int s_tracking_error;
-static int s_previous_tracking_error;
-static int s_pid_output;
+static int s_lat_accum;
+static int s_forward_output;
+static int s_turn_output;
 
-static int s_pending_turn;
-static int s_pending_seed_x;
-static uint8_t s_pending_miss_frames;
-static int s_hint_direction;
-static uint8_t s_hint_frames;
-static uint8_t s_corner_frames;
-static uint8_t s_corner_exit_frames;
-static int s_corner_origin_x;
-static int s_corner_predicted_x;
-static int64_t s_corner_started_us;
+static int s_turn_direction;
+static uint8_t s_turn_hint_frames;
+static uint8_t s_turn_exit_frames;
+static uint32_t s_turn_frames;
+static int64_t s_turn_started_us;
+static int64_t s_alert_until_us;
 static int s_reacquire_x;
 
 static int s_command_a;
@@ -284,9 +301,9 @@ static void render_tracking_overlay(uint8_t *frame,
 
 static int state_search_half_percent(void)
 {
-    if (s_state == LINE_STATE_CORNER) {
-        int percent = LINE_CORNER_WINDOW_START_PERCENT +
-                      (int)s_corner_frames * LINE_CORNER_WINDOW_GROW_PERCENT;
+    if (s_state == LINE_STATE_TURN) {
+        const int percent = LINE_CORNER_WINDOW_START_PERCENT +
+                            (int)s_turn_frames * LINE_CORNER_WINDOW_GROW_PERCENT;
         return percent > LINE_CORNER_WINDOW_MAX_PERCENT ?
                LINE_CORNER_WINDOW_MAX_PERCENT : percent;
     }
@@ -303,7 +320,6 @@ static bool observe_line(uint8_t *frame,
                          uint16_t width,
                          uint16_t height,
                          uint8_t source_threshold,
-                         bool remembered_corridor,
                          bool draw_overlay,
                          line_observation_t *observation)
 {
@@ -323,30 +339,17 @@ static bool observe_line(uint8_t *frame,
     cfg.width = width;
     cfg.height = height;
     cfg.threshold = source_threshold;
-    cfg.use_history = s_seed_valid;
-    cfg.seed_x = s_seed_x;
+    /* 折角旋转时不要用旧种子：新赛道会从侧面转到中间来，应该在整条 ROI 底部
+     * 重新找最靠中心的黑线，而不是围着入弯前的位置猜。 */
+    cfg.use_history = s_seed_valid && s_state != LINE_STATE_TURN;
+    cfg.seed_x = s_state == LINE_STATE_TURN ? (int)width / 2 : s_seed_x;
     cfg.search_half_percent = state_search_half_percent();
     cfg.expected_width = s_line_width;
     cfg.mirror_x = CAMERA_LINE_MIRROR_X ? true : false;
     cfg.saturation_guard = LINE_SATURATION_GUARD ? true : false;
     cfg.saturation_max = LINE_SATURATION_MAX;
-    cfg.corridor_x = remembered_corridor && s_pending_turn != 0 ?
-                     s_pending_seed_x : -1;
-    cfg.corridor_half = positive_percent((int)width, LINE_SEARCH_HALF_PERCENT,
-                                         LINE_SEARCH_HALF_MIN);
-
-    if (s_state == LINE_STATE_CORNER && s_pending_turn != 0) {
-        const int step = positive_percent((int)width,
-                                          LINE_CORNER_PREDICT_STEP_PERCENT, 2);
-        const int predicted = s_corner_origin_x +
-                              s_pending_turn * step * (int)s_corner_frames;
-        s_corner_predicted_x = clamp_range(predicted, 0, (int)width - 1);
-        cfg.seed_x = s_corner_predicted_x;
-        cfg.corridor_x = s_corner_predicted_x;
-        cfg.corridor_half = positive_percent((int)width,
-                                             LINE_CORNER_WINDOW_START_PERCENT,
-                                             LINE_SEARCH_HALF_MIN);
-    }
+    cfg.corridor_x = -1;
+    cfg.corridor_half = 0;
 
     const bool candidate = line_geometry_track(frame, &cfg, observation);
     observation->threshold = source_threshold;
@@ -461,92 +464,130 @@ static void drive(int forward, int turn, int lat)
     motor_set(&motor_d, s_command_d);
 }
 
-static void reset_pd(void)
+static void reset_control(void)
 {
-    s_tracking_error = 0;
-    s_previous_tracking_error = 0;
-    s_error_filter_initialized = false;
-    s_pid_output = 0;
-}
-
-static void clear_turn_plan(void)
-{
-    s_pending_turn = 0;
-    s_pending_seed_x = 0;
-    s_pending_miss_frames = 0;
-    s_hint_direction = 0;
-    s_hint_frames = 0;
-    s_corner_frames = 0;
-    s_corner_exit_frames = 0;
-    s_corner_origin_x = 0;
-    s_corner_predicted_x = 0;
-    s_corner_started_us = 0;
+    s_lat_accum = 0;
+    s_forward_output = 0;
+    s_turn_output = 0;
 }
 
 static void reset_tracking(void)
 {
-    reset_pd();
-    clear_turn_plan();
+    reset_control();
     s_seed_valid = false;
     s_seed_x = 0;
     s_line_width = 0;
     s_lost_frames = 0;
     s_reacquire_frames = 0;
     s_reacquire_x = 0;
+    s_turn_direction = 0;
+    s_turn_hint_frames = 0;
+    s_turn_exit_frames = 0;
+    s_turn_started_us = 0;
+    s_alert_until_us = 0;
+    s_finish_frames = 0;
     s_state = LINE_STATE_NORMAL;
 }
 
-static int pd_steering(int lateral_error, int heading_error)
+/*
+ * 偏航通道：只做粗对正。
+ *
+ * B 轮实测起转值 13，而 kiwi 混控下后轮只承担 turn，所以偏航指令要么是 0，
+ * 要么必须大到让 B 真的转起来 —— 小幅偏航在这台车上物理上不存在。因此这里
+ * 是一个带死区的粗环，位置精修交给横移通道。赛道全部由直线段和折角组成，
+ * 直线段上把车身姿态保持在十几度以内就足够了。
+ */
+static int yaw_command(int heading_error)
 {
-    if (!s_error_filter_initialized) {
-        s_tracking_error = lateral_error;
-        s_previous_tracking_error = lateral_error;
-        s_error_filter_initialized = true;
-    } else {
-        s_tracking_error = (s_tracking_error * LINE_ERROR_FILTER_OLD +
-                            lateral_error * LINE_ERROR_FILTER_NEW) /
-                           (LINE_ERROR_FILTER_OLD + LINE_ERROR_FILTER_NEW);
-    }
-
-    const int delta_lateral_error = s_tracking_error - s_previous_tracking_error;
-    s_previous_tracking_error = s_tracking_error;
-    if (abs(s_tracking_error) <= LINE_ERROR_DEADBAND &&
-        abs(heading_error) <= LINE_ERROR_DEADBAND) {
-        s_pid_output = 0;
+    int target = LINE_PID_KH * heading_error / LINE_PID_SCALE;
+    target = clamp_int(target, LINE_TURN_MAX);
+    if (abs(target) < LINE_YAW_MIN_OUTPUT) {
         return 0;
     }
-
-    /* 只保留整数 P、heading 前馈和 D；没有积分状态。 */
-    int target = (LINE_PID_KP * s_tracking_error -
-                  LINE_PID_KH * heading_error -
-                  LINE_PID_KD * delta_lateral_error) / LINE_PID_SCALE;
-    target = clamp_int(target, LINE_PID_TURN_MAX);
-    const int delta = target - s_pid_output;
-    if (delta > LINE_PID_SLEW_PER_FRAME) {
-        target = s_pid_output + LINE_PID_SLEW_PER_FRAME;
-    } else if (delta < -LINE_PID_SLEW_PER_FRAME) {
-        target = s_pid_output - LINE_PID_SLEW_PER_FRAME;
-    }
-    s_pid_output = target;
-    if (abs(s_pid_output) <= LINE_PID_OUTPUT_DEADBAND) {
-        s_pid_output = 0;
-    }
-    return s_pid_output;
+    return target;
 }
 
-static int forward_speed(int lateral_error)
+/*
+ * 横移通道：一阶纠偏，外加时间抖动。
+ *
+ * 纯横移要求 |lat| >= 11（A/D 也各承担一份 lat，低于起转值会被混控丢弃），
+ * 所以小幅横移只能靠"攒够了发一个整脉冲"。15 FPS 下这是几 Hz 的脉冲串，
+ * 车体本身把它积分掉，等效平均值就是需求值。
+ */
+static int strafe_command(int lateral_error)
 {
-    const int magnitude = abs(lateral_error);
+    int demand = LINE_PID_KP_LAT * lateral_error / LINE_PID_SCALE;
+    demand = clamp_int(demand, LINE_LAT_MAX);
+    if (abs(lateral_error) <= LINE_ERROR_DEADBAND) {
+        demand = 0;
+    }
+    if (demand == 0) {
+        s_lat_accum = 0;
+        return 0;
+    }
+    if (abs(demand) >= LINE_LAT_MIN_OUTPUT) {
+        s_lat_accum = 0;
+        return demand;
+    }
+    s_lat_accum += demand;
+    if (abs(s_lat_accum) >= LINE_LAT_MIN_OUTPUT) {
+        const int pulse = s_lat_accum > 0 ? LINE_LAT_MIN_OUTPUT : -LINE_LAT_MIN_OUTPUT;
+        s_lat_accum -= pulse;
+        return pulse;
+    }
+    return 0;
+}
+
+static int min_int(int a, int b)
+{
+    return a < b ? a : b;
+}
+
+/* 速度取所有限制里最小的一个。远端只在这里起作用，绝不参与转向。 */
+static int forward_speed(const line_observation_t *observation, int64_t now)
+{
+    int speed = LINE_FORWARD_FAST;
+    const int magnitude = abs(observation->lateral_error);
     if (magnitude >= LINE_ERROR_LARGE) {
-        return LINE_FORWARD_CRAWL;
+        speed = min_int(speed, LINE_FORWARD_CRAWL);
+    } else if (magnitude >= LINE_ERROR_MEDIUM) {
+        speed = min_int(speed, LINE_FORWARD_SLOW);
+    } else if (magnitude > LINE_ERROR_DEADBAND) {
+        speed = min_int(speed, LINE_FORWARD_MEDIUM);
     }
-    if (magnitude >= LINE_ERROR_MEDIUM) {
-        return LINE_FORWARD_SLOW;
+    if (abs(observation->heading_error) >= LINE_HEADING_SLOW) {
+        speed = min_int(speed, LINE_FORWARD_SLOW);
     }
-    if (magnitude > LINE_ERROR_DEADBAND) {
-        return LINE_FORWARD_MEDIUM;
+    if (abs(observation->far_error) >= LINE_FAR_SLOW) {
+        speed = min_int(speed, LINE_FORWARD_SLOW);
     }
-    return LINE_FORWARD_FAST;
+    if (observation->corner_direction != 0 || observation->finish_candidate) {
+        speed = min_int(speed, LINE_FORWARD_CRAWL);
+    }
+    if (observation->valid_rows < LINE_MIN_VALID_ROWS + 2) {
+        speed = min_int(speed, LINE_FORWARD_MEDIUM);
+    }
+    if (s_alert_until_us != 0 && now < s_alert_until_us) {
+        speed = min_int(speed, LINE_FORWARD_SLOW);
+    }
+    return speed;
+}
+
+/* forward 单独限速率，避免速度档位在门限附近来回跳造成推力抖动。 */
+static void drive_normal(const line_observation_t *observation, int64_t now)
+{
+    const int target = forward_speed(observation, now);
+    const int delta = target - s_forward_output;
+    if (delta > LINE_FORWARD_SLEW) {
+        s_forward_output += LINE_FORWARD_SLEW;
+    } else if (delta < -LINE_FORWARD_SLEW) {
+        s_forward_output -= LINE_FORWARD_SLEW;
+    } else {
+        s_forward_output = target;
+    }
+    s_turn_output = yaw_command(observation->heading_error);
+    drive(s_forward_output, s_turn_output,
+          strafe_command(observation->lateral_error));
 }
 
 static void update_seed(const line_observation_t *observation)
@@ -554,7 +595,14 @@ static void update_seed(const line_observation_t *observation)
     if (observation == NULL || !observation->candidate) {
         return;
     }
-    s_seed_x = observation->seed_x;
+    /* 种子只做速率限制，不做低通：低通会让搜索窗口系统性滞后于真实线。 */
+    if (!s_seed_valid) {
+        s_seed_x = observation->seed_x;
+    } else {
+        const int delta = clamp_int(observation->seed_x - s_seed_x,
+                                    LINE_SEED_SLEW_PX);
+        s_seed_x += delta;
+    }
     s_seed_valid = true;
     if (observation->near_width > 0) {
         s_line_width = s_line_width == 0 ? observation->near_width :
@@ -564,43 +612,15 @@ static void update_seed(const line_observation_t *observation)
     }
 }
 
-static void update_turn_memory(const line_observation_t *observation)
-{
-    if (observation == NULL || !observation->candidate ||
-        observation->corner_direction == 0 || s_pending_turn != 0 ||
-        s_state != LINE_STATE_NORMAL) {
-        if (s_pending_turn == 0) {
-            s_hint_direction = 0;
-            s_hint_frames = 0;
-        }
-        return;
-    }
-
-    const int direction = observation->corner_direction;
-    if (direction != s_hint_direction) {
-        s_hint_direction = direction;
-        s_hint_frames = 1;
-    } else if (s_hint_frames < LINE_BRANCH_CONFIRM_FRAMES) {
-        ++s_hint_frames;
-    }
-
-    if (s_hint_frames >= LINE_BRANCH_CONFIRM_FRAMES) {
-        s_pending_turn = direction;
-        s_pending_seed_x = observation->seed_x;
-        s_hint_direction = 0;
-        s_hint_frames = 0;
-        ESP_LOGI(TAG, "pending_turn=%d; continue on the old line until it disappears",
-                 s_pending_turn);
-    }
-}
-
 static const char *state_name(void)
 {
     switch (s_state) {
-    case LINE_STATE_CORNER:
-        return "CORNER";
+    case LINE_STATE_TURN:
+        return "TURN";
     case LINE_STATE_LOST:
         return "LOST";
+    case LINE_STATE_FINISH:
+        return "FINISH";
     case LINE_STATE_NORMAL:
     default:
         return "NORMAL";
@@ -644,7 +664,7 @@ static void maybe_log_summary(int64_t now)
              s_armed, s_last_candidate, (unsigned)s_arm_frames,
              s_last_threshold, s_last_seed_x, s_line_width,
              (unsigned)s_last_valid_rows, (unsigned)s_last_confidence,
-             s_last_lateral_error, s_last_heading_error, s_pending_turn,
+             s_last_lateral_error, s_last_heading_error, s_turn_direction,
              s_stby_enabled,
              s_command_a, s_command_b, s_command_d);
 
@@ -689,17 +709,14 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     }
 
     line_observation_t observation = {0};
-    if (s_state == LINE_STATE_CORNER && s_corner_frames < UINT8_MAX) {
-        ++s_corner_frames;
+    if (s_state == LINE_STATE_TURN && s_turn_frames < UINT32_MAX) {
+        ++s_turn_frames;
     }
     if (s_state == LINE_STATE_LOST && s_lost_frames < UINT32_MAX) {
         ++s_lost_frames;
     }
-    const bool remembered_corridor = s_pending_turn != 0 &&
-                                     s_state != LINE_STATE_CORNER;
     const bool candidate = observe_line(rgb565_big_endian, width, height,
-                                        source_threshold, remembered_corridor,
-                                        draw_overlay,
+                                        source_threshold, draw_overlay,
                                         &observation);
     s_last_threshold = observation.threshold;
     s_last_candidate = candidate;
@@ -719,7 +736,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             if (s_arm_frames >= LINE_ARM_CONFIRM_FRAMES) {
                 s_armed = true;
                 s_state = LINE_STATE_NORMAL;
-                reset_pd();
+                reset_control();
                 update_seed(&observation);
                 s_last_line_us = now;
                 s_motor_start_us = now;
@@ -738,110 +755,87 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         goto done;
     }
 
-    if (observation.finish_candidate && candidate) {
+    /* ---- 终点 T：双侧敞开的横杆 + 下方仍有立柱 ---- */
+    if (!observation.finish_candidate) {
+        s_finish_frames = 0;
+    } else if (LINE_FINISH_ENABLE && candidate && s_state == LINE_STATE_NORMAL) {
         if (s_finish_frames < LINE_FINISH_CONFIRM_FRAMES) {
             ++s_finish_frames;
         }
         if (s_finish_frames >= LINE_FINISH_CONFIRM_FRAMES) {
             s_finished = true;
+            s_state = LINE_STATE_FINISH;
             stop_motors();
-            ESP_LOGW(TAG, "finish bar confirmed; motors stopped");
+            ESP_LOGW(TAG, "finish T confirmed at row %d; motors stopped",
+                     observation.corner_row_y);
             goto done;
         }
-    } else {
-        s_finish_frames = 0;
-    }
-
-    if (s_state == LINE_STATE_CORNER) {
-        bool new_line_candidate = candidate;
-        if (new_line_candidate && s_pending_turn != 0) {
-            const int displacement = observation.seed_x - s_corner_origin_x;
-            const int minimum_shift = positive_percent((int)width,
-                                                       LINE_CORNER_MIN_SHIFT_PERCENT,
-                                                       LINE_SEARCH_HALF_MIN);
-            const int prediction_window = positive_percent((int)width,
-                                                            LINE_CORNER_WINDOW_START_PERCENT,
-                                                            LINE_SEARCH_HALF_MIN);
-            /* Do not count the old seed as a CORNER exit.  The bottom seed
-             * must move in the remembered direction and stay near prediction. */
-            if (direction_of(displacement) != s_pending_turn ||
-                abs(displacement) < minimum_shift ||
-                abs(observation.seed_x - s_corner_predicted_x) > prediction_window) {
-                new_line_candidate = false;
-            }
-        }
-        if (new_line_candidate) {
-            if (s_corner_exit_frames < LINE_CORNER_EXIT_CONFIRM_FRAMES) {
-                ++s_corner_exit_frames;
-            }
-        } else {
-            s_corner_exit_frames = 0;
-        }
-        if (s_corner_exit_frames >= LINE_CORNER_EXIT_CONFIRM_FRAMES) {
-            s_state = LINE_STATE_NORMAL;
-            update_seed(&observation);
-            clear_turn_plan();
-            reset_pd();
-            s_last_line_us = now;
-            const int turn = pd_steering(observation.lateral_error,
-                                         observation.heading_error);
-            drive(forward_speed(observation.lateral_error), turn, 0);
-            goto done;
-        }
-        if (s_corner_started_us != 0 &&
-            now - s_corner_started_us > (int64_t)LINE_CORNER_TIMEOUT_MS * 1000) {
-            disarm_tracking();
-            ESP_LOGW(TAG, "corner timed out; motors stopped and line confirmation reset");
-            goto done;
-        }
-        drive(LINE_FORWARD_CRAWL, -s_pending_turn * LINE_TURN_MAX, 0);
+        /* 确认期间继续爬行，让车停在横杆上而不是提前刹住。 */
+        drive(LINE_FORWARD_CRAWL, 0, 0);
         goto done;
     }
 
-    if (s_pending_turn != 0) {
-        if (candidate && observation.near_line_visible) {
+    /* ---- 折角：绕摄像头原地旋转，用近场闭环退出 ---- */
+    if (s_state == LINE_STATE_TURN) {
+        const bool settled = s_turn_started_us != 0 &&
+                             now - s_turn_started_us >=
+                                 (int64_t)LINE_TURN_MIN_MS * 1000;
+        const bool aligned = settled && candidate && observation.near_line_visible &&
+                             observation.corner_direction == 0 &&
+                             abs(observation.lateral_error) <= LINE_TURN_EXIT_ERROR;
+        if (aligned) {
+            if (s_turn_exit_frames < LINE_TURN_EXIT_FRAMES) {
+                ++s_turn_exit_frames;
+            }
+        } else {
+            s_turn_exit_frames = 0;
+        }
+        if (s_turn_exit_frames >= LINE_TURN_EXIT_FRAMES) {
             s_state = LINE_STATE_NORMAL;
-            s_pending_miss_frames = 0;
+            s_turn_direction = 0;
+            s_turn_frames = 0;
+            s_turn_exit_frames = 0;
+            s_turn_started_us = 0;
+            /* 出弯后一段时间内限速：赛道右上角两个直角弯之间只有 10 cm。 */
+            s_alert_until_us = now + (int64_t)LINE_ALERT_MS * 1000;
             s_lost_frames = 0;
             s_reacquire_frames = 0;
             s_last_line_us = now;
             update_seed(&observation);
-            const int turn = pd_steering(observation.lateral_error,
-                                         observation.heading_error);
-            drive(forward_speed(observation.lateral_error), turn, 0);
+            reset_control();
+            ESP_LOGI(TAG, "turn complete; back to NORMAL at ey=%d",
+                     observation.lateral_error);
+            drive_normal(&observation, now);
             goto done;
         }
-
-        /* 旧直线消失需连续确认，避免一帧曝光抖动提前拐。 */
-        if (s_pending_miss_frames < LINE_PENDING_MISS_CONFIRM_FRAMES) {
-            ++s_pending_miss_frames;
-        }
-        if (s_pending_miss_frames < LINE_PENDING_MISS_CONFIRM_FRAMES) {
-            drive(LINE_FORWARD_CRAWL, 0, 0);
+        if (s_turn_started_us != 0 &&
+            now - s_turn_started_us > (int64_t)LINE_TURN_TIMEOUT_MS * 1000) {
+            s_state = LINE_STATE_LOST;
+            s_lost_frames = 1;
+            s_turn_direction = 0;
+            s_turn_started_us = 0;
+            s_reacquire_frames = 0;
+            s_reacquire_x = s_seed_x;
+            zero_motor_outputs();
+            ESP_LOGW(TAG, "turn timed out without reacquiring the line");
             goto done;
         }
-
-        /* 旧直线已不在保存的局部走廊内，现在才进入统一 CORNER。 */
-        s_state = LINE_STATE_CORNER;
-        s_corner_started_us = now;
-        s_corner_frames = 0;
-        s_corner_exit_frames = 0;
-        s_corner_origin_x = s_pending_seed_x;
-        s_corner_predicted_x = s_pending_seed_x;
-        reset_pd();
-        drive(LINE_FORWARD_CRAWL, -s_pending_turn * LINE_TURN_MAX, 0);
+        /* 摄像头在旋转中心前方 a 处，纯原地旋转会让它横扫 a*theta 而丢线。
+         * 叠加 lat = turn * a/(2L) 就变成绕镜头旋转，全程保住近场视野。 */
+        {
+            const int turn = -s_turn_direction * LINE_PIVOT_TURN;
+            drive(0, turn, turn * LINE_CAM_PIVOT_PERCENT / 100);
+        }
         goto done;
     }
 
+    /* ---- LOST：只在最后可信种子附近重捕获 ---- */
     if (s_state == LINE_STATE_LOST) {
         const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
         if (candidate) {
             const int confirm_window = positive_percent((int)width,
                                                         LINE_SEARCH_HALF_PERCENT,
                                                         LINE_SEARCH_HALF_MIN);
-            /* A LOST candidate must first remain close to the last trusted
-             * seed.  The expanding window is for small real motion, not for
-             * jumping across the image onto a chair leg or other dark object. */
             const bool near_last_seed =
                 abs(observation.seed_x - s_seed_x) <= confirm_window;
             if (!near_last_seed) {
@@ -863,21 +857,18 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 s_reacquire_frames = 0;
                 update_seed(&observation);
                 s_last_line_us = now;
-                reset_pd();
-                update_turn_memory(&observation);
-                const int turn = pd_steering(observation.lateral_error,
-                                             observation.heading_error);
-                drive(forward_speed(observation.lateral_error), turn, 0);
+                reset_control();
+                drive_normal(&observation, now);
                 goto done;
             }
             if (near_last_seed) {
+                /* 已经看见线但还没确认：用横移把它拉回中间，不要转车身。 */
                 const int correction = direction_of(observation.seed_x - s_seed_x);
-                drive(LINE_FORWARD_CRAWL, -correction * 4, 0);
+                drive(LINE_FORWARD_CRAWL, 0, correction * LINE_LAT_MIN_OUTPUT);
             } else {
                 drive(LINE_FORWARD_CRAWL, 0, 0);
             }
         } else {
-            /* 候选线必须在相邻帧连续出现，任何空帧都重新开始确认。 */
             s_reacquire_frames = 0;
             s_reacquire_x = s_seed_x;
             if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
@@ -892,16 +883,45 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         goto done;
     }
 
+    /* ---- NORMAL ---- */
     if (candidate) {
         s_state = LINE_STATE_NORMAL;
         s_lost_frames = 0;
         s_reacquire_frames = 0;
         s_last_line_us = now;
-        update_turn_memory(&observation);
         update_seed(&observation);
-        const int turn = pd_steering(observation.lateral_error,
-                                     observation.heading_error);
-        drive(forward_speed(observation.lateral_error), turn, 0);
+
+        /* 近场折角事件才动手；远处的同一个事件只在 forward_speed 里降速。 */
+        const int trigger_y = (int)height * LINE_TURN_TRIGGER_PERCENT / 100;
+        if (observation.corner_direction != 0 &&
+            observation.corner_row_y >= trigger_y) {
+            if (observation.corner_direction == s_turn_direction) {
+                if (s_turn_hint_frames < LINE_TURN_HINT_FRAMES) {
+                    ++s_turn_hint_frames;
+                }
+            } else {
+                s_turn_direction = observation.corner_direction;
+                s_turn_hint_frames = 1;
+            }
+            if (s_turn_hint_frames >= LINE_TURN_HINT_FRAMES) {
+                s_state = LINE_STATE_TURN;
+                s_turn_frames = 0;
+                s_turn_exit_frames = 0;
+                s_turn_hint_frames = 0;
+                s_turn_started_us = now;
+                reset_control();
+                ESP_LOGI(TAG, "corner %s at row %d; pivoting about the camera",
+                         s_turn_direction < 0 ? "left" : "right",
+                         observation.corner_row_y);
+                const int turn = -s_turn_direction * LINE_PIVOT_TURN;
+                drive(0, turn, turn * LINE_CAM_PIVOT_PERCENT / 100);
+                goto done;
+            }
+        } else {
+            s_turn_hint_frames = 0;
+            s_turn_direction = 0;
+        }
+        drive_normal(&observation, now);
         goto done;
     }
 
@@ -909,14 +929,16 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     s_lost_frames = 1;
     s_reacquire_frames = 0;
     s_reacquire_x = s_seed_x;
-    reset_pd();
-    const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
-    if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
-        drive(LINE_FORWARD_CRAWL, 0, 0);
-    } else {
-        zero_motor_outputs();
-        if (lost_us >= (int64_t)LINE_LOST_STOP_MS * 1000) {
-            disarm_tracking();
+    reset_control();
+    {
+        const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
+        if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
+            drive(LINE_FORWARD_CRAWL, 0, 0);
+        } else {
+            zero_motor_outputs();
+            if (lost_us >= (int64_t)LINE_LOST_STOP_MS * 1000) {
+                disarm_tracking();
+            }
         }
     }
 

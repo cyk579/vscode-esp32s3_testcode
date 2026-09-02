@@ -301,6 +301,44 @@ static void scenario_mixer(void)
           "scaling introduced sideways motion");
 }
 
+/* 绕摄像头旋转的指令必须让三个轮子都过起转值，而且实际比例要对得上：
+ * f≈0、lat/turn ≈ a/(2L)。turn 给小了 a/d = lat - turn 会掉到起转值以下，
+ * 只剩后轮在推，车就变成绕后轮甩而不是绕镜头转。 */
+static void scenario_pivot(void)
+{
+    const line_mixer_cfg_t cfg = mixer_cfg();
+    static const int pivots[] = {26, -26};
+
+    for (size_t i = 0; i < sizeof(pivots) / sizeof(pivots[0]); ++i) {
+        const int turn = pivots[i];
+        const int lat = turn * 50 / 100;
+        char name[24];
+        line_mixer_out_t out = {0, 0, 0, false, false};
+        int rf = 0, rt = 0, rl = 0;
+        snprintf(name, sizeof(name), "pivot(%d)", turn);
+        line_mixer_solve(0, turn, lat, &cfg, &out);
+        line_mixer_body(out.a, out.b, out.d, &rf, &rt, &rl);
+        printf("  %-16s a=%4d b=%4d d=%4d  scaled=%d -> (%d,%d,%d)\n",
+               name, out.a, out.b, out.d, out.scaled, rf, rt, rl);
+        check(name, "all wheels drive",
+              out.a != 0 && out.b != 0 && out.d != 0,
+              "a pivot command left a wheel below its stiction floor");
+        check(name, "no net forward", abs(rf) <= 1, "pivot should not translate");
+        check(name, "turn keeps sign", (rt > 0) == (turn > 0),
+              "pivot rotation flipped direction");
+        check(name, "lat tracks turn", rt != 0 && abs(rl * 100 / rt - 50) <= 15,
+              "camera-pivot strafe ratio lost");
+    }
+
+    /* 偏航给小了就会退化成"只有后轮在推"。 */
+    line_mixer_out_t weak = {0, 0, 0, false, false};
+    line_mixer_solve(0, 19, 9, &cfg, &weak);
+    printf("  %-16s a=%4d b=%4d d=%4d  (weak pivot degenerates)\n",
+           "pivot(19)", weak.a, weak.b, weak.d);
+    check("pivot-weak", "documents the floor", weak.a == 0 && weak.d == 0,
+          "expected the weak pivot to drop A and D");
+}
+
 int main(int argc, char **argv)
 {
     static const int widths[] = {7, 11, 15};
@@ -351,6 +389,7 @@ int main(int argc, char **argv)
 
     printf("\n-- mixer --\n");
     scenario_mixer();
+    scenario_pivot();
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
