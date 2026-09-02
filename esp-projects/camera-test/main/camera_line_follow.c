@@ -33,6 +33,12 @@
 /* 解码器输出大端字节序 RGB565；画面左右相反时改为 1。 */
 #define CAMERA_LINE_MIRROR_X 0
 
+/* 摄像头相对车体的安装旋转。扫描坐标系永远是车体视角（sy 越大越靠近车），
+ * 缓冲区按这个值反查，不做整帧旋转拷贝，所以改它不增加单帧耗时。
+ * 判断方法：看 TFT 上的绿点是**沿着**胶带走还是**横切**胶带；或者看日志
+ * 的 valid_rows —— 装反了会一直是 0~3 且反复 LOST/finish。 */
+#define CAMERA_LINE_ROTATION LINE_ROTATE_0
+
 /* ROI、行距、逐行搜索和线段判据全部在 line_geometry.h 里，ESP 端和 host
  * 回归测试共用同一组常量。这里只保留状态机自己的窗口策略和时序。 */
 #define LINE_LOST_WINDOW_GROW_PERCENT 4
@@ -102,7 +108,8 @@
  * 落在起转值以下会被混控丢掉，只剩后轮在推。
  * TODO(实测): LINE_CAM_PIVOT_PERCENT 用尺子量 a 和 L 后填 a*100/(2L)。 */
 #define LINE_PIVOT_TURN 26
-#define LINE_CAM_PIVOT_PERCENT 50
+/* 实测 a=7~8 cm、L=9~10 cm -> a/(2L) 约 40%。 */
+#define LINE_CAM_PIVOT_PERCENT 40
 #define LINE_ALERT_MS 900U
 
 /* 校准模式：置 1 后不跑视觉，直接按脚本输出电机命令并打日志。
@@ -301,25 +308,31 @@ static void overlay_cross(uint8_t *frame,
     }
 }
 
+/* points[] 是扫描坐标，overlay 要映射回缓冲区坐标才能画在原始帧上。 */
 static void render_tracking_overlay(uint8_t *frame,
-                                    uint16_t width,
-                                    uint16_t height,
+                                    const line_scan_cfg_t *cfg,
                                     const line_observation_t *observation)
 {
-    if (frame == NULL || observation == NULL) {
+    if (frame == NULL || cfg == NULL || observation == NULL) {
         return;
     }
+    const uint16_t width = cfg->width;
+    const uint16_t height = cfg->height;
+    int bx = 0;
+    int by = 0;
     /* Keep the debug overlay sparse so it is effectively free at 2.5 FPS. */
     for (int i = 0; i < observation->point_count; i += 2) {
-        overlay_dot(frame, width, height, observation->point_x[i],
-                    observation->point_y[i], 0x07e0);
+        line_geometry_map(cfg, observation->point_x[i], observation->point_y[i],
+                          &bx, &by);
+        overlay_dot(frame, width, height, bx, by, 0x07e0);
     }
     if (observation->point_count == 0) {
         return;
     }
     /* 红十字画在实际扫描起始行上，方便用地面胶带量出最近扫描行的落地距离。 */
-    overlay_cross(frame, width, height, observation->point_x[0],
-                  observation->scan_bottom_y, 0xf800);
+    line_geometry_map(cfg, observation->point_x[0], observation->scan_bottom_y,
+                      &bx, &by);
+    overlay_cross(frame, width, height, bx, by, 0xf800);
 }
 
 static int state_search_half_percent(void)
@@ -368,6 +381,7 @@ static bool observe_line(uint8_t *frame,
     cfg.seed_x = s_state == LINE_STATE_TURN ? (int)width / 2 : s_seed_x;
     cfg.search_half_percent = state_search_half_percent();
     cfg.expected_width = s_line_width;
+    cfg.rotation = CAMERA_LINE_ROTATION;
     cfg.mirror_x = CAMERA_LINE_MIRROR_X ? true : false;
     cfg.saturation_guard = LINE_SATURATION_GUARD ? true : false;
     cfg.saturation_max = LINE_SATURATION_MAX;
@@ -377,7 +391,7 @@ static bool observe_line(uint8_t *frame,
     const bool candidate = line_geometry_track(frame, &cfg, observation);
     observation->threshold = source_threshold;
     if (draw_overlay) {
-        render_tracking_overlay(frame, width, height, observation);
+        render_tracking_overlay(frame, &cfg, observation);
     }
     return candidate;
 }

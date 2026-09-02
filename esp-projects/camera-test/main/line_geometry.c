@@ -51,8 +51,63 @@ int line_geometry_error(int center, int image_width, bool mirror_x)
     return mirror_x ? -error : error;
 }
 
-static bool pixel_is_dark(const uint8_t *pixel, const line_scan_cfg_t *cfg)
+int line_geometry_scan_width(const line_scan_cfg_t *cfg)
 {
+    if (cfg == NULL) {
+        return 0;
+    }
+    return (cfg->rotation == LINE_ROTATE_90 || cfg->rotation == LINE_ROTATE_270) ?
+           (int)cfg->height : (int)cfg->width;
+}
+
+int line_geometry_scan_height(const line_scan_cfg_t *cfg)
+{
+    if (cfg == NULL) {
+        return 0;
+    }
+    return (cfg->rotation == LINE_ROTATE_90 || cfg->rotation == LINE_ROTATE_270) ?
+           (int)cfg->width : (int)cfg->height;
+}
+
+void line_geometry_map(const line_scan_cfg_t *cfg, int sx, int sy,
+                       int *bx, int *by)
+{
+    if (cfg == NULL || bx == NULL || by == NULL) {
+        return;
+    }
+    const int w = (int)cfg->width;
+    const int h = (int)cfg->height;
+    switch (cfg->rotation) {
+    case LINE_ROTATE_90:
+        *bx = sy;
+        *by = h - 1 - sx;
+        break;
+    case LINE_ROTATE_180:
+        *bx = w - 1 - sx;
+        *by = h - 1 - sy;
+        break;
+    case LINE_ROTATE_270:
+        *bx = w - 1 - sy;
+        *by = sx;
+        break;
+    case LINE_ROTATE_0:
+    default:
+        *bx = sx;
+        *by = sy;
+        break;
+    }
+}
+
+static bool pixel_is_dark(const uint8_t *frame, const line_scan_cfg_t *cfg,
+                          int sx, int sy)
+{
+    int bx = 0;
+    int by = 0;
+    line_geometry_map(cfg, sx, sy, &bx, &by);
+    if (bx < 0 || by < 0 || bx >= (int)cfg->width || by >= (int)cfg->height) {
+        return false;
+    }
+    const uint8_t *pixel = frame + (((size_t)by * cfg->width + (size_t)bx) * 2);
     if (line_geometry_luma(pixel) > cfg->threshold) {
         return false;
     }
@@ -77,8 +132,9 @@ static bool scan_segment(const uint8_t *frame,
                          int width_reference,
                          line_segment_t *segment)
 {
-    const int width = (int)cfg->width;
-    if (frame == NULL || segment == NULL || y < 0 || y >= (int)cfg->height) {
+    const int width = line_geometry_scan_width(cfg);
+    if (frame == NULL || segment == NULL || y < 0 ||
+        y >= line_geometry_scan_height(cfg)) {
         return false;
     }
 
@@ -107,9 +163,7 @@ static bool scan_segment(const uint8_t *frame,
     int run_start = 0;
 
     for (int x = left; x <= right + 1; ++x) {
-        const bool dark = x <= right &&
-                          pixel_is_dark(frame + (((size_t)y * cfg->width + (size_t)x) * 2),
-                                        cfg);
+        const bool dark = x <= right && pixel_is_dark(frame, cfg, x, y);
         if (dark && !in_run) {
             in_run = true;
             run_start = x;
@@ -178,8 +232,8 @@ bool line_geometry_track(const uint8_t *frame,
     observation->threshold = cfg->threshold;
     observation->corner_row_y = -1;
     observation->scan_bottom_y = -1;
-    const int width = (int)cfg->width;
-    const int height = (int)cfg->height;
+    const int width = line_geometry_scan_width(cfg);
+    const int height = line_geometry_scan_height(cfg);
     if (width < 16 || height < 16 || cfg->threshold <= 0) {
         return false;
     }

@@ -435,6 +435,76 @@ static void scenario_dither(void)
           "strafe should be silent inside the deadband");
 }
 
+/*
+ * 旋转等价性：把同一个场景按 90/180/270 度重新排布到缓冲区里，再让几何层用
+ * 对应的 rotation 去读，观测结果必须和不旋转时**逐字段相同**。
+ *
+ * 这条决定了"摄像头装反 90 度"能不能靠改一个宏解决，而不是重写扫描几何。
+ */
+static uint8_t g_rotated[FRAME_W * FRAME_H * 2];
+
+static void rebuild_rotated(line_rotation_t rotation, line_scan_cfg_t *cfg)
+{
+    const bool swap = rotation == LINE_ROTATE_90 || rotation == LINE_ROTATE_270;
+    cfg->rotation = rotation;
+    cfg->width = swap ? FRAME_H : FRAME_W;
+    cfg->height = swap ? FRAME_W : FRAME_H;
+    memset(g_rotated, 0, sizeof(g_rotated));
+    for (int sy = 0; sy < FRAME_H; ++sy) {
+        for (int sx = 0; sx < FRAME_W; ++sx) {
+            int bx = 0;
+            int by = 0;
+            line_geometry_map(cfg, sx, sy, &bx, &by);
+            const uint8_t *src = g_frame + (((size_t)sy * FRAME_W + (size_t)sx) * 2);
+            uint8_t *dst = g_rotated + (((size_t)by * cfg->width + (size_t)bx) * 2);
+            dst[0] = src[0];
+            dst[1] = src[1];
+        }
+    }
+}
+
+static bool same_observation(const line_observation_t *a,
+                             const line_observation_t *b)
+{
+    return a->candidate == b->candidate && a->valid_rows == b->valid_rows &&
+           a->seed_x == b->seed_x && a->near_width == b->near_width &&
+           a->lateral_error == b->lateral_error &&
+           a->heading_error == b->heading_error &&
+           a->far_error == b->far_error &&
+           a->corner_direction == b->corner_direction &&
+           a->finish_candidate == b->finish_candidate &&
+           a->near_line_visible == b->near_line_visible;
+}
+
+static void scenario_rotation(int w)
+{
+    static const struct { line_rotation_t rotation; const char *label; } cases[] = {
+        {LINE_ROTATE_90, "rot90"},
+        {LINE_ROTATE_180, "rot180"},
+        {LINE_ROTATE_270, "rot270"},
+    };
+    line_observation_t reference;
+    line_scan_cfg_t cfg = base_cfg(w);
+
+    /* 用一个信息量够大的场景：斜线 + 单侧横条（左折角）。 */
+    fill_frame(240, 240, 240);
+    draw_segment(LINE_X, FRAME_H - 1, LINE_X, BAR_Y, w, 0, 0, 0);
+    draw_segment(LINE_X, BAR_Y, 30, BAR_Y, w, 0, 0, 0);
+    line_geometry_track(g_frame, &cfg, &reference);
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        char name[24];
+        line_observation_t obs;
+        line_scan_cfg_t rcfg = base_cfg(w);
+        snprintf(name, sizeof(name), "%s/w=%d", cases[i].label, w);
+        rebuild_rotated(cases[i].rotation, &rcfg);
+        line_geometry_track(g_rotated, &rcfg, &obs);
+        report(name, &obs);
+        check(name, "same as unrotated", same_observation(&reference, &obs),
+              "rotating the buffer changed the observation");
+    }
+}
+
 int main(int argc, char **argv)
 {
     static const int widths[] = {7, 11, 15};
@@ -482,6 +552,7 @@ int main(int argc, char **argv)
         scenario_finish_t(w);
         scenario_colour_blob(w);
         scenario_signs(w);
+        scenario_rotation(w);
     }
 
     printf("\n-- mixer --\n");

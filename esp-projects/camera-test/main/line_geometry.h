@@ -50,6 +50,19 @@ extern "C" {
 #define LINE_WIDTH_FALLBACK_PERCENT 4
 #define LINE_FINISH_STEM_ROWS 3
 
+/*
+ * 摄像头相对车体的安装旋转。"扫描坐标系"永远是车体视角：sy 越大越靠近车，
+ * sx 越大越靠车体右侧。缓冲区里的像素按这个枚举反查，不做整帧旋转拷贝。
+ *
+ * 判断方法见 test/README.md：绿点必须沿着胶带走，而不是横切胶带。
+ */
+typedef enum {
+    LINE_ROTATE_0 = 0,   /* 缓冲区就是车体视角 */
+    LINE_ROTATE_90,      /* 缓冲区顺时针转 90 度后才是车体视角 */
+    LINE_ROTATE_180,
+    LINE_ROTATE_270,
+} line_rotation_t;
+
 /* 单行黑色线段的形状分类。WIDE_* 表示该行的黑区宽度远超正常线宽，
  * 其质心是搜索窗口的产物而不是赛道位置，不能用于转向。 */
 typedef enum {
@@ -79,6 +92,7 @@ typedef struct {
     int corridor_x;          /* < 0 表示不启用走廊约束 */
     int corridor_half;
     int expected_width;      /* 近场线宽 EMA（px），0 表示未知 */
+    line_rotation_t rotation;
     bool mirror_x;
     bool saturation_guard;   /* 额外要求 max-min <= saturation_max */
     int saturation_max;
@@ -106,6 +120,14 @@ typedef struct {
 } line_observation_t;
 
 uint8_t line_geometry_luma(const uint8_t *pixel);
+
+/* 扫描坐标系的尺寸：90/270 度时和缓冲区的宽高互换。 */
+int line_geometry_scan_width(const line_scan_cfg_t *cfg);
+int line_geometry_scan_height(const line_scan_cfg_t *cfg);
+
+/* 扫描坐标 -> 缓冲区坐标。overlay 要用它把点画回原始帧上。 */
+void line_geometry_map(const line_scan_cfg_t *cfg, int sx, int sy,
+                       int *bx, int *by);
 
 /* 正值表示赛道在画面中心左侧，与已实车验证的转向符号配套：
  * 线偏左 -> error > 0 -> turn > 0 -> 逆时针 -> 向左。 */
