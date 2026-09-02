@@ -54,8 +54,10 @@
 #define LINE_SATURATION_MAX 60
 #define LINE_WIDTH_FILTER_OLD 3
 #define LINE_WIDTH_FILTER_NEW 1
-#define LINE_ERROR_FILTER_OLD 4
-#define LINE_ERROR_FILTER_NEW 6
+#define LINE_ERROR_FILTER_OLD 6
+#define LINE_ERROR_FILTER_NEW 4
+#define LINE_PD_KD_LAT 20
+#define LINE_PD_KD_HEADING 50
 
 /* 这些值保留原有的上电、限速、换向保护和超时停车行为。 */
 #define LINE_START_DELAY_MS 600U
@@ -201,6 +203,8 @@ static int s_turn_output;
 static bool s_error_filter_initialized;
 static int s_lateral_control_error;
 static int s_heading_control_error;
+static int s_lateral_error_rate;
+static int s_heading_error_rate;
 
 static int s_turn_direction;
 static uint8_t s_turn_hint_frames;
@@ -512,6 +516,8 @@ static void reset_control(void)
     s_error_filter_initialized = false;
     s_lateral_control_error = 0;
     s_heading_control_error = 0;
+    s_lateral_error_rate = 0;
+    s_heading_error_rate = 0;
 }
 
 static void reset_tracking(void)
@@ -575,15 +581,26 @@ static void drive_normal(const line_observation_t *observation, int64_t now)
     } else {
         s_forward_output = target;
     }
+    const int previous_lateral = s_lateral_control_error;
+    const int previous_heading = s_heading_control_error;
     const int lateral_error = filter_control_error(observation->lateral_error,
                                                    &s_lateral_control_error);
     const int heading_error = filter_control_error(observation->heading_error,
                                                    &s_heading_control_error);
+    const int lateral_delta = s_error_filter_initialized ?
+                              lateral_error - previous_lateral : 0;
+    const int heading_delta = s_error_filter_initialized ?
+                              heading_error - previous_heading : 0;
+    s_lateral_error_rate = (s_lateral_error_rate * 2 + lateral_delta) / 3;
+    s_heading_error_rate = (s_heading_error_rate * 2 + heading_delta) / 3;
     s_error_filter_initialized = true;
-    s_turn_output = line_control_yaw(&cfg, heading_error,
-                                     &s_yaw_accum);
+    s_turn_output = line_control_yaw_pd(&cfg, heading_error,
+                                        s_heading_error_rate,
+                                        LINE_PD_KD_HEADING, &s_yaw_accum);
     drive(s_forward_output, s_turn_output,
-          line_control_strafe(&cfg, lateral_error, &s_lat_accum));
+          line_control_strafe_pd(&cfg, lateral_error,
+                                 s_lateral_error_rate,
+                                 LINE_PD_KD_LAT, &s_lat_accum));
 }
 
 static void update_seed(const line_observation_t *observation)

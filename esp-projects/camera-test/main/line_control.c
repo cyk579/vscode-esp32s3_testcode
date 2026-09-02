@@ -54,6 +54,21 @@ int line_control_yaw(const line_control_cfg_t *cfg, int heading_error,
     return dither(target, cfg->yaw_min, accum);
 }
 
+int line_control_yaw_pd(const line_control_cfg_t *cfg, int heading_error,
+                        int derivative, int kd, int *accum)
+{
+    if (cfg == NULL || accum == NULL || cfg->scale <= 0) {
+        return 0;
+    }
+    if (abs(heading_error) <= cfg->heading_deadband && derivative == 0) {
+        *accum = 0;
+        return 0;
+    }
+    int target = -(cfg->kh * heading_error + kd * derivative) / cfg->scale;
+    target = clamp_int(target, cfg->turn_max);
+    return dither(target, cfg->yaw_min, accum);
+}
+
 int line_control_strafe(const line_control_cfg_t *cfg, int lateral_error,
                         int *accum)
 {
@@ -66,6 +81,21 @@ int line_control_strafe(const line_control_cfg_t *cfg, int lateral_error,
     }
     /* 线在左 (error > 0) 要向左平移 (lat < 0)，所以这里是负号。 */
     int demand = -cfg->kp_lat * lateral_error / cfg->scale;
+    demand = clamp_int(demand, cfg->lat_max);
+    return dither(demand, cfg->lat_min, accum);
+}
+
+int line_control_strafe_pd(const line_control_cfg_t *cfg, int lateral_error,
+                           int derivative, int kd, int *accum)
+{
+    if (cfg == NULL || accum == NULL || cfg->scale <= 0) {
+        return 0;
+    }
+    if (abs(lateral_error) <= cfg->error_deadband && derivative == 0) {
+        *accum = 0;
+        return 0;
+    }
+    int demand = -(cfg->kp_lat * lateral_error + kd * derivative) / cfg->scale;
     demand = clamp_int(demand, cfg->lat_max);
     return dither(demand, cfg->lat_min, accum);
 }

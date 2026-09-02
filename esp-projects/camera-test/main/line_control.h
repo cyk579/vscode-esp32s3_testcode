@@ -54,12 +54,20 @@ typedef struct {
 int line_control_yaw(const line_control_cfg_t *cfg, int heading_error,
                      int *accum);
 
+/* 摄像头控制用的受限 PD 版本：derivative 是已滤波的逐帧误差变化量，
+ * kd 只用于抑制过冲，不改变原有符号约定和起转脉冲逻辑。 */
+int line_control_yaw_pd(const line_control_cfg_t *cfg, int heading_error,
+                        int derivative, int kd, int *accum);
+
 /*
  * 横移：一阶纠偏 + 时间抖动。
  * 需求量低于 lat_min 时攒进 *accum，攒够了发一个整脉冲，等效平均值不变。
  */
 int line_control_strafe(const line_control_cfg_t *cfg, int lateral_error,
                         int *accum);
+
+int line_control_strafe_pd(const line_control_cfg_t *cfg, int lateral_error,
+                           int derivative, int kd, int *accum);
 
 /* 前进速度取所有限制里最小的一个。远端只在这里起作用，绝不参与转向。 */
 int line_control_speed(const line_control_cfg_t *cfg,
