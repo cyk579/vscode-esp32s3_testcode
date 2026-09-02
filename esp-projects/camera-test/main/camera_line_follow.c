@@ -75,10 +75,10 @@
 /* 终点 T 停车。调巡线时可以临时置 0，避免把"误停"当成"丢线"。 */
 #define LINE_FINISH_ENABLE 1
 
-/* 在上一版可持续低速基础上统一加 2；斜坡仍按控制周期平滑上升。 */
-#define LINE_FORWARD_FAST 30
-#define LINE_FORWARD_MEDIUM 27
-#define LINE_FORWARD_SLOW 23
+/* 持续巡航速度取 24% 版和 30% 版之间的折中值；起步另有短时增扭脉冲。 */
+#define LINE_FORWARD_FAST 27
+#define LINE_FORWARD_MEDIUM 25
+#define LINE_FORWARD_SLOW 22
 #define LINE_FORWARD_CRAWL 18
 #define LINE_FORWARD_SLEW 8
 
@@ -156,11 +156,11 @@
 #define PWM_MAX 1023U
 #define MOTOR_MIN_RUN_OUTPUT 11
 #define MOTOR_B_MIN_RUN_OUTPUT 13
-#define START_KICK_OUTPUT 20
-#define START_KICK_CYCLES 3U
-/* 正常巡航上限为 30%；转向时由混控器按总量自动缩放。 */
+#define START_KICK_OUTPUT 30
+#define START_KICK_CYCLES 6U
+/* 持续巡航上限为 27%；30% 只作为起步/换向脉冲和混控余量。 */
 #define MOTOR_PWM_CEILING 30
-#define LINE_SPEED_CAP 30
+#define LINE_SPEED_CAP 27
 #define MOTOR_TRIM_A 90
 #define MOTOR_TRIM_D 100
 
@@ -1077,7 +1077,8 @@ static bool obstacle_step(int64_t now, uint16_t width, bool line_available)
             if (elapsed >= AVOID_LEFT_TIMEOUT_MS && !clear) {
                 ESP_LOGW(TAG, "left shift timeout without clear echo; continuing");
             } else {
-                ESP_LOGI(TAG, "left shift complete after %ums clear echo", elapsed);
+                ESP_LOGI(TAG, "left shift complete after %ums clear echo",
+                         (unsigned)elapsed);
             }
         }
         break;
