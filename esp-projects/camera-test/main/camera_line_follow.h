@@ -23,6 +23,15 @@ void camera_line_follow_frame_callback(uint8_t *rgb565_big_endian,
                                        bool draw_overlay,
                                        void *user_ctx);
 
+/* Draw the latest control result on the independently decoded TFT preview. */
+void camera_line_follow_preview_callback(uint8_t *rgb565_big_endian,
+                                         uint16_t width,
+                                         uint16_t height,
+                                         uint8_t source_threshold,
+                                         uint32_t sequence,
+                                         int64_t capture_us,
+                                         void *user_ctx);
+
 #ifdef __cplusplus
 }
 #endif

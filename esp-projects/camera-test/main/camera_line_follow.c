@@ -129,8 +129,8 @@
 #define LINE_CALIB_SPIN_MS 10000U
 
 /* 扫描几何按这个解码尺寸调过；协商到别的分辨率时绝对像素量的含义会变。 */
-#define LINE_EXPECTED_WIDTH 240
-#define LINE_EXPECTED_HEIGHT 160
+#define LINE_EXPECTED_WIDTH 120
+#define LINE_EXPECTED_HEIGHT 80
 
 /* 起转下限、启动冲量和方向符号全部复用 car-spin 的实车校准值。红外巡线
  * 工程是在同一台三轮全向车上测过的，这里不要再自行下调：B 轮实测起转
@@ -254,6 +254,8 @@ static uint32_t s_line_us_max;
 static int64_t s_summary_start_us;
 static uint32_t s_summary_camera_frames;
 static uint32_t s_summary_processed_frames;
+static uint32_t s_summary_control_frames;
+static uint32_t s_summary_preview_frames;
 static uint32_t s_summary_dropped_frames;
 static uint32_t s_callback_dropped_frames;
 static uint32_t s_summary_callback_dropped_frames;
@@ -262,6 +264,26 @@ static SemaphoreHandle_t s_control_mutex;
 static bool s_watchdog_created;
 static bool s_logged_frame_size;
 static bool s_suppress_kick;
+
+#define LINE_OVERLAY_MAX_POINTS (LINE_SCAN_MAX_ROWS / 2 + 1)
+typedef struct {
+    bool valid;
+    uint16_t control_width;
+    uint16_t control_height;
+    line_rotation_t rotation;
+    uint8_t point_count;
+    int16_t point_x[LINE_OVERLAY_MAX_POINTS];
+    int16_t point_y[LINE_OVERLAY_MAX_POINTS];
+    int16_t seed_x;
+    int16_t seed_y;
+    bool corner_valid;
+    int16_t corner_x;
+    int16_t corner_y;
+    uint32_t sequence;
+} line_overlay_snapshot_t;
+
+static line_overlay_snapshot_t s_overlay_snapshot;
+static SemaphoreHandle_t s_overlay_mutex;
 
 static void camera_line_follow_watchdog_task(void *arg);
 #if LINE_CALIB_MODE
@@ -369,6 +391,89 @@ static void render_tracking_overlay(uint8_t *frame,
     overlay_cross(frame, width, height, bx, by, 0xf800);
 }
 
+/* Keep only the detector's sparse points. Preview never runs a second scan. */
+static void save_overlay_snapshot(uint16_t width, uint16_t height,
+                                  const line_observation_t *observation,
+                                  uint32_t sequence)
+{
+    if (observation == NULL || s_overlay_mutex == NULL) {
+        return;
+    }
+    if (xSemaphoreTake(s_overlay_mutex, 0) != pdTRUE) {
+        return;
+    }
+    s_overlay_snapshot.valid = observation->point_count > 0;
+    s_overlay_snapshot.control_width = width;
+    s_overlay_snapshot.control_height = height;
+    s_overlay_snapshot.rotation = CAMERA_LINE_ROTATION;
+    s_overlay_snapshot.point_count = 0;
+    s_overlay_snapshot.seed_x = -1;
+    s_overlay_snapshot.seed_y = -1;
+    s_overlay_snapshot.corner_valid = false;
+    s_overlay_snapshot.corner_x = -1;
+    s_overlay_snapshot.corner_y = -1;
+    s_overlay_snapshot.sequence = sequence;
+    for (int i = 0; i < observation->point_count &&
+                    s_overlay_snapshot.point_count < LINE_OVERLAY_MAX_POINTS; i += 2) {
+        const uint8_t index = s_overlay_snapshot.point_count++;
+        s_overlay_snapshot.point_x[index] = observation->point_x[i];
+        s_overlay_snapshot.point_y[index] = observation->point_y[i];
+    }
+    if (observation->point_count > 0) {
+        s_overlay_snapshot.seed_x = observation->point_x[0];
+        s_overlay_snapshot.seed_y = observation->scan_bottom_y;
+    }
+    if (observation->corner_direction != 0 && observation->corner_x >= 0 &&
+        observation->corner_row_y >= 0) {
+        s_overlay_snapshot.corner_valid = true;
+        s_overlay_snapshot.corner_x = observation->corner_x;
+        s_overlay_snapshot.corner_y = observation->corner_row_y;
+    }
+    (void)xSemaphoreGive(s_overlay_mutex);
+}
+
+static void render_preview_overlay(uint8_t *frame, uint16_t width, uint16_t height)
+{
+    if (frame == NULL || s_overlay_mutex == NULL) {
+        return;
+    }
+    line_overlay_snapshot_t snapshot;
+    if (xSemaphoreTake(s_overlay_mutex, 0) != pdTRUE) {
+        return;
+    }
+    snapshot = s_overlay_snapshot;
+    (void)xSemaphoreGive(s_overlay_mutex);
+    if (!snapshot.valid || snapshot.control_width == 0 ||
+        snapshot.control_height == 0) {
+        return;
+    }
+
+    line_scan_cfg_t cfg = {0};
+    cfg.width = snapshot.control_width;
+    cfg.height = snapshot.control_height;
+    cfg.rotation = snapshot.rotation;
+    int bx = 0;
+    int by = 0;
+    for (uint8_t i = 0; i < snapshot.point_count; ++i) {
+        line_geometry_map(&cfg, snapshot.point_x[i], snapshot.point_y[i], &bx, &by);
+        const int px = bx * (int)width / snapshot.control_width;
+        const int py = by * (int)height / snapshot.control_height;
+        overlay_dot(frame, width, height, px, py, 0x07e0);
+    }
+    if (snapshot.seed_x >= 0 && snapshot.seed_y >= 0) {
+        line_geometry_map(&cfg, snapshot.seed_x, snapshot.seed_y, &bx, &by);
+        const int px = bx * (int)width / snapshot.control_width;
+        const int py = by * (int)height / snapshot.control_height;
+        overlay_cross(frame, width, height, px, py, 0xf800);
+    }
+    if (snapshot.corner_valid) {
+        line_geometry_map(&cfg, snapshot.corner_x, snapshot.corner_y, &bx, &by);
+        const int px = bx * (int)width / snapshot.control_width;
+        const int py = by * (int)height / snapshot.control_height;
+        overlay_dot(frame, width, height, px, py, 0xffe0);
+    }
+}
+
 static int state_search_half_percent(void)
 {
     if (s_state == LINE_STATE_TURN) {
@@ -400,6 +505,7 @@ static bool observe_line(uint8_t *frame,
     *observation = empty;
     observation->threshold = source_threshold;
     observation->corner_row_y = -1;
+    observation->corner_x = -1;
     observation->scan_bottom_y = -1;
     if (source_threshold == 0) {
         return false;
@@ -691,11 +797,15 @@ static const char *state_name(void)
 
 static void maybe_log_summary(int64_t now)
 {
+    camera_display_pipeline_stats_t pipeline = {0};
+    camera_display_get_pipeline_stats(&pipeline);
     if (s_summary_start_us == 0) {
         s_summary_start_us = now;
-        camera_display_get_counters(&s_summary_camera_frames,
-                                    &s_summary_processed_frames,
-                                    &s_summary_dropped_frames);
+        s_summary_camera_frames = pipeline.camera_frames;
+        s_summary_processed_frames = pipeline.processed_frames;
+        s_summary_control_frames = pipeline.control_frames;
+        s_summary_preview_frames = pipeline.preview_frames;
+        s_summary_dropped_frames = pipeline.frames_dropped;
         s_summary_callback_dropped_frames = s_callback_dropped_frames;
         return;
     }
@@ -703,36 +813,40 @@ static void maybe_log_summary(int64_t now)
         return;
     }
 
-    uint32_t camera_frames = 0;
-    uint32_t processed_frames = 0;
-    uint32_t dropped_frames = 0;
-    camera_display_get_counters(&camera_frames, &processed_frames, &dropped_frames);
-    const uint32_t camera_fps = camera_frames - s_summary_camera_frames;
-    const uint32_t processed_fps = processed_frames - s_summary_processed_frames;
-    const uint32_t frames_dropped = (dropped_frames - s_summary_dropped_frames) +
+    const uint32_t camera_fps = pipeline.camera_frames - s_summary_camera_frames;
+    const uint32_t processed_fps = pipeline.processed_frames - s_summary_processed_frames;
+    const uint32_t control_fps = pipeline.control_frames - s_summary_control_frames;
+    const uint32_t preview_fps = pipeline.preview_frames - s_summary_preview_frames;
+    const uint32_t frames_dropped = (pipeline.frames_dropped - s_summary_dropped_frames) +
                                     (s_callback_dropped_frames -
                                      s_summary_callback_dropped_frames);
     const uint32_t line_us_avg = s_control_frames == 0 ? 0 :
                                  s_line_us_sum / s_control_frames;
-    uint32_t decode_us = 0;
-    uint32_t threshold_us = 0;
-    uint32_t tft_us = 0;
-    camera_display_get_timing(&decode_us, &threshold_us, &tft_us);
     const int64_t line_age_ms = s_last_line_us == 0 ? -1 :
                                 (now - s_last_line_us) / 1000;
+    const int64_t frame_age_ms = pipeline.last_control_age_us == 0 ? (int64_t)-1 :
+                                 (int64_t)(pipeline.last_control_age_us / 1000U);
     ESP_LOGI(TAG,
-             "fps camera=%u processed=%u control=%u drop=%u callback_drop=%u "
-             "frame=%ux%u timing_us[decode,threshold,tft]=[%u,%u,%u] "
+             "fps camera=%u decoded=%u control=%u preview=%u drop=%u "
+             "control_drop=%u preview_drop=%u callback_drop=%u frame=%ux%u "
+             "age_ms=%lld timing_us[control_decode,preview_decode,threshold,tft]=[%u,%u,%u,%u] "
              "line_us[avg,max]=[%u,%u]",
              (unsigned)camera_fps, (unsigned)processed_fps,
-             (unsigned)s_control_frames, (unsigned)frames_dropped,
+             (unsigned)control_fps, (unsigned)preview_fps,
+             (unsigned)frames_dropped,
+             (unsigned)pipeline.control_dropped_frames,
+             (unsigned)pipeline.preview_dropped_frames,
              (unsigned)(s_callback_dropped_frames -
                         s_summary_callback_dropped_frames),
              (unsigned)s_last_frame_width, (unsigned)s_last_frame_height,
-             (unsigned)decode_us, (unsigned)threshold_us, (unsigned)tft_us,
+             (long long)frame_age_ms,
+             (unsigned)pipeline.control_decode_us,
+             (unsigned)pipeline.preview_decode_us,
+             (unsigned)pipeline.threshold_us,
+             (unsigned)pipeline.tft_us,
              (unsigned)line_us_avg, (unsigned)s_line_us_max);
     ESP_LOGI(TAG,
-             "vision state=%s armed=%d STBY=%d candidate=%d arm=%u lost=%u "
+             "vision state=%s armed=%d STBY=%d candidate=%d arm_frames=%u lost=%u "
              "reacq=%u/%u seed_valid=%d threshold=%d seed_x=%d line_w=%d "
              "scan_bottom=%d points=%d valid_rows=%u near_rows=%d confidence=%u "
              "near_line=%d far_error=%d corner=%d@%d line_age_ms=%lld",
@@ -765,9 +879,11 @@ static void maybe_log_summary(int64_t now)
              s_last_direction[1], s_last_direction[2],
              s_command_a, s_command_b, s_command_d);
 
-    s_summary_camera_frames = camera_frames;
-    s_summary_processed_frames = processed_frames;
-    s_summary_dropped_frames = dropped_frames;
+    s_summary_camera_frames = pipeline.camera_frames;
+    s_summary_processed_frames = pipeline.processed_frames;
+    s_summary_control_frames = pipeline.control_frames;
+    s_summary_preview_frames = pipeline.preview_frames;
+    s_summary_dropped_frames = pipeline.frames_dropped;
     s_summary_callback_dropped_frames = s_callback_dropped_frames;
     s_summary_start_us = now;
     s_control_frames = 0;
@@ -840,6 +956,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     const bool candidate = observe_line(rgb565_big_endian, width, height,
                                         source_threshold, draw_overlay,
                                         &observation);
+    save_overlay_snapshot(width, height, &observation, 0);
     s_last_scan_bottom_y = observation.scan_bottom_y;
     s_last_point_count = observation.point_count;
     s_last_near_normal_rows = observation.near_normal_rows;
@@ -1209,6 +1326,13 @@ esp_err_t camera_line_follow_start(void)
             return ESP_ERR_NO_MEM;
         }
     }
+    if (s_overlay_mutex == NULL) {
+        s_overlay_mutex = xSemaphoreCreateMutex();
+        if (s_overlay_mutex == NULL) {
+            ESP_LOGE(TAG, "Could not allocate overlay mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
 
     const gpio_num_t direction_pins[] = {
         A_IN1, A_IN2, B_IN1, B_IN2, D_IN1, D_IN2, STBY_GPIO
@@ -1278,9 +1402,12 @@ esp_err_t camera_line_follow_start(void)
     s_summary_start_us = 0;
     s_summary_camera_frames = 0;
     s_summary_processed_frames = 0;
+    s_summary_control_frames = 0;
+    s_summary_preview_frames = 0;
     s_summary_dropped_frames = 0;
     s_callback_dropped_frames = 0;
     s_summary_callback_dropped_frames = 0;
+    s_overlay_snapshot = (line_overlay_snapshot_t){0};
     s_control_frames = 0;
     s_line_us_sum = 0;
     s_line_us_max = 0;
@@ -1347,4 +1474,20 @@ void camera_line_follow_frame_callback(uint8_t *rgb565_big_endian,
     if (s_control_mutex != NULL) {
         (void)xSemaphoreGive(s_control_mutex);
     }
+}
+
+void camera_line_follow_preview_callback(uint8_t *rgb565_big_endian,
+                                         uint16_t width,
+                                         uint16_t height,
+                                         uint8_t source_threshold,
+                                         uint32_t sequence,
+                                         int64_t capture_us,
+                                         void *user_ctx)
+{
+    (void)source_threshold;
+    (void)sequence;
+    (void)capture_us;
+    (void)user_ctx;
+    /* This callback is display-only. It never scans pixels or touches motors. */
+    render_preview_overlay(rgb565_big_endian, width, height);
 }

@@ -22,7 +22,7 @@ extern "C" {
 #define LINE_ROI_BOTTOM_PERCENT 100
 #define LINE_NEAR_TOP_PERCENT 65
 #define LINE_NEAR_BOTTOM_PERCENT 92
-#define LINE_ROW_STEP 4
+#define LINE_ROW_STEP 2
 #define LINE_BOTTOM_SKIP_ROWS 0
 #define LINE_SCAN_MAX_ROWS 64
 #define LINE_SEARCH_HALF_PERCENT 20
@@ -30,7 +30,7 @@ extern "C" {
 #define LINE_SEARCH_HALF_MAX 80
 /* 逐行搜索用上一行的斜率做预测，所以跳变门限可以比原来紧。 */
 #define LINE_MAX_CENTER_JUMP_PERCENT 12
-#define LINE_MIN_SEGMENT_WIDTH 3
+#define LINE_MIN_SEGMENT_WIDTH 2
 #define LINE_MAX_SEGMENT_WIDTH_PERCENT 55
 #define LINE_MIN_VALID_ROWS 4
 #define LINE_CORNER_MIN_VALID_ROWS 2
@@ -108,6 +108,7 @@ typedef struct {
     int heading_error;
     int corner_direction;    /* -1 左 / +1 右 / 0 无 */
     int corner_row_y;        /* 事件所在行，用于判断远近；-1 表示无 */
+    int corner_x;            /* 事件行的支路中心，用于预览 overlay */
     int far_error;           /* 远端取样点误差，只用于限速 */
     int near_width;          /* 最底行的黑段宽度（px） */
     uint8_t near_normal_rows;/* 近场里形状正常的行数 */

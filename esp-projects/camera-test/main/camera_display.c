@@ -1,5 +1,6 @@
 #include "camera_display.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -14,18 +15,25 @@
 #include "tft_st7735.h"
 #endif
 
-#define CAMERA_DISPLAY_SLOT_COUNT 2
+/* Three JPEG slots let USB reception, control decode, and preview overlap. */
+#define CAMERA_DISPLAY_SLOT_COUNT 3
 #define CAMERA_DISPLAY_MAX_JPEG_BYTES (256 * 1024)
-#define CAMERA_DECODE_MAX_WIDTH 320
-#define CAMERA_DECODE_MAX_HEIGHT 240
-#define CAMERA_DISPLAY_RGB565_BYTES \
-    ((size_t)CAMERA_DECODE_MAX_WIDTH * CAMERA_DECODE_MAX_HEIGHT * 2)
+#define CAMERA_CONTROL_BUFFER_COUNT 2
+#define CAMERA_CONTROL_MAX_WIDTH 160
+#define CAMERA_CONTROL_MAX_HEIGHT 120
+#define CAMERA_CONTROL_RGB565_BYTES \
+    ((size_t)CAMERA_CONTROL_MAX_WIDTH * CAMERA_CONTROL_MAX_HEIGHT * 2)
+#define CAMERA_PREVIEW_MAX_WIDTH 320
+#define CAMERA_PREVIEW_MAX_HEIGHT 240
+#define CAMERA_PREVIEW_RGB565_BYTES \
+    ((size_t)CAMERA_PREVIEW_MAX_WIDTH * CAMERA_PREVIEW_MAX_HEIGHT * 2)
 #define CAMERA_DISPLAY_JPEG_WORK_BYTES (16 * 1024)
+
 #define CAMERA_BINARY_ROI_TOP_PERCENT 30
 #define CAMERA_BINARY_ROI_BOTTOM_PERCENT 100
 #define CAMERA_BINARY_ROI_LEFT_PERCENT 20
 #define CAMERA_BINARY_ROI_RIGHT_PERCENT 80
-#define CAMERA_BINARY_ROW_STEP 3
+#define CAMERA_BINARY_ROW_STEP 2
 #define CAMERA_BINARY_DARK_PERCENTILE 2
 #define CAMERA_BINARY_LIGHT_PERCENTILE 90
 #define CAMERA_BINARY_MIN_CONTRAST 32
@@ -35,37 +43,75 @@
 #define CAMERA_BINARY_THRESHOLD_SLEW 8
 #define CAMERA_BINARY_THRESHOLD_FILTER_OLD 3
 #define CAMERA_BINARY_THRESHOLD_FILTER_NEW 1
-#define CAMERA_OUTPUT_MAX_WIDTH CAMERA_DECODE_MAX_WIDTH
-#define CAMERA_OUTPUT_MAX_HEIGHT CAMERA_DECODE_MAX_HEIGHT
-#define CAMERA_TFT_REFRESH_US 333333
+
+/* 480x320 -> 240x160 preview; the TFT driver samples every second pixel. */
+#define CAMERA_TFT_REFRESH_US 400000
 #define CAMERA_TFT_CROP_LEFT_PERCENT CAMERA_BINARY_ROI_LEFT_PERCENT
 #define CAMERA_TFT_CROP_RIGHT_PERCENT CAMERA_BINARY_ROI_RIGHT_PERCENT
 #define CAMERA_TFT_CROP_TOP_PERCENT CAMERA_BINARY_ROI_TOP_PERCENT
 #define CAMERA_TFT_CROP_BOTTOM_PERCENT CAMERA_BINARY_ROI_BOTTOM_PERCENT
 
 typedef struct {
+    uint8_t slot;
+    size_t jpeg_len;
+    uint32_t sequence;
+    int64_t capture_us;
+} jpeg_frame_ref_t;
+
+typedef struct {
+    uint8_t buffer;
+    uint16_t width;
+    uint16_t height;
+    uint8_t threshold;
+    uint32_t sequence;
+    int64_t capture_us;
+} control_frame_ref_t;
+
+typedef struct {
+    uint8_t slot;
+    size_t jpeg_len;
+    uint32_t sequence;
+    int64_t capture_us;
+    uint8_t threshold;
+} preview_frame_ref_t;
+
+typedef struct {
     uint8_t *jpeg_slots[CAMERA_DISPLAY_SLOT_COUNT];
-    size_t jpeg_sizes[CAMERA_DISPLAY_SLOT_COUNT];
-    uint8_t *rgb565;
-    uint8_t *jpeg_work;
+    uint8_t *control_rgb565[CAMERA_CONTROL_BUFFER_COUNT];
+    uint8_t *preview_rgb565;
+    uint8_t *control_jpeg_work;
+    uint8_t *preview_jpeg_work;
     QueueHandle_t free_slots;
     QueueHandle_t ready_slots;
+    QueueHandle_t preview_slots;
+    QueueHandle_t free_control_buffers;
+    QueueHandle_t ready_control_frames;
     bool started;
     bool tft_ready;
     camera_display_frame_callback_t frame_callback;
     void *frame_callback_ctx;
-    uint16_t previous_width;
-    uint16_t previous_height;
+    camera_display_preview_callback_t preview_callback;
+    void *preview_callback_ctx;
+    uint16_t previous_preview_width;
+    uint16_t previous_preview_height;
     int64_t last_preview_us;
     uint8_t binary_threshold;
     bool threshold_initialized;
     uint8_t threshold_filtered;
     volatile uint32_t camera_frames;
     volatile uint32_t processed_frames;
+    volatile uint32_t control_frames;
+    volatile uint32_t preview_frames;
     volatile uint32_t frames_dropped;
-    volatile uint32_t last_decode_us;
+    volatile uint32_t control_dropped_frames;
+    volatile uint32_t preview_dropped_frames;
+    volatile uint32_t last_control_decode_us;
+    volatile uint32_t last_preview_decode_us;
     volatile uint32_t last_threshold_us;
     volatile uint32_t last_tft_us;
+    volatile uint32_t last_control_age_us;
+    volatile uint32_t last_control_sequence;
+    uint32_t next_sequence;
 } camera_display_state_t;
 
 static const char *TAG = "camera_display";
@@ -165,8 +211,65 @@ static uint8_t filter_binary_threshold(uint8_t candidate)
     return s_display.threshold_filtered;
 }
 
-static bool choose_scale(uint16_t source_width,
-                         uint16_t source_height,
+static bool find_complete_jpeg(const uint8_t *data, size_t length,
+                               size_t *offset, size_t *jpeg_length)
+{
+    size_t candidate_soi = SIZE_MAX;
+    size_t selected_soi = SIZE_MAX;
+    size_t selected_end = 0;
+    for (size_t i = 0; i + 1 < length; ++i) {
+        if (data[i] == 0xff && data[i + 1] == 0xd8) {
+            candidate_soi = i;
+        } else if (data[i] == 0xff && data[i + 1] == 0xd9 &&
+                   candidate_soi != SIZE_MAX) {
+            selected_soi = candidate_soi;
+            selected_end = i + 2;
+            candidate_soi = SIZE_MAX;
+        }
+    }
+    if (selected_soi == SIZE_MAX || selected_end <= selected_soi) {
+        return false;
+    }
+    *offset = selected_soi;
+    *jpeg_length = selected_end - selected_soi;
+    return true;
+}
+
+static void log_jpeg_diagnostic(const uint8_t *jpeg, size_t jpeg_len)
+{
+    static bool logged;
+    if (logged) {
+        return;
+    }
+    logged = true;
+    size_t sof0 = 0;
+    size_t sof2 = 0;
+    size_t dht = 0;
+    size_t dqt = 0;
+    for (size_t i = 0; i + 1 < jpeg_len; ++i) {
+        if (jpeg[i] != 0xff) {
+            continue;
+        }
+        switch (jpeg[i + 1]) {
+        case 0xc0: ++sof0; break;
+        case 0xc2: ++sof2; break;
+        case 0xc4: ++dht; break;
+        case 0xdb: ++dqt; break;
+        default: break;
+        }
+    }
+    char head[3 * 32 + 1] = {0};
+    const size_t head_len = jpeg_len < 32 ? jpeg_len : 32;
+    for (size_t i = 0; i < head_len; ++i) {
+        snprintf(head + i * 3, 4, "%02x ", jpeg[i]);
+    }
+    ESP_LOGW(TAG, "JPEG diagnostic len=%u SOF0=%u SOF2=%u DQT=%u DHT=%u head=%s",
+             (unsigned)jpeg_len, (unsigned)sof0, (unsigned)sof2,
+             (unsigned)dqt, (unsigned)dht, head);
+}
+
+static bool choose_scale(uint16_t source_width, uint16_t source_height,
+                         uint16_t max_width, uint16_t max_height,
                          esp_jpeg_image_scale_t *scale)
 {
     static const struct {
@@ -184,8 +287,7 @@ static bool choose_scale(uint16_t source_width,
                                       choices[i].divider;
         const uint16_t scaled_height = (source_height + choices[i].divider - 1) /
                                        choices[i].divider;
-        if (scaled_width <= CAMERA_OUTPUT_MAX_WIDTH &&
-            scaled_height <= CAMERA_OUTPUT_MAX_HEIGHT) {
+        if (scaled_width <= max_width && scaled_height <= max_height) {
             *scale = choices[i].scale;
             return true;
         }
@@ -193,31 +295,22 @@ static bool choose_scale(uint16_t source_width,
     return false;
 }
 
-static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
+static bool decode_jpeg_to_buffer(const uint8_t *input, size_t input_len,
+                                  uint8_t *output_buffer, size_t output_size,
+                                  uint16_t max_width, uint16_t max_height,
+                                  uint8_t *working_buffer,
+                                  uint16_t *output_width, uint16_t *output_height,
+                                  uint32_t *decode_us)
 {
-    static bool logged_format_diagnostic;
-    const int64_t decode_start_us = esp_timer_get_time();
-    /* Recover the newest complete JPEG when a malformed bulk UVC device
-     * concatenates an incomplete frame with the following frame. */
-    size_t candidate_soi = jpeg_len;
-    size_t selected_soi = jpeg_len;
-    size_t selected_end = 0;
-    for (size_t i = 0; i + 1 < jpeg_len; ++i) {
-        if (jpeg[i] == 0xff && jpeg[i + 1] == 0xd8) {
-            candidate_soi = i;
-        } else if (jpeg[i] == 0xff && jpeg[i + 1] == 0xd9 && candidate_soi < i) {
-            selected_soi = candidate_soi;
-            selected_end = i + 2;
-            candidate_soi = jpeg_len;
-        }
-    }
-    if (selected_soi == jpeg_len) {
+    const int64_t start_us = esp_timer_get_time();
+    size_t offset = 0;
+    size_t jpeg_len = 0;
+    if (!find_complete_jpeg(input, input_len, &offset, &jpeg_len)) {
         ESP_LOGW(TAG, "MJPEG frame has no complete JPEG SOI/EOI pair (len=%u)",
-                 (unsigned)jpeg_len);
+                 (unsigned)input_len);
         return false;
     }
-    jpeg += selected_soi;
-    jpeg_len = selected_end - selected_soi;
+    const uint8_t *jpeg = input + offset;
 
     esp_jpeg_image_cfg_t info_config = {
         .indata = jpeg,
@@ -229,46 +322,14 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
     esp_err_t err = esp_jpeg_get_image_info(&info_config, &source_info);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "MJPEG header is not a baseline JPEG: %s", esp_err_to_name(err));
-        if (!logged_format_diagnostic) {
-            logged_format_diagnostic = true;
-            size_t sof0 = 0, sof2 = 0, dht = 0, dqt = 0;
-            for (size_t i = 0; i + 1 < jpeg_len; ++i) {
-                if (jpeg[i] != 0xff) {
-                    continue;
-                }
-                switch (jpeg[i + 1]) {
-                case 0xc0: sof0++; break;
-                case 0xc2: sof2++; break;
-                case 0xc4: dht++; break;
-                case 0xdb: dqt++; break;
-                default: break;
-                }
-            }
-            char head[3 * 32 + 1] = {0};
-            size_t head_len = jpeg_len < 32 ? jpeg_len : 32;
-            for (size_t i = 0; i < head_len; ++i) {
-                snprintf(head + i * 3, 4, "%02x ", jpeg[i]);
-            }
-            char markers[160] = {0};
-            size_t marker_pos = 0;
-            for (size_t i = 0; i + 1 < jpeg_len && marker_pos + 8 < sizeof(markers); ++i) {
-                if (jpeg[i] == 0xff && jpeg[i + 1] != 0x00 && jpeg[i + 1] != 0xff) {
-                    int written = snprintf(markers + marker_pos, sizeof(markers) - marker_pos,
-                                            "%02x@%u ", jpeg[i + 1], (unsigned)i);
-                    if (written > 0) marker_pos += (size_t)written;
-                }
-            }
-            ESP_LOGW(TAG, "JPEG diagnostic len=%u SOF0=%u SOF2=%u DQT=%u DHT=%u head=%s",
-                     (unsigned)jpeg_len, (unsigned)sof0, (unsigned)sof2,
-                     (unsigned)dqt, (unsigned)dht, head);
-            ESP_LOGW(TAG, "JPEG markers: %s", markers);
-        }
+        log_jpeg_diagnostic(jpeg, jpeg_len);
         return false;
     }
 
     esp_jpeg_image_scale_t scale;
-    if (!choose_scale(source_info.width, source_info.height, &scale)) {
-         ESP_LOGW(TAG, "Frame %ux%u is too large for the decoded frame buffer",
+    if (!choose_scale(source_info.width, source_info.height,
+                      max_width, max_height, &scale)) {
+        ESP_LOGW(TAG, "Frame %ux%u is too large for the decoded frame buffer",
                  (unsigned)source_info.width, (unsigned)source_info.height);
         return false;
     }
@@ -276,16 +337,15 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
     esp_jpeg_image_cfg_t decode_config = {
         .indata = jpeg,
         .indata_size = jpeg_len,
-        .outbuf = s_display.rgb565,
-        .outbuf_size = CAMERA_DISPLAY_RGB565_BYTES,
+        .outbuf = output_buffer,
+        .outbuf_size = output_size,
         .out_format = JPEG_IMAGE_FORMAT_RGB565,
         .out_scale = scale,
         .flags = {
-             /* Keep RGB565 bytes in the order expected by the callback/TFT. */
             .swap_color_bytes = true,
         },
         .advanced = {
-            .working_buffer = s_display.jpeg_work,
+            .working_buffer = working_buffer,
             .working_buffer_size = CAMERA_DISPLAY_JPEG_WORK_BYTES,
         },
     };
@@ -296,84 +356,259 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
         return false;
     }
     if (output.width == 0 || output.height == 0 ||
-        output.width > CAMERA_OUTPUT_MAX_WIDTH ||
-        output.height > CAMERA_OUTPUT_MAX_HEIGHT ||
-        output.output_len > CAMERA_DISPLAY_RGB565_BYTES) {
+        output.width > max_width || output.height > max_height ||
+        output.output_len > output_size) {
         ESP_LOGW(TAG, "Unexpected decoded size %ux%u (%u bytes)",
-                 (unsigned)output.width, (unsigned)output.height, (unsigned)output.output_len);
+                 (unsigned)output.width, (unsigned)output.height,
+                 (unsigned)output.output_len);
         return false;
     }
-    s_display.last_decode_us = (uint32_t)(esp_timer_get_time() - decode_start_us);
-
-    const int64_t threshold_start_us = esp_timer_get_time();
-    const uint8_t threshold_candidate =
-        calculate_binary_threshold(s_display.rgb565, output.width, output.height);
-    const uint8_t source_threshold = filter_binary_threshold(threshold_candidate);
-    s_display.last_threshold_us =
-        (uint32_t)(esp_timer_get_time() - threshold_start_us);
-    s_display.binary_threshold = source_threshold;
-
-    bool draw_preview = false;
-#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
-    const int64_t now = esp_timer_get_time();
-    draw_preview = s_display.tft_ready &&
-                   (s_display.last_preview_us == 0 ||
-                    now - s_display.last_preview_us >= CAMERA_TFT_REFRESH_US);
-#endif
-
-    if (s_display.frame_callback != NULL) {
-        s_display.frame_callback(s_display.rgb565, output.width, output.height,
-                                 source_threshold, draw_preview,
-                                 s_display.frame_callback_ctx);
+    *output_width = output.width;
+    *output_height = output.height;
+    if (decode_us != NULL) {
+        *decode_us = (uint32_t)(esp_timer_get_time() - start_us);
     }
-
-#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
-    if (!draw_preview) {
-        return true;
-    }
-    if (output.width != s_display.previous_width || output.height != s_display.previous_height) {
-        tft_st7735_fill(0xffff);
-        s_display.previous_width = output.width;
-        s_display.previous_height = output.height;
-    }
-    const uint16_t crop_left = (uint16_t)(output.width *
-                                          CAMERA_TFT_CROP_LEFT_PERCENT / 100);
-    const uint16_t crop_top = (uint16_t)(output.height *
-                                         CAMERA_TFT_CROP_TOP_PERCENT / 100);
-    const uint16_t crop_right = (uint16_t)((output.width *
-                                           CAMERA_TFT_CROP_RIGHT_PERCENT / 100) - 1);
-    const uint16_t crop_bottom = (uint16_t)((output.height *
-                                            CAMERA_TFT_CROP_BOTTOM_PERCENT / 100) - 1);
-    const int64_t tft_start_us = esp_timer_get_time();
-    if (!tft_st7735_draw_rgb565_2x_crop(s_display.rgb565, output.width,
-                                        output.height, crop_left, crop_top,
-                                        crop_right, crop_bottom, 0xffff)) {
-        ESP_LOGW(TAG, "TFT draw failed");
-        return false;
-    }
-    s_display.last_tft_us = (uint32_t)(esp_timer_get_time() - tft_start_us);
-    s_display.last_preview_us = now;
-#endif
     return true;
 }
 
-static void camera_display_task(void *arg)
+static void release_jpeg_slot(uint8_t slot)
+{
+    if (xQueueSend(s_display.free_slots, &slot, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "JPEG frame pool corruption (slot=%u)", (unsigned)slot);
+    }
+}
+
+static bool enqueue_latest_preview(const preview_frame_ref_t *frame)
+{
+    if (xQueueSend(s_display.preview_slots, frame, 0) == pdTRUE) {
+        return true;
+    }
+
+    preview_frame_ref_t stale;
+    if (xQueueReceive(s_display.preview_slots, &stale, 0) == pdTRUE) {
+        release_jpeg_slot(stale.slot);
+        ++s_display.preview_dropped_frames;
+        ++s_display.frames_dropped;
+    }
+    if (xQueueSend(s_display.preview_slots, frame, 0) == pdTRUE) {
+        return true;
+    }
+    ++s_display.preview_dropped_frames;
+    ++s_display.frames_dropped;
+    return false;
+}
+
+static bool acquire_control_buffer(uint8_t *buffer)
+{
+    if (xQueueReceive(s_display.free_control_buffers, buffer, 0) == pdTRUE) {
+        return true;
+    }
+
+    /* The control queue is latest-only too. Recycle a frame not yet consumed. */
+    control_frame_ref_t stale;
+    if (xQueueReceive(s_display.ready_control_frames, &stale, 0) == pdTRUE) {
+        *buffer = stale.buffer;
+        ++s_display.control_dropped_frames;
+        ++s_display.frames_dropped;
+        return true;
+    }
+    return false;
+}
+
+static bool enqueue_latest_control(const control_frame_ref_t *frame)
+{
+    if (xQueueSend(s_display.ready_control_frames, frame, 0) == pdTRUE) {
+        return true;
+    }
+
+    control_frame_ref_t stale;
+    if (xQueueReceive(s_display.ready_control_frames, &stale, 0) == pdTRUE) {
+        if (xQueueSend(s_display.free_control_buffers, &stale.buffer, 0) != pdTRUE) {
+            ESP_LOGE(TAG, "Control frame pool corruption");
+        }
+        ++s_display.control_dropped_frames;
+        ++s_display.frames_dropped;
+    }
+    if (xQueueSend(s_display.ready_control_frames, frame, 0) == pdTRUE) {
+        return true;
+    }
+    if (xQueueSend(s_display.free_control_buffers, &frame->buffer, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "Control frame pool corruption");
+    }
+    ++s_display.control_dropped_frames;
+    ++s_display.frames_dropped;
+    return false;
+}
+
+static void camera_control_task(void *arg)
 {
     (void)arg;
-    uint8_t slot;
-
+    control_frame_ref_t frame;
     while (true) {
-        if (xQueueReceive(s_display.ready_slots, &slot, portMAX_DELAY) != pdTRUE) {
+        if (xQueueReceive(s_display.ready_control_frames, &frame, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        const int64_t now = esp_timer_get_time();
+        const int64_t age = now >= frame.capture_us ? now - frame.capture_us : 0;
+        s_display.last_control_age_us = age > UINT32_MAX ? UINT32_MAX : (uint32_t)age;
+        s_display.last_control_sequence = frame.sequence;
+        if (s_display.frame_callback != NULL) {
+            ++s_display.control_frames;
+            s_display.frame_callback(s_display.control_rgb565[frame.buffer],
+                                     frame.width, frame.height, frame.threshold,
+                                     false, s_display.frame_callback_ctx);
+        }
+        if (xQueueSend(s_display.free_control_buffers, &frame.buffer, 0) != pdTRUE) {
+            ESP_LOGE(TAG, "Control frame pool corruption after callback");
+        }
+    }
+}
+
+static void camera_preview_task(void *arg)
+{
+    (void)arg;
+    preview_frame_ref_t frame;
+    while (true) {
+        if (xQueueReceive(s_display.preview_slots, &frame, portMAX_DELAY) != pdTRUE) {
             continue;
         }
 
-        if (decode_and_draw(s_display.jpeg_slots[slot], s_display.jpeg_sizes[slot])) {
-            s_display.processed_frames++;
+        uint16_t width = 0;
+        uint16_t height = 0;
+        uint32_t decode_us = 0;
+        const bool decoded = decode_jpeg_to_buffer(
+            s_display.jpeg_slots[frame.slot], frame.jpeg_len,
+            s_display.preview_rgb565, CAMERA_PREVIEW_RGB565_BYTES,
+            CAMERA_PREVIEW_MAX_WIDTH, CAMERA_PREVIEW_MAX_HEIGHT,
+            s_display.preview_jpeg_work, &width, &height, &decode_us);
+        s_display.last_preview_decode_us = decode_us;
+        if (decoded) {
+            ++s_display.preview_frames;
+            if (s_display.preview_callback != NULL) {
+                s_display.preview_callback(s_display.preview_rgb565, width, height,
+                                            frame.threshold,
+                                            frame.sequence, frame.capture_us,
+                                            s_display.preview_callback_ctx);
+            }
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+            if (s_display.tft_ready) {
+                if (width != s_display.previous_preview_width ||
+                    height != s_display.previous_preview_height) {
+                    (void)tft_st7735_fill(0xffff);
+                    s_display.previous_preview_width = width;
+                    s_display.previous_preview_height = height;
+                }
+                uint16_t crop_right = (uint16_t)((width *
+                                                  CAMERA_TFT_CROP_RIGHT_PERCENT / 100) - 1);
+                uint16_t crop_bottom = (uint16_t)((height *
+                                                   CAMERA_TFT_CROP_BOTTOM_PERCENT / 100) - 1);
+                const uint16_t crop_left = (uint16_t)(width *
+                                                       CAMERA_TFT_CROP_LEFT_PERCENT / 100);
+                const uint16_t crop_top = (uint16_t)(height *
+                                                      CAMERA_TFT_CROP_TOP_PERCENT / 100);
+                if (crop_right >= width) {
+                    crop_right = width - 1;
+                }
+                if (crop_bottom >= height) {
+                    crop_bottom = height - 1;
+                }
+                const int64_t tft_start_us = esp_timer_get_time();
+                if (!tft_st7735_draw_rgb565_2x_crop(
+                        s_display.preview_rgb565, width, height,
+                        crop_left, crop_top, crop_right, crop_bottom, 0xffff)) {
+                    ESP_LOGW(TAG, "TFT draw failed");
+                } else {
+                    s_display.last_tft_us =
+                        (uint32_t)(esp_timer_get_time() - tft_start_us);
+                }
+            }
+#endif
         }
-        if (xQueueSend(s_display.free_slots, &slot, pdMS_TO_TICKS(100)) != pdTRUE) {
-            ESP_LOGE(TAG, "Display frame pool corruption");
+        release_jpeg_slot(frame.slot);
+    }
+}
+
+static void camera_decode_task(void *arg)
+{
+    (void)arg;
+    jpeg_frame_ref_t frame;
+    while (true) {
+        if (xQueueReceive(s_display.ready_slots, &frame, portMAX_DELAY) != pdTRUE) {
+            continue;
         }
 
+        uint8_t control_buffer = 0;
+        uint16_t width = 0;
+        uint16_t height = 0;
+        uint32_t decode_us = 0;
+        bool control_buffer_acquired = false;
+        bool control_decoded = false;
+        if (acquire_control_buffer(&control_buffer)) {
+            control_buffer_acquired = true;
+            control_decoded = decode_jpeg_to_buffer(
+                s_display.jpeg_slots[frame.slot], frame.jpeg_len,
+                s_display.control_rgb565[control_buffer], CAMERA_CONTROL_RGB565_BYTES,
+                CAMERA_CONTROL_MAX_WIDTH, CAMERA_CONTROL_MAX_HEIGHT,
+                s_display.control_jpeg_work, &width, &height, &decode_us);
+            s_display.last_control_decode_us = decode_us;
+        } else {
+            ++s_display.control_dropped_frames;
+            ++s_display.frames_dropped;
+        }
+
+        if (control_decoded) {
+            const int64_t threshold_start_us = esp_timer_get_time();
+            const uint8_t threshold_candidate =
+                calculate_binary_threshold(s_display.control_rgb565[control_buffer],
+                                           width, height);
+            const uint8_t source_threshold = filter_binary_threshold(threshold_candidate);
+            s_display.last_threshold_us =
+                (uint32_t)(esp_timer_get_time() - threshold_start_us);
+            s_display.binary_threshold = source_threshold;
+            control_frame_ref_t control = {
+                .buffer = control_buffer,
+                .width = width,
+                .height = height,
+                .threshold = source_threshold,
+                .sequence = frame.sequence,
+                .capture_us = frame.capture_us,
+            };
+            if (enqueue_latest_control(&control)) {
+                ++s_display.processed_frames;
+            }
+        } else if (control_buffer_acquired) {
+            if (xQueueSend(s_display.free_control_buffers, &control_buffer, 0) != pdTRUE) {
+                ESP_LOGE(TAG, "Control frame pool corruption after decode failure");
+            }
+        }
+
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+        const int64_t now = esp_timer_get_time();
+        const bool preview_due = s_display.tft_ready &&
+                                 (s_display.last_preview_us == 0 ||
+                                  now - s_display.last_preview_us >= CAMERA_TFT_REFRESH_US);
+        if (preview_due) {
+            preview_frame_ref_t preview = {
+                .slot = frame.slot,
+                .jpeg_len = frame.jpeg_len,
+                .sequence = frame.sequence,
+                .capture_us = frame.capture_us,
+                .threshold = s_display.binary_threshold,
+            };
+            if (!enqueue_latest_preview(&preview)) {
+                release_jpeg_slot(frame.slot);
+            } else {
+                /* Reserve the next preview period when the request is queued,
+                 * so a slow SPI transfer or a decode error cannot turn the
+                 * debug path into a per-camera-frame operation. */
+                s_display.last_preview_us = now;
+            }
+        } else {
+            release_jpeg_slot(frame.slot);
+        }
+#else
+        release_jpeg_slot(frame.slot);
+#endif
     }
 }
 
@@ -383,10 +618,16 @@ static void release_allocations(void)
         heap_caps_free(s_display.jpeg_slots[i]);
         s_display.jpeg_slots[i] = NULL;
     }
-    heap_caps_free(s_display.rgb565);
-    s_display.rgb565 = NULL;
-    heap_caps_free(s_display.jpeg_work);
-    s_display.jpeg_work = NULL;
+    for (size_t i = 0; i < CAMERA_CONTROL_BUFFER_COUNT; ++i) {
+        heap_caps_free(s_display.control_rgb565[i]);
+        s_display.control_rgb565[i] = NULL;
+    }
+    heap_caps_free(s_display.preview_rgb565);
+    s_display.preview_rgb565 = NULL;
+    heap_caps_free(s_display.control_jpeg_work);
+    s_display.control_jpeg_work = NULL;
+    heap_caps_free(s_display.preview_jpeg_work);
+    s_display.preview_jpeg_work = NULL;
     if (s_display.free_slots != NULL) {
         vQueueDelete(s_display.free_slots);
         s_display.free_slots = NULL;
@@ -394,6 +635,18 @@ static void release_allocations(void)
     if (s_display.ready_slots != NULL) {
         vQueueDelete(s_display.ready_slots);
         s_display.ready_slots = NULL;
+    }
+    if (s_display.preview_slots != NULL) {
+        vQueueDelete(s_display.preview_slots);
+        s_display.preview_slots = NULL;
+    }
+    if (s_display.free_control_buffers != NULL) {
+        vQueueDelete(s_display.free_control_buffers);
+        s_display.free_control_buffers = NULL;
+    }
+    if (s_display.ready_control_frames != NULL) {
+        vQueueDelete(s_display.ready_control_frames);
+        s_display.ready_control_frames = NULL;
     }
 }
 
@@ -404,34 +657,50 @@ esp_err_t camera_display_start(void)
     }
     s_display.camera_frames = 0;
     s_display.processed_frames = 0;
+    s_display.control_frames = 0;
+    s_display.preview_frames = 0;
     s_display.frames_dropped = 0;
+    s_display.control_dropped_frames = 0;
+    s_display.preview_dropped_frames = 0;
     s_display.binary_threshold = 0;
     s_display.threshold_initialized = false;
     s_display.threshold_filtered = 0;
-    s_display.last_decode_us = 0;
+    s_display.last_control_decode_us = 0;
+    s_display.last_preview_decode_us = 0;
     s_display.last_threshold_us = 0;
     s_display.last_tft_us = 0;
+    s_display.last_control_age_us = 0;
+    s_display.last_control_sequence = 0;
     s_display.last_preview_us = 0;
+    s_display.previous_preview_width = 0;
+    s_display.previous_preview_height = 0;
+    s_display.next_sequence = 0;
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
     s_display.tft_ready = tft_st7735_init();
     if (!s_display.tft_ready) {
-        ESP_LOGW(TAG, "ST7735 unavailable; decoded-frame callbacks remain active");
+        ESP_LOGW(TAG, "ST7735 unavailable; control pipeline remains active");
     }
 #else
     s_display.tft_ready = false;
 #endif
 
     s_display.free_slots = xQueueCreate(CAMERA_DISPLAY_SLOT_COUNT, sizeof(uint8_t));
-    s_display.ready_slots = xQueueCreate(1, sizeof(uint8_t));
-    if (s_display.free_slots == NULL || s_display.ready_slots == NULL) {
-        ESP_LOGE(TAG, "Could not allocate display queues");
+    s_display.ready_slots = xQueueCreate(1, sizeof(jpeg_frame_ref_t));
+    s_display.preview_slots = xQueueCreate(1, sizeof(preview_frame_ref_t));
+    s_display.free_control_buffers =
+        xQueueCreate(CAMERA_CONTROL_BUFFER_COUNT, sizeof(uint8_t));
+    s_display.ready_control_frames = xQueueCreate(1, sizeof(control_frame_ref_t));
+    if (s_display.free_slots == NULL || s_display.ready_slots == NULL ||
+        s_display.preview_slots == NULL || s_display.free_control_buffers == NULL ||
+        s_display.ready_control_frames == NULL) {
+        ESP_LOGE(TAG, "Could not allocate camera pipeline queues");
         release_allocations();
         return ESP_ERR_NO_MEM;
     }
 
     for (uint8_t slot = 0; slot < CAMERA_DISPLAY_SLOT_COUNT; ++slot) {
-        s_display.jpeg_slots[slot] = heap_caps_malloc(CAMERA_DISPLAY_MAX_JPEG_BYTES,
-                                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_display.jpeg_slots[slot] = heap_caps_malloc(
+            CAMERA_DISPLAY_MAX_JPEG_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (s_display.jpeg_slots[slot] == NULL ||
             xQueueSend(s_display.free_slots, &slot, 0) != pdTRUE) {
             ESP_LOGE(TAG, "Could not allocate JPEG frame buffer %u", slot);
@@ -439,37 +708,60 @@ esp_err_t camera_display_start(void)
             return ESP_ERR_NO_MEM;
         }
     }
-
-    s_display.rgb565 = heap_caps_malloc(CAMERA_DISPLAY_RGB565_BYTES,
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_display.rgb565 == NULL) {
-        ESP_LOGE(TAG, "Could not allocate RGB565 frame buffer");
+    for (uint8_t buffer = 0; buffer < CAMERA_CONTROL_BUFFER_COUNT; ++buffer) {
+        s_display.control_rgb565[buffer] = heap_caps_malloc(
+            CAMERA_CONTROL_RGB565_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_display.control_rgb565[buffer] == NULL ||
+            xQueueSend(s_display.free_control_buffers, &buffer, 0) != pdTRUE) {
+            ESP_LOGE(TAG, "Could not allocate control RGB565 buffer %u", buffer);
+            release_allocations();
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    s_display.control_jpeg_work = heap_caps_malloc(
+        CAMERA_DISPLAY_JPEG_WORK_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (s_display.control_jpeg_work == NULL) {
+        ESP_LOGE(TAG, "Could not allocate camera decode buffers");
         release_allocations();
         return ESP_ERR_NO_MEM;
     }
-
-    s_display.jpeg_work = heap_caps_malloc(CAMERA_DISPLAY_JPEG_WORK_BYTES,
-                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (s_display.jpeg_work == NULL) {
-        ESP_LOGE(TAG, "Could not allocate JPEG working buffer");
-        release_allocations();
-        return ESP_ERR_NO_MEM;
-    }
-
-    if (xTaskCreate(camera_display_task, "camera_decode", 6144, NULL, 4, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "Could not create camera decoder task");
-        release_allocations();
-        return ESP_ERR_NO_MEM;
-    }
-
-    s_display.started = true;
-    ESP_LOGI(TAG, "Camera decoder started; adaptive threshold, TFT preview=%s; JPEG frames larger than %u bytes are skipped",
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
-             s_display.tft_ready ? "ready" : "unavailable",
-#else
-             "disabled",
+    s_display.preview_rgb565 = heap_caps_malloc(
+        CAMERA_PREVIEW_RGB565_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_display.preview_jpeg_work = heap_caps_malloc(
+        CAMERA_DISPLAY_JPEG_WORK_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (s_display.preview_rgb565 == NULL || s_display.preview_jpeg_work == NULL) {
+        ESP_LOGE(TAG, "Could not allocate TFT preview buffers");
+        release_allocations();
+        return ESP_ERR_NO_MEM;
+    }
 #endif
-             CAMERA_DISPLAY_MAX_JPEG_BYTES);
+
+    if (xTaskCreatePinnedToCore(camera_decode_task, "camera_decode", 6144,
+                                NULL, 5, NULL, 0) != pdPASS ||
+        xTaskCreatePinnedToCore(camera_control_task, "camera_control", 4096,
+                                NULL, 5, NULL, 1) != pdPASS) {
+        ESP_LOGE(TAG, "Could not create camera control tasks");
+        return ESP_ERR_NO_MEM;
+    }
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+    if (s_display.tft_ready &&
+        xTaskCreatePinnedToCore(camera_preview_task, "camera_preview", 6144,
+                                NULL, 2, NULL, 1) != pdPASS) {
+        ESP_LOGW(TAG, "Could not create TFT preview task; control remains active");
+        s_display.tft_ready = false;
+    }
+#endif
+    s_display.started = true;
+    ESP_LOGI(TAG, "Camera pipeline started: control <=%ux%u, preview <=%ux%u, TFT=%s",
+             CAMERA_CONTROL_MAX_WIDTH, CAMERA_CONTROL_MAX_HEIGHT,
+             CAMERA_PREVIEW_MAX_WIDTH, CAMERA_PREVIEW_MAX_HEIGHT,
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+             s_display.tft_ready ? "2.5fps" : "unavailable"
+#else
+             "disabled"
+#endif
+             );
     return ESP_OK;
 }
 
@@ -480,14 +772,22 @@ void camera_display_set_frame_callback(camera_display_frame_callback_t callback,
     s_display.frame_callback_ctx = user_ctx;
 }
 
+void camera_display_set_preview_callback(camera_display_preview_callback_t callback,
+                                         void *user_ctx)
+{
+    s_display.preview_callback = callback;
+    s_display.preview_callback_ctx = user_ctx;
+}
+
 bool camera_display_submit(const uint8_t *jpeg, size_t jpeg_len)
 {
     if (!s_display.started || jpeg == NULL || jpeg_len == 0) {
         return false;
     }
-    s_display.camera_frames++;
+    ++s_display.camera_frames;
     if (jpeg_len > CAMERA_DISPLAY_MAX_JPEG_BYTES) {
-        if ((++s_display.frames_dropped % 100U) == 1U) {
+        ++s_display.frames_dropped;
+        if (s_display.frames_dropped % 100U == 1U) {
             ESP_LOGW(TAG, "Dropping %u-byte JPEG; input limit is %u bytes",
                      (unsigned)jpeg_len, CAMERA_DISPLAY_MAX_JPEG_BYTES);
         }
@@ -496,49 +796,74 @@ bool camera_display_submit(const uint8_t *jpeg, size_t jpeg_len)
 
     uint8_t slot;
     if (xQueueReceive(s_display.free_slots, &slot, 0) != pdTRUE) {
-        // A queued frame is already stale. Reuse its slot rather than making
-        // the USB callback wait for the decoder and TFT transfer.
-        if (xQueueReceive(s_display.ready_slots, &slot, 0) != pdTRUE) {
-            s_display.frames_dropped++;
+        jpeg_frame_ref_t stale;
+        if (xQueueReceive(s_display.ready_slots, &stale, 0) != pdTRUE) {
+            ++s_display.frames_dropped;
             return false;
         }
-        s_display.frames_dropped++;
+        slot = stale.slot;
+        ++s_display.frames_dropped;
     }
 
+    const int64_t capture_us = esp_timer_get_time();
     memcpy(s_display.jpeg_slots[slot], jpeg, jpeg_len);
-    s_display.jpeg_sizes[slot] = jpeg_len;
-    if (xQueueSend(s_display.ready_slots, &slot, 0) == pdTRUE) {
+    jpeg_frame_ref_t frame = {
+        .slot = slot,
+        .jpeg_len = jpeg_len,
+        .sequence = ++s_display.next_sequence,
+        .capture_us = capture_us,
+    };
+    if (xQueueSend(s_display.ready_slots, &frame, 0) == pdTRUE) {
         return true;
     }
 
-    // A new frame arrived while a previous one was queued. Keep only this
-    // newer frame and return the replaced slot to the free pool.
-    uint8_t stale_slot;
-    if (xQueueReceive(s_display.ready_slots, &stale_slot, 0) == pdTRUE) {
-        xQueueSend(s_display.free_slots, &stale_slot, 0);
-        s_display.frames_dropped++;
+    jpeg_frame_ref_t stale;
+    if (xQueueReceive(s_display.ready_slots, &stale, 0) == pdTRUE) {
+        release_jpeg_slot(stale.slot);
+        ++s_display.frames_dropped;
     }
-    if (xQueueSend(s_display.ready_slots, &slot, 0) == pdTRUE) {
+    if (xQueueSend(s_display.ready_slots, &frame, 0) == pdTRUE) {
         return true;
     }
-
-    xQueueSend(s_display.free_slots, &slot, 0);
-    s_display.frames_dropped++;
+    release_jpeg_slot(slot);
+    ++s_display.frames_dropped;
     return false;
+}
+
+void camera_display_get_pipeline_stats(camera_display_pipeline_stats_t *stats)
+{
+    if (stats == NULL) {
+        return;
+    }
+    stats->camera_frames = s_display.camera_frames;
+    stats->processed_frames = s_display.processed_frames;
+    stats->control_frames = s_display.control_frames;
+    stats->preview_frames = s_display.preview_frames;
+    stats->frames_dropped = s_display.frames_dropped;
+    stats->control_dropped_frames = s_display.control_dropped_frames;
+    stats->preview_dropped_frames = s_display.preview_dropped_frames;
+    stats->control_decode_us = s_display.last_control_decode_us;
+    stats->preview_decode_us = s_display.last_preview_decode_us;
+    stats->threshold_us = s_display.last_threshold_us;
+    stats->tft_us = s_display.last_tft_us;
+    stats->last_control_age_us = s_display.last_control_age_us;
+    stats->last_control_sequence = s_display.last_control_sequence;
 }
 
 void camera_display_get_counters(uint32_t *camera_frames,
                                  uint32_t *processed_frames,
                                  uint32_t *dropped_frames)
 {
+    camera_display_pipeline_stats_t stats;
+    camera_display_get_pipeline_stats(&stats);
     if (camera_frames != NULL) {
-        *camera_frames = s_display.camera_frames;
+        *camera_frames = stats.camera_frames;
     }
     if (processed_frames != NULL) {
-        *processed_frames = s_display.processed_frames;
+        *processed_frames = stats.processed_frames;
     }
     if (dropped_frames != NULL) {
-        *dropped_frames = s_display.frames_dropped;
+        *dropped_frames = stats.frames_dropped;
     }
 }
 
@@ -546,13 +871,15 @@ void camera_display_get_timing(uint32_t *decode_us,
                                uint32_t *threshold_us,
                                uint32_t *tft_us)
 {
+    camera_display_pipeline_stats_t stats;
+    camera_display_get_pipeline_stats(&stats);
     if (decode_us != NULL) {
-        *decode_us = s_display.last_decode_us;
+        *decode_us = stats.control_decode_us;
     }
     if (threshold_us != NULL) {
-        *threshold_us = s_display.last_threshold_us;
+        *threshold_us = stats.threshold_us;
     }
     if (tft_us != NULL) {
-        *tft_us = s_display.last_tft_us;
+        *tft_us = stats.tft_us;
     }
 }

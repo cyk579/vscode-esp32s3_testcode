@@ -231,6 +231,7 @@ bool line_geometry_track(const uint8_t *frame,
     *observation = empty;
     observation->threshold = cfg->threshold;
     observation->corner_row_y = -1;
+    observation->corner_x = -1;
     observation->scan_bottom_y = -1;
     const int width = line_geometry_scan_width(cfg);
     const int height = line_geometry_scan_height(cfg);
@@ -298,6 +299,7 @@ bool line_geometry_track(const uint8_t *frame,
             /* 形状事件：质心不可用，记下方向和所在行就结束向上跟踪。
              * 双侧敞开 = 终点 T / 十字；单侧敞开 = 直角或锐角弯。 */
             observation->corner_row_y = y;
+            observation->corner_x = segment.center;
             if (segment.kind == LINE_ROW_WIDE_BOTH) {
                 observation->finish_candidate = point_count >= LINE_FINISH_STEM_ROWS &&
                                                 y >= near_top;

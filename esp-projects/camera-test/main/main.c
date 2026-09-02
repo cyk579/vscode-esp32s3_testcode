@@ -113,11 +113,11 @@ typedef struct {
     const char* name;
 } uvc_stream_profile_t;
 
-/* 优先使用 320x240@30：源 JPEG 像素更少，ESP32-S3 软件解码吞吐明显高于
- * 480x320@25，同时保留完整的 320x240 巡线输入。 */
+/* 保持当前摄像头的 480x320@25 输入；控制解码器再做 1/4 缩放。
+ * 若设备不接受该档位，再退回到 320x240@30。 */
 uvc_stream_profile_t uvc_stream_profiles[EXAMPLE_UVC_PROTOCOL_AUTO_COUNT] = {
-    {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, "320x240, fps 30"},
     {UVC_FRAME_FORMAT_MJPEG, 480, 320, 25, "480x320, fps 25"},
+    {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, "320x240, fps 30"},
     {UVC_FRAME_FORMAT_MJPEG, 480, 320,  0, "480x320, any fps"},
     {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, "640x480, fps 15"},
     {UVC_FRAME_FORMAT_MJPEG, 1280, 720,  0, "1280x720, any fps"}
@@ -311,6 +311,7 @@ void app_main(void)
     esp_err_t line_follow_err = camera_line_follow_start();
     if (line_follow_err == ESP_OK) {
         camera_display_set_frame_callback(camera_line_follow_frame_callback, NULL);
+        camera_display_set_preview_callback(camera_line_follow_preview_callback, NULL);
         ESP_LOGI(TAG, "Camera black-line following enabled; TB6612 standby is held low until arm");
     } else {
         ESP_LOGE(TAG, "Camera black-line following disabled: %s", esp_err_to_name(line_follow_err));

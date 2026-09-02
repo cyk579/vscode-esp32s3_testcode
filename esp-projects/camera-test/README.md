@@ -52,7 +52,7 @@ ESP32-S3 原生 USB OTG 的引脚固定如下：
 
 ### ST7735 显示屏
 
-本仓库已经按 `LQ_TFT18SPIV33`、常见 `ST7735`、`128x160` 分辨率适配。程序以横屏方式工作。巡线始终使用最高 `320x240` 的解码画面；TFT 刷新时才逐行 2:1 抽样为 `160x120`，不分配第二张完整图像。`Example Configuration -> Enable TFT preview` 当前默认开启用于实车诊断。
+本仓库已经按 `LQ_TFT18SPIV33`、常见 `ST7735`、`128x160` 分辨率适配。程序以横屏方式工作。控制链路将当前 `480x320` JPEG 缩放为约 `120x80`；TFT 预览独立解码为 `240x160`，再逐行 2:1 抽样到屏幕，不占用控制缓冲。`Example Configuration -> Enable TFT preview` 当前默认开启用于实车诊断。
 
 | ESP32-S3 | TFT | 说明 |
 | --- | --- | --- |
@@ -130,7 +130,7 @@ idf.py -p COM6 -b 115200 flash
 
 ## 查看图像：屏幕和电脑
 
-接好屏幕后，摄像头一旦开始 `Streaming...`，屏幕会以约 2.5 FPS 显示原始彩色画面；绿色稀疏点是实际中心点序列，红色十字是底部 seed。巡线回调仍按摄像头处理帧率运行，只有待刷新的帧才绘制 overlay 并逐行下采样到 TFT，不生成整幅二值图或第二张 framebuffer。
+接好屏幕后，摄像头一旦开始 `Streaming...`，屏幕会以约 2.5 FPS 显示原始彩色画面；绿色稀疏点是控制链路实际中心点序列，红色十字是底部 seed，黄色点表示已检测支路。巡线控制与 TFT 解码/刷屏由独立任务完成，不生成整幅二值图或第二张 framebuffer。
 
 建议按以下顺序做首次功能验证：
 
@@ -175,18 +175,19 @@ py -3.13 player.py --headless --frames 1 --save camera_capture.jpg
 
 不要在 ESP-IDF 自带的 Python 环境中使用裸命令 `python player.py`；该环境通常未安装 OpenCV。本机已经在 Python 3.13 中安装并验证了 OpenCV，因此使用 `py -3.13` 可以明确选择正确的解释器。
 
-ESP32-S3 是 USB Full Speed Host，自动协商按响应速度优先依次尝试 MJPEG `320×240@30 FPS`、`480×320@15 FPS`、`480×320` 首个可用帧率、`640×480@15 FPS`，最后才尝试 `1280×720` 首个可用帧率。高分辨率帧会在解码时缩小到适合巡线和可选 TFT 的低分辨率画面；单帧 JPEG 缓冲上限为 256 KiB。如果可以枚举但无法协商视频格式，说明 D+/D- 已经接对，但该摄像头可能不是标准 UVC/MJPEG 设备，或者不支持这些分辨率。
+ESP32-S3 是 USB Full Speed Host，自动协商按响应速度优先依次尝试 MJPEG `480×320@25 FPS`、`320×240@30 FPS`、`480×320` 首个可用帧率、`640×480@15 FPS`，最后才尝试 `1280×720` 首个可用帧率。当前摄像头通常使用 `480×320@25`；控制解码缩小到约 `120×80`，TFT 预览独立缩小到 `240×160`。单帧 JPEG 缓冲上限为 256 KiB。如果可以枚举但无法协商视频格式，说明 D+/D- 已经接对，但该摄像头可能不是标准 UVC/MJPEG 设备，或者不支持这些分辨率。
 
 ## 摄像头巡黑线
 
 `Enable camera black-line following` 默认开启。比赛模式的数据链路为：
 
 ```text
-UVC MJPEG -> 最新帧覆盖队列 -> JPEG 解码 RGB565 -> 一次自适应阈值
-           -> 局部巡线扫描 -> 整数 PD -> TB6612 电机控制
+UVC MJPEG(480x320@25) -> 三槽位最新帧队列
+       -> 控制解码 1/4(约120x80) -> 自适应阈值 -> 局部巡线 -> PD -> TB6612
+       -> 低优先级预览解码 1/2(约240x160) -> 稀疏 overlay -> TFT(约2.5 FPS)
 ```
 
-解码后保留原始 RGB565，巡线只扫描底部种子和相邻搜索窗口，不生成整幅二值图，也不对全宽黑像素做主要重心定位。阈值从 ROI 直方图计算，并用整数帧间低通/变化限幅抑制光照抖动；每个被扫描像素只计算一次亮度并与阈值比较。TFT 的低频 overlay 和 2:1 逐行下采样均发生在本帧巡线判断之后。
+解码后保留原始 RGB565，控制链路只扫描底部种子和相邻搜索窗口，不生成整幅二值图，也不对全宽黑像素做主要重心定位。阈值从控制帧 ROI 直方图计算，并用整数帧间低通/变化限幅抑制光照抖动；每个被扫描像素只计算一次亮度并与阈值比较。预览解码、overlay 和 2:1 逐行下采样在低优先级任务中完成，不能阻塞控制帧。
 
 赛道跟踪从画面底部开始：有历史时只在上一帧 `seed_x` 附近找线，无历史时选择靠近画面中心的合理黑线段。后续扫描行只在上一中心点固定窗口内寻找连续线段，并检查线宽和相邻中心点的最大横向跳变。这样侧面或远处的大片黑块不会抢走当前赛道。
 
@@ -203,7 +204,7 @@ UVC MJPEG -> 最新帧覆盖队列 -> JPEG 解码 RGB565 -> 一次自适应阈�
 巡线模块每秒输出一行摘要，不逐帧打印、不保存图片。摘要至少包含：
 
 ```text
-camera_fps processed_fps control_fps frames_dropped
+camera_fps decoded_fps control_fps preview_fps frames_dropped frame_age_ms
 line_us_avg line_us_max state armed candidate arm_frames threshold
 seed_x valid_rows confidence lateral_error heading_error pending_turn
 STBY motor[A,B,D]
