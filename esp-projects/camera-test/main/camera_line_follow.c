@@ -43,8 +43,8 @@
 
 /* ROI、行距、逐行搜索和线段判据全部在 line_geometry.h 里，ESP 端和 host
  * 回归测试共用同一组常量。这里只保留状态机自己的窗口策略和时序。 */
-#define LINE_LOST_WINDOW_GROW_PERCENT 4
-#define LINE_LOST_WINDOW_MAX_PERCENT 42
+#define LINE_LOST_WINDOW_GROW_PERCENT 5
+#define LINE_LOST_WINDOW_MAX_PERCENT 48
 #define LINE_CORNER_WINDOW_START_PERCENT 28
 #define LINE_CORNER_WINDOW_GROW_PERCENT 4
 #define LINE_CORNER_WINDOW_MAX_PERCENT 46
@@ -66,19 +66,25 @@
 #define LINE_ARM_CONFIRM_FRAMES 3U
 #define LINE_MOTOR_START_RAMP_MS 700
 #define LINE_MOTOR_START_MIN_OUTPUT 14
-#define LINE_LOST_HOLD_MS 300U
-#define LINE_LOST_STOP_MS 900U
+#define LINE_LOST_HOLD_MS 600U
+#define LINE_LOST_STOP_MS 1800U
 #define LINE_FRAME_TIMEOUT_MS 1200U
 #define LINE_FINISH_CONFIRM_FRAMES 5U
 /* 终点 T 停车。调巡线时可以临时置 0，避免把"误停"当成"丢线"。 */
 #define LINE_FINISH_ENABLE 1
 
 /* 22% 是 car-spin 已验证的低速可持续区间；斜坡仍按控制周期平滑上升。 */
-#define LINE_FORWARD_FAST 30
-#define LINE_FORWARD_MEDIUM 28
-#define LINE_FORWARD_SLOW 24
-#define LINE_FORWARD_CRAWL 18
-#define LINE_FORWARD_SLEW 8
+#define LINE_FORWARD_FAST 22
+#define LINE_FORWARD_MEDIUM 20
+#define LINE_FORWARD_SLOW 18
+#define LINE_FORWARD_CRAWL 14
+#define LINE_FORWARD_SLEW 4
+
+/* A two-point partial scan is often a one-frame JPEG/lighting miss, not a
+ * genuine loss of the track. Keep the previous steering briefly while the
+ * detector catches up, but do not let partial noise extend the line age. */
+#define LINE_PARTIAL_MIN_POINTS 2
+#define LINE_PARTIAL_TRACK_HOLD_MS 450U
 
 /* 误差门限。|error| 被 ROI 夹在 55 以内（center 只能落在 48..191），所以
  * 原来的 LINE_ERROR_LARGE=60 在 NORMAL 里永远不可达，CRAWL 那一档是死的。 */
@@ -102,8 +108,8 @@
 #define LINE_SEED_SLEW_PX 12
 
 /* 折角：事件行进入画面下方 88% 才动手；更远处只降速，避免提前转弯。 */
-#define LINE_TURN_TRIGGER_PERCENT 88
-#define LINE_TURN_HINT_FRAMES 2U
+#define LINE_TURN_TRIGGER_PERCENT 80
+#define LINE_TURN_HINT_FRAMES 1U
 #define LINE_TURN_EXIT_FRAMES 2U
 /* 旋转至少持续这么久才接受退出，否则第一帧还在看入弯前那条线就会假退出，
  * 然后立刻又检测到同一个折角，来回抖。 */
@@ -415,7 +421,14 @@ static void save_overlay_snapshot(uint16_t width, uint16_t height,
     if (xSemaphoreTake(s_overlay_mutex, 0) != pdTRUE) {
         return;
     }
-    s_overlay_snapshot.valid = observation->point_count > 0;
+    /* Keep the last usable overlay through a detector miss. Clearing it here
+     * made the TFT appear to stop updating exactly when the car lost the line,
+     * which hid the evidence needed to tune the controller. */
+    if (observation->point_count == 0) {
+        (void)xSemaphoreGive(s_overlay_mutex);
+        return;
+    }
+    s_overlay_snapshot.valid = true;
     s_overlay_snapshot.control_width = width;
     s_overlay_snapshot.control_height = height;
     s_overlay_snapshot.rotation = CAMERA_LINE_ROTATION;
@@ -1029,9 +1042,27 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     if (s_state == LINE_STATE_LOST && s_lost_frames < UINT32_MAX) {
         ++s_lost_frames;
     }
-    const bool candidate = observe_line(rgb565_big_endian, width, height,
-                                        source_threshold, draw_overlay,
-                                        &observation);
+    const bool detector_candidate = observe_line(rgb565_big_endian, width, height,
+                                                 source_threshold, draw_overlay,
+                                                 &observation);
+    bool candidate = detector_candidate;
+    bool partial_candidate = false;
+    if (!detector_candidate && s_armed && s_state == LINE_STATE_NORMAL &&
+        s_seed_valid && observation.point_count >= LINE_PARTIAL_MIN_POINTS &&
+        observation.near_normal_rows >= LINE_PARTIAL_MIN_POINTS &&
+        s_last_line_us != 0 &&
+        now - s_last_line_us <= (int64_t)LINE_PARTIAL_TRACK_HOLD_MS * 1000) {
+        /* Geometry remains strict for arming and corner/finish events. Only
+         * normal steering gets this one-frame grace period. */
+        observation.candidate = true;
+        observation.seed_x = s_seed_x;
+        observation.lateral_error = s_last_lateral_error;
+        observation.heading_error = s_last_heading_error;
+        observation.far_error = s_last_far_error;
+        observation.near_line_visible = true;
+        candidate = true;
+        partial_candidate = true;
+    }
     save_overlay_snapshot(width, height, &observation, 0);
     s_last_scan_bottom_y = observation.scan_bottom_y;
     s_last_point_count = observation.point_count;
@@ -1213,8 +1244,10 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         s_state = LINE_STATE_NORMAL;
         s_lost_frames = 0;
         s_reacquire_frames = 0;
-        s_last_line_us = now;
-        update_seed(&observation);
+        if (!partial_candidate) {
+            s_last_line_us = now;
+            update_seed(&observation);
+        }
 
         /* 近场折角先挂起；只有旧线随后消失才进入 CORNER 原地慢转。 */
         const int trigger_y = (int)height * LINE_TURN_TRIGGER_PERCENT / 100;
