@@ -1029,6 +1029,10 @@ static void camera_line_follow_watchdog_task(void *arg)
         if (!s_started || s_control_mutex == NULL) {
             continue;
         }
+#if LINE_CALIB_MODE
+        /* 校准脚本自己管电机；解码帧超时不能在测试中途把 STBY 拉低。 */
+        continue;
+#endif
         const int64_t now = esp_timer_get_time();
         if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
             continue;
