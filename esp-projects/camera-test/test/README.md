@@ -13,8 +13,13 @@ sh build.sh          # 或者 mingw32-make run && mingw32-make syntax
    弯、10 cm 横杆终点 T、深红色球干扰），每个场景都在 7/11/15 px 三种线宽下
    各跑一遍。断言写的是**正确行为**，所以在几何层修好之前是红的。
 2. **ESP 侧语法检查**：`esp_stubs/` 里是最小的 ESP-IDF 桩头文件，只为了让
-   host gcc 能对 `camera_line_follow.c` 做 `-fsyntax-only`。它不验证行为，
-   但能挡住类型错误和笔误。
+   host gcc 能对 `camera_line_follow.c` 做 `-fsyntax-only`，`LINE_CALIB_MODE`
+   的两条分支都会编一遍。它不验证行为，但能挡住类型错误和笔误。
+
+3. **混控与控制律单元测试**：`line_mixer` 的等比缩放/起转值处理/反解，以及
+   `line_control` 的符号和抖动平均值。`sign-*` 用例把整条链路（几何 → 控制律
+   → 混控 → 车体速度）钉住 —— 转向和平移是两个不同的执行器，和误差符号的
+   关系不一样，这里已经抓到过一次符号写反。
 
 ## 用真实帧回放
 

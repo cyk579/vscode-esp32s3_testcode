@@ -10,5 +10,9 @@ CFLAGS="-std=c11 -O1 -g -Wall -Wextra -Wno-unused-parameter -I../main"
 $CC $CFLAGS -o harness host_harness.c ../main/line_geometry.c ../main/line_mixer.c ../main/line_control.c
 $CC -std=c11 -fsyntax-only -Wall -Wextra -Wno-unused-parameter \
     -I../main -Iesp_stubs -Iesp_stubs/freertos ../main/camera_line_follow.c
-echo "esp-side syntax check: ok"
+# 校准模式那条分支也要编一遍，否则它会一直烂在 #if 里没人发现。
+sed 's/^#define LINE_CALIB_MODE 0$/#define LINE_CALIB_MODE 1/'     ../main/camera_line_follow.c > .calib_variant.c
+$CC -std=c11 -fsyntax-only -Wall -Wextra -Wno-unused-parameter     -I../main -Iesp_stubs -Iesp_stubs/freertos .calib_variant.c
+rm -f .calib_variant.c
+echo "esp-side syntax check: ok (both LINE_CALIB_MODE branches)"
 ./harness "$@"

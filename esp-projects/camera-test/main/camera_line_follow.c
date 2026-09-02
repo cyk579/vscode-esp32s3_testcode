@@ -105,6 +105,17 @@
 #define LINE_CAM_PIVOT_PERCENT 50
 #define LINE_ALERT_MS 900U
 
+/* 校准模式：置 1 后不跑视觉，直接按脚本输出电机命令并打日志。
+ * 把车放在赛道板上（不要架空，静摩擦要真实），看串口 + 卷尺就能得到
+ * 三个通道的静摩擦死区和 cm/s，不需要任何仪器。测完记得改回 0。 */
+#define LINE_CALIB_MODE 0
+#define LINE_CALIB_SETTLE_MS 3000U
+#define LINE_CALIB_STEP_MS 1500U
+#define LINE_CALIB_STEP_FROM 4
+#define LINE_CALIB_STEP_TO 26
+#define LINE_CALIB_RUN_MS 3000U
+#define LINE_CALIB_SPIN_MS 10000U
+
 /* 扫描几何按这个解码尺寸调过；协商到别的分辨率时绝对像素量的含义会变。 */
 #define LINE_EXPECTED_WIDTH 240
 #define LINE_EXPECTED_HEIGHT 160
@@ -211,6 +222,9 @@ static bool s_watchdog_created;
 static bool s_logged_frame_size;
 
 static void camera_line_follow_watchdog_task(void *arg);
+#if LINE_CALIB_MODE
+static void camera_line_calibration_task(void *arg);
+#endif
 
 static int clamp_int(int value, int limit)
 {
@@ -640,6 +654,15 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
 {
     const int64_t line_start_us = esp_timer_get_time();
     const int64_t now = line_start_us;
+#if LINE_CALIB_MODE
+    /* 校准模式下电机由校准任务独占，视觉只负责刷 overlay。 */
+    (void)source_threshold;
+    (void)draw_overlay;
+    (void)width;
+    (void)height;
+    (void)rgb565_big_endian;
+    goto done;
+#endif
     if (!s_started || s_finished) {
         if (s_started) {
             stop_motors();
@@ -913,6 +936,63 @@ done:
     }
 }
 
+#if LINE_CALIB_MODE
+/*
+ * 单通道阶梯：每级 1.5 s，眼看第几级车子开始动，那一级就是该通道的静摩擦
+ * 死区。之后是定时跑，用卷尺量位移换成 cm/s；旋转固定跑 10 s 数圈数。
+ */
+static void calibration_stair(const char *label, int channel)
+{
+    ESP_LOGW(TAG, "CALIB stair %s: %d..%d, %u ms per step",
+             label, LINE_CALIB_STEP_FROM, LINE_CALIB_STEP_TO,
+             (unsigned)LINE_CALIB_STEP_MS);
+    for (int v = LINE_CALIB_STEP_FROM; v <= LINE_CALIB_STEP_TO; ++v) {
+        ESP_LOGW(TAG, "CALIB %s=%d", label, v);
+        drive(channel == 0 ? v : 0, channel == 1 ? v : 0, channel == 2 ? v : 0);
+        vTaskDelay(pdMS_TO_TICKS(LINE_CALIB_STEP_MS));
+    }
+    zero_motor_outputs();
+    vTaskDelay(pdMS_TO_TICKS(LINE_CALIB_STEP_MS));
+}
+
+static void calibration_run(const char *label, int forward, int turn, int lat,
+                            uint32_t duration_ms)
+{
+    ESP_LOGW(TAG, "CALIB run %s: forward=%d turn=%d lat=%d for %u ms",
+             label, forward, turn, lat, (unsigned)duration_ms);
+    drive(forward, turn, lat);
+    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+    zero_motor_outputs();
+    ESP_LOGW(TAG, "CALIB run %s done; measure the displacement now", label);
+    vTaskDelay(pdMS_TO_TICKS(LINE_CALIB_SETTLE_MS));
+}
+
+static void camera_line_calibration_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGW(TAG, "CALIB mode: put the car on the track surface, not on blocks");
+    vTaskDelay(pdMS_TO_TICKS(LINE_CALIB_SETTLE_MS));
+    gpio_set_level(STBY_GPIO, 1);
+    s_stby_enabled = true;
+    s_motor_start_us = 0;
+
+    calibration_stair("forward", 0);
+    calibration_stair("turn", 1);
+    calibration_stair("lat", 2);
+
+    calibration_run("forward", 20, 0, 0, LINE_CALIB_RUN_MS);
+    calibration_run("lat", 0, 0, 14, LINE_CALIB_RUN_MS);
+    calibration_run("spin", 0, LINE_TURN_MAX, 0, LINE_CALIB_SPIN_MS);
+    calibration_run("pivot", 0, LINE_PIVOT_TURN,
+                    LINE_PIVOT_TURN * LINE_CAM_PIVOT_PERCENT / 100,
+                    LINE_CALIB_SPIN_MS);
+
+    stop_motors();
+    ESP_LOGW(TAG, "CALIB done: set LINE_CALIB_MODE back to 0");
+    vTaskDelete(NULL);
+}
+#endif
+
 static void camera_line_follow_watchdog_task(void *arg)
 {
     (void)arg;
@@ -1036,6 +1116,14 @@ esp_err_t camera_line_follow_start(void)
         }
         s_watchdog_created = true;
     }
+#if LINE_CALIB_MODE
+    if (xTaskCreate(camera_line_calibration_task, "camera_line_calib", 3072,
+                    NULL, 2, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Could not create the motor calibration task");
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGW(TAG, "LINE_CALIB_MODE is on; vision control is disabled");
+#endif
     ESP_LOGI(TAG, "Camera line follower ready; motors stay stopped until a stable line is seen");
     return ESP_OK;
 }
