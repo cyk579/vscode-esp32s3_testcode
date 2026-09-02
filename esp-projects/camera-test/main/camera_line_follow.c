@@ -243,6 +243,11 @@
 #define BALL_WHITE_MAX_SATURATION 35
 #define BALL_WHITE_MIN_EDGE_PIXELS 4
 
+/* subject2-findball is a standalone endpoint test image.  The vehicle is
+ * placed at the finish and must enter the ball state machine directly; the
+ * line detector, finish detector, and obstacle route are skipped. */
+#define BALL_DIRECT_TEST_MODE 1
+
 typedef struct {
     gpio_num_t in1;
     gpio_num_t in2;
@@ -2001,8 +2006,15 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         goto done;
     }
     if (s_finished) {
-        /* The line is complete, but the same latest-frame callback now feeds
-         * the independent ball-delivery state machine. */
+        /* The line is complete (or deliberately bypassed in the standalone
+         * endpoint image), and the latest frame feeds only the ball state
+         * machine.  Start the direct test on the first decoded frame so the
+         * search timeout does not run while USB Host is still booting. */
+#if BALL_DIRECT_TEST_MODE
+        if (s_ball_phase == BALL_IDLE) {
+            ball_begin(now);
+        }
+#endif
         ball_process_frame(rgb565_big_endian, width, height, now);
         goto done;
     }
@@ -2631,6 +2643,16 @@ esp_err_t camera_line_follow_start(void)
     s_line_us_sum = 0;
     s_line_us_max = 0;
     reset_tracking();
+#if BALL_DIRECT_TEST_MODE
+    /* This branch starts with the chassis already at the endpoint.  Mark the
+     * route complete and arm the motor permission latch, but defer ball_begin
+     * until the first camera frame arrives (see process_frame above). */
+    s_finished = true;
+    s_armed = true;
+    ESP_LOGW(TAG,
+             "BALL_DIRECT_TEST_MODE=1: line following, finish T, and obstacle "
+             "avoidance skipped; waiting for first frame at endpoint");
+#endif
     gpio_set_level(STBY_GPIO, 0);
     stop_motors();
 
@@ -2661,7 +2683,11 @@ esp_err_t camera_line_follow_start(void)
     }
     ESP_LOGW(TAG, "LINE_CALIB_MODE is on; vision control is disabled");
 #endif
+#if BALL_DIRECT_TEST_MODE
+    ESP_LOGI(TAG, "Endpoint ball test ready; place vehicle at finish and keep camera view clear");
+#else
     ESP_LOGI(TAG, "Camera line follower ready; motors stay stopped until a stable line is seen");
+#endif
     return ESP_OK;
 }
 
