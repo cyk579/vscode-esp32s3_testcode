@@ -71,12 +71,12 @@
 /* 终点 T 停车。调巡线时可以临时置 0，避免把"误停"当成"丢线"。 */
 #define LINE_FINISH_ENABLE 1
 
-/* 实车调试阶段四档前进量统一压到最低可持续前进值。 */
-#define LINE_FORWARD_FAST 15
-#define LINE_FORWARD_MEDIUM 15
-#define LINE_FORWARD_SLOW 15
-#define LINE_FORWARD_CRAWL 15
-#define LINE_FORWARD_SLEW 4
+/* 实车调试阶段四档前进量统一设为低速但能克服落地静摩擦的值。 */
+#define LINE_FORWARD_FAST 18
+#define LINE_FORWARD_MEDIUM 18
+#define LINE_FORWARD_SLOW 18
+#define LINE_FORWARD_CRAWL 18
+#define LINE_FORWARD_SLEW 2
 
 /* 误差门限。|error| 被 ROI 夹在 55 以内（center 只能落在 48..191），所以
  * 原来的 LINE_ERROR_LARGE=60 在 NORMAL 里永远不可达，CRAWL 那一档是死的。 */
@@ -139,12 +139,12 @@
 #define PWM_MAX 1023U
 #define MOTOR_MIN_RUN_OUTPUT 11
 #define MOTOR_B_MIN_RUN_OUTPUT 13
-#define START_KICK_OUTPUT 15
-#define START_KICK_CYCLES 8U
-/* 调试阶段把所有实际轮端输出限制在 18 以内：前进量为 15，启动冲量也不
- * 超过 15，转弯混控最多只到 18，避免日志里出现 30 级的突然冲刺。 */
+#define START_KICK_OUTPUT 18
+#define START_KICK_CYCLES 3U
+/* 调试阶段把所有实际轮端输出限制在 18 以内：前进量和启动冲量都不
+ * 超过 18，转弯混控也最多到 18，避免日志里出现 30 级的突然冲刺。 */
 #define MOTOR_PWM_CEILING 18
-#define LINE_SPEED_CAP 15
+#define LINE_SPEED_CAP 18
 #define MOTOR_TRIM_A 100
 #define MOTOR_TRIM_D 100
 

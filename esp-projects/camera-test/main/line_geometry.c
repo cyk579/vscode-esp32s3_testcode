@@ -353,7 +353,15 @@ bool line_geometry_track(const uint8_t *frame,
         observation->seed_x = observation->point_x[0];
     }
     if (point_count < LINE_MIN_VALID_ROWS) {
-        return false;
+        /* 锐角的近场横向投影会吃掉若干扫描行；只要已经有两行
+         * 正常中心点，并且明确报告了靠近底部的单侧支路，就允许
+         * 状态机进入 CORNER/TURN。普通丢线仍严格要求四行。 */
+        const int corner_near_y = height * LINE_NEAR_BOTTOM_PERCENT / 100;
+        if (observation->corner_direction == 0 ||
+            observation->corner_row_y < corner_near_y ||
+            point_count < LINE_CORNER_MIN_VALID_ROWS) {
+            return false;
+        }
     }
 
     const int near_count = point_count < LINE_NEAR_ROWS ? point_count : LINE_NEAR_ROWS;
