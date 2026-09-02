@@ -35,8 +35,9 @@
 #define CAMERA_LINE_MIRROR_X 0
 /*
  * The chassis center is about 5 cm left of the tape in the real vehicle.
- * A negative image offset makes the NORMAL controller steer right until the
- * tape is about 18 pixels right of the optical center (the tuned 120x80 view).
+ * The negative reference offset is intentional for this installation: it
+ * moves the accepted track reference left of the optical center, compensating
+ * the measured chassis/camera placement without changing the mixer.
  */
 #define CAMERA_LINE_CENTER_BIAS_PX (-18)
 
@@ -636,8 +637,6 @@ static bool observe_line(uint8_t *frame,
         const int signed_bias = CAMERA_LINE_MIRROR_X ? -bias : bias;
         observation->lateral_error = clamp_int(observation->lateral_error +
                                                signed_bias, 100);
-        observation->far_error = clamp_int(observation->far_error +
-                                           signed_bias, 100);
     }
     if (draw_overlay) {
         render_tracking_overlay(frame, &cfg, observation);
