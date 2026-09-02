@@ -492,6 +492,7 @@ static void reset_tracking(void)
     s_turn_direction = 0;
     s_turn_hint_frames = 0;
     s_turn_exit_frames = 0;
+    s_turn_frames = 0;
     s_turn_started_us = 0;
     s_alert_until_us = 0;
     s_finish_frames = 0;
