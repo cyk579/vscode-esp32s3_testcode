@@ -71,11 +71,11 @@
 /* 终点 T 停车。调巡线时可以临时置 0，避免把"误停"当成"丢线"。 */
 #define LINE_FINISH_ENABLE 1
 
-/* 实车调试阶段四档前进量统一设为低速但能克服落地静摩擦的值。 */
-#define LINE_FORWARD_FAST 18
-#define LINE_FORWARD_MEDIUM 18
-#define LINE_FORWARD_SLOW 18
-#define LINE_FORWARD_CRAWL 18
+/* 22% 是 car-spin 已验证的低速可持续区间；斜坡仍按控制周期平滑上升。 */
+#define LINE_FORWARD_FAST 22
+#define LINE_FORWARD_MEDIUM 22
+#define LINE_FORWARD_SLOW 22
+#define LINE_FORWARD_CRAWL 22
 #define LINE_FORWARD_SLEW 2
 
 /* 误差门限。|error| 被 ROI 夹在 55 以内（center 只能落在 48..191），所以
@@ -99,8 +99,8 @@
 #define LINE_LAT_MIN_OUTPUT 11
 #define LINE_SEED_SLEW_PX 12
 
-/* 折角：事件行落到画面下方 80% 以内才动手，之前只降速。 */
-#define LINE_TURN_TRIGGER_PERCENT 80
+/* 折角：事件行进入画面下方 88% 才动手；更远处只降速，避免提前转弯。 */
+#define LINE_TURN_TRIGGER_PERCENT 88
 #define LINE_TURN_HINT_FRAMES 2U
 #define LINE_TURN_EXIT_FRAMES 2U
 /* 旋转至少持续这么久才接受退出，否则第一帧还在看入弯前那条线就会假退出，
@@ -113,7 +113,7 @@
  * TODO(实测): LINE_CAM_PIVOT_PERCENT 用尺子量 a 和 L 后填 a*100/(2L)。 */
 #define LINE_PIVOT_TURN 26
 /* 低速调试时优先保证三轮都超过各自起转阈值；此前叠加 40% 横移后，
- * 在 18% 总上限下 A/D 被缩放掉，锐角阶段实际只剩 B 轮。 */
+ * 在较低总上限下 A/D 被缩放掉，锐角阶段实际只剩 B 轮。 */
 #define LINE_CAM_PIVOT_PERCENT 0
 #define LINE_ALERT_MS 900U
 
@@ -124,7 +124,7 @@
 #define LINE_CALIB_SETTLE_MS 3000U
 #define LINE_CALIB_STEP_MS 1500U
 #define LINE_CALIB_STEP_FROM 4
-#define LINE_CALIB_STEP_TO 18
+#define LINE_CALIB_STEP_TO 24
 #define LINE_CALIB_RUN_MS 3000U
 #define LINE_CALIB_SPIN_MS 10000U
 
@@ -139,12 +139,11 @@
 #define PWM_MAX 1023U
 #define MOTOR_MIN_RUN_OUTPUT 11
 #define MOTOR_B_MIN_RUN_OUTPUT 13
-#define START_KICK_OUTPUT 18
+#define START_KICK_OUTPUT 24
 #define START_KICK_CYCLES 3U
-/* 调试阶段把所有实际轮端输出限制在 18 以内：前进量和启动冲量都不
- * 超过 18，转弯混控也最多到 18，避免日志里出现 30 级的突然冲刺。 */
-#define MOTOR_PWM_CEILING 18
-#define LINE_SPEED_CAP 18
+/* 正常巡航保持 22%，只给短暂起转脉冲留到 24%，避免再次卡在静摩擦区。 */
+#define MOTOR_PWM_CEILING 24
+#define LINE_SPEED_CAP 22
 #define MOTOR_TRIM_A 100
 #define MOTOR_TRIM_D 100
 
