@@ -75,11 +75,11 @@
 #define LINE_FINISH_ENABLE 1
 
 /* 在上一版可持续低速基础上统一加 2；斜坡仍按控制周期平滑上升。 */
-#define LINE_FORWARD_FAST 24
-#define LINE_FORWARD_MEDIUM 22
-#define LINE_FORWARD_SLOW 20
+#define LINE_FORWARD_FAST 30
+#define LINE_FORWARD_MEDIUM 27
+#define LINE_FORWARD_SLOW 23
 #define LINE_FORWARD_CRAWL 18
-#define LINE_FORWARD_SLEW 2
+#define LINE_FORWARD_SLEW 8
 
 /* A two-point partial scan is often a one-frame JPEG/lighting miss, not a
  * genuine loss of the track. Keep the previous steering briefly while the
@@ -157,9 +157,9 @@
 #define MOTOR_B_MIN_RUN_OUTPUT 13
 #define START_KICK_OUTPUT 20
 #define START_KICK_CYCLES 3U
-/* 正常巡航保持 24%，只给短暂起转脉冲留到 26%，避免再次卡在静摩擦区。 */
-#define MOTOR_PWM_CEILING 26
-#define LINE_SPEED_CAP 24
+/* 正常巡航上限为 30%；转向时由混控器按总量自动缩放。 */
+#define MOTOR_PWM_CEILING 30
+#define LINE_SPEED_CAP 30
 #define MOTOR_TRIM_A 90
 #define MOTOR_TRIM_D 100
 
@@ -814,13 +814,15 @@ static void drive_slow_spin(int turn)
     s_suppress_kick = saved_suppress_kick;
 }
 
-static void reset_control(void)
+static void reset_control(bool reset_forward)
 {
     s_lat_accum = 0;
     s_yaw_accum = 0;
-    /* Restart from a real drive value; starting at zero made the first several
-     * frames fall below the wheel stiction floors and produced no motion. */
-    s_forward_output = LINE_MOTOR_START_MIN_OUTPUT;
+    /* State transitions must not make a moving car restart its forward ramp.
+     * Only arm/disarm paths request a fresh starting value. */
+    if (reset_forward) {
+        s_forward_output = LINE_MOTOR_START_MIN_OUTPUT;
+    }
     s_turn_output = 0;
     s_error_filter_initialized = false;
     s_lateral_control_error = 0;
@@ -831,7 +833,7 @@ static void reset_control(void)
 
 static void reset_tracking(void)
 {
-    reset_control();
+    reset_control(true);
     s_seed_valid = false;
     s_seed_x = 0;
     s_line_width = 0;
@@ -1205,7 +1207,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             if (s_arm_frames >= LINE_ARM_CONFIRM_FRAMES) {
                 s_armed = true;
                 s_state = LINE_STATE_NORMAL;
-                reset_control();
+                reset_control(true);
                 update_seed(&observation);
                 s_last_line_us = now;
                 s_motor_start_us = now;
@@ -1272,7 +1274,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             s_reacquire_frames = 0;
             s_last_line_us = now;
             update_seed(&observation);
-            reset_control();
+            reset_control(false);
             ESP_LOGI(TAG, "turn complete; back to NORMAL at ey=%d",
                      observation.lateral_error);
             drive_normal(&observation, now);
@@ -1327,7 +1329,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 s_reacquire_frames = 0;
                 update_seed(&observation);
                 s_last_line_us = now;
-                reset_control();
+                reset_control(false);
                 drive_normal(&observation, now);
                 goto done;
             }
@@ -1398,7 +1400,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         s_turn_exit_frames = 0;
         s_turn_started_us = now;
         s_turn_pending_until_us = 0;
-        reset_control();
+        reset_control(false);
         ESP_LOGI(TAG, "corner %s confirmed after old line loss; pivoting",
                  s_turn_direction < 0 ? "left" : "right");
         drive_slow_spin(-s_turn_direction * LINE_PIVOT_TURN);
@@ -1409,7 +1411,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     s_lost_frames = 1;
     s_reacquire_frames = 0;
     s_reacquire_x = s_seed_x;
-    reset_control();
+    reset_control(false);
     {
         const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
         if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
