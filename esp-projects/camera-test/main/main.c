@@ -114,10 +114,10 @@ typedef struct {
 } uvc_stream_profile_t;
 
 /* 巡线的扫描几何里有绝对像素量（行距、最小线宽、窗口上下限），所以协商到
- * 哪个分辨率会改变行为。这台摄像头实测协商到 480x320@15（解码缩放成
- * 240x160），把它放在列表第一位，让每次上电得到同一个几何。 */
+ * 哪个分辨率会改变行为。这台摄像头的 480x320 描述符支持 15~25 FPS；优先
+ * 请求 25 FPS，失败时再回退到摄像头可接受的速率。解码仍缩放成 240x160。 */
 uvc_stream_profile_t uvc_stream_profiles[EXAMPLE_UVC_PROTOCOL_AUTO_COUNT] = {
-    {UVC_FRAME_FORMAT_MJPEG, 480, 320, 15, "480x320, fps 15"},
+    {UVC_FRAME_FORMAT_MJPEG, 480, 320, 25, "480x320, fps 25"},
     {UVC_FRAME_FORMAT_MJPEG, 480, 320,  0, "480x320, any fps"},
     {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, "320x240, fps 30"},
     {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, "640x480, fps 15"},
