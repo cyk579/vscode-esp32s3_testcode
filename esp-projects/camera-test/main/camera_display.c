@@ -38,6 +38,10 @@
 #define CAMERA_OUTPUT_MAX_WIDTH CAMERA_DECODE_MAX_WIDTH
 #define CAMERA_OUTPUT_MAX_HEIGHT CAMERA_DECODE_MAX_HEIGHT
 #define CAMERA_TFT_REFRESH_US 333333
+#define CAMERA_TFT_CROP_LEFT_PERCENT CAMERA_BINARY_ROI_LEFT_PERCENT
+#define CAMERA_TFT_CROP_RIGHT_PERCENT CAMERA_BINARY_ROI_RIGHT_PERCENT
+#define CAMERA_TFT_CROP_TOP_PERCENT CAMERA_BINARY_ROI_TOP_PERCENT
+#define CAMERA_TFT_CROP_BOTTOM_PERCENT CAMERA_BINARY_ROI_BOTTOM_PERCENT
 
 typedef struct {
     uint8_t *jpeg_slots[CAMERA_DISPLAY_SLOT_COUNT];
@@ -324,7 +328,17 @@ static bool decode_and_draw(uint8_t *jpeg, size_t jpeg_len)
         s_display.previous_width = output.width;
         s_display.previous_height = output.height;
     }
-    if (!tft_st7735_draw_rgb565_2x(s_display.rgb565, output.width, output.height)) {
+    const uint16_t crop_left = (uint16_t)(output.width *
+                                          CAMERA_TFT_CROP_LEFT_PERCENT / 100);
+    const uint16_t crop_top = (uint16_t)(output.height *
+                                         CAMERA_TFT_CROP_TOP_PERCENT / 100);
+    const uint16_t crop_right = (uint16_t)((output.width *
+                                           CAMERA_TFT_CROP_RIGHT_PERCENT / 100) - 1);
+    const uint16_t crop_bottom = (uint16_t)((output.height *
+                                            CAMERA_TFT_CROP_BOTTOM_PERCENT / 100) - 1);
+    if (!tft_st7735_draw_rgb565_2x_crop(s_display.rgb565, output.width,
+                                        output.height, crop_left, crop_top,
+                                        crop_right, crop_bottom, 0xffff)) {
         ESP_LOGW(TAG, "TFT draw failed");
         return false;
     }

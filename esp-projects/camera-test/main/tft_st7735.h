@@ -18,3 +18,14 @@ bool tft_st7735_draw_rgb565(const uint8_t *rgb565_big_endian,
 bool tft_st7735_draw_rgb565_2x(const uint8_t *rgb565_big_endian,
                               uint16_t source_width,
                               uint16_t source_height);
+
+/* Same 2:1 sampling, but keep the source coordinates and paint pixels outside
+ * the crop rectangle with blank_color. No full-size intermediate framebuffer. */
+bool tft_st7735_draw_rgb565_2x_crop(const uint8_t *rgb565_big_endian,
+                                    uint16_t source_width,
+                                    uint16_t source_height,
+                                    uint16_t crop_left,
+                                    uint16_t crop_top,
+                                    uint16_t crop_right,
+                                    uint16_t crop_bottom,
+                                    uint16_t blank_color);

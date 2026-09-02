@@ -155,6 +155,63 @@ bool tft_st7735_draw_rgb565_2x(const uint8_t *rgb565_big_endian,
     return true;
 }
 
+bool tft_st7735_draw_rgb565_2x_crop(const uint8_t *rgb565_big_endian,
+                                    uint16_t source_width,
+                                    uint16_t source_height,
+                                    uint16_t crop_left,
+                                    uint16_t crop_top,
+                                    uint16_t crop_right,
+                                    uint16_t crop_bottom,
+                                    uint16_t blank_color)
+{
+    const uint16_t width = source_width / 2;
+    const uint16_t height = source_height / 2;
+    if (!s_initialized || rgb565_big_endian == NULL || width == 0 || height == 0 ||
+        width > TFT_ST7735_WIDTH || height > TFT_ST7735_HEIGHT) {
+        return false;
+    }
+
+    if (crop_left >= source_width) crop_left = source_width - 1;
+    if (crop_top >= source_height) crop_top = source_height - 1;
+    if (crop_right >= source_width) crop_right = source_width - 1;
+    if (crop_bottom >= source_height) crop_bottom = source_height - 1;
+    if (crop_left > crop_right || crop_top > crop_bottom) {
+        return false;
+    }
+
+    const uint16_t x0 = (TFT_ST7735_WIDTH - width) / 2;
+    const uint16_t y0 = (TFT_ST7735_HEIGHT - height) / 2;
+    if (set_window(x0, y0, x0 + width - 1, y0 + height - 1) != ESP_OK) {
+        return false;
+    }
+
+    uint8_t line[TFT_ST7735_WIDTH * 2];
+    const uint8_t blank_hi = (uint8_t)(blank_color >> 8);
+    const uint8_t blank_lo = (uint8_t)blank_color;
+    for (uint16_t y = 0; y < height; ++y) {
+        const uint16_t source_y = y * 2;
+        const bool row_visible = source_y >= crop_top && source_y <= crop_bottom;
+        const uint8_t *source = rgb565_big_endian +
+                                (size_t)source_y * source_width * 2;
+        for (uint16_t x = 0; x < width; ++x) {
+            const uint16_t source_x = x * 2;
+            const size_t out = (size_t)x * 2;
+            if (row_visible && source_x >= crop_left && source_x <= crop_right) {
+                const uint8_t *pixel = source + (size_t)source_x * 2;
+                line[out] = pixel[0];
+                line[out + 1] = pixel[1];
+            } else {
+                line[out] = blank_hi;
+                line[out + 1] = blank_lo;
+            }
+        }
+        if (write_data(line, (size_t)width * 2) != ESP_OK) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool tft_st7735_init(void)
 {
     if (s_initialized) {
