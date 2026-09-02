@@ -31,7 +31,7 @@
 #define STBY_GPIO GPIO_NUM_8
 
 /* 解码器输出大端字节序 RGB565；画面左右相反时改为 1。 */
-#define CAMERA_LINE_MIRROR_X 0
+#define CAMERA_LINE_MIRROR_X 1
 
 /* 摄像头相对车体的安装旋转。扫描坐标系永远是车体视角（sy 越大越靠近车），
  * 缓冲区按这个值反查，不做整帧旋转拷贝，所以改它不增加单帧耗时。
