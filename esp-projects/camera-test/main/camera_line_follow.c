@@ -220,6 +220,7 @@ static uint32_t s_summary_callback_dropped_frames;
 static SemaphoreHandle_t s_control_mutex;
 static bool s_watchdog_created;
 static bool s_logged_frame_size;
+static bool s_suppress_kick;
 
 static void camera_line_follow_watchdog_task(void *arg);
 #if LINE_CALIB_MODE
@@ -421,7 +422,7 @@ static void motor_set(const motor_t *motor, int command)
     /* 起转值筛选和整向量缩放都在混控层完成，这里不再逐轮抬值：抬值会把
      * 指令向量整体转向（turn=1 被抬到 13 就是 13 倍偏航）。 */
     int output = abs(speed);
-    if (s_kick_cycles[index] > 0) {
+    if (s_kick_cycles[index] > 0 && !s_suppress_kick) {
         /* car-spin 的实车规则：换向冲量固定为 START_KICK_OUTPUT，B 轮只在
          * 转向量足够大时才参与冲量。冲量绝对不能被启动 ramp 限幅压低，
          * 否则首帧的 kick 会变成 12%，等于把破静摩擦的冲量自己抵消掉。 */
@@ -941,16 +942,43 @@ done:
  * 单通道阶梯：每级 1.5 s，眼看第几级车子开始动，那一级就是该通道的静摩擦
  * 死区。之后是定时跑，用卷尺量位移换成 cm/s；旋转固定跑 10 s 数圈数。
  */
+/*
+ * 阶梯专用输出：绕过混控的起转值过滤，并临时关掉换向冲量。
+ *
+ * 两件事都必须做，否则测出来的不是真实静摩擦：
+ *   - 混控会把低于 11/13 的分量直接置零，阶梯永远"从地板值开始动"；
+ *   - 换向冲量按调用次数衰减，而阶梯每级只调用一次，8 级都会被抬到 32。
+ */
+static void calibration_drive_raw(int forward, int turn, int lat)
+{
+    const line_mixer_cfg_t cfg = {
+        MOTOR_PWM_CEILING, 0, 0, MOTOR_TRIM_A, MOTOR_TRIM_D,
+    };
+    line_mixer_out_t out = {0, 0, 0, false, false};
+    line_mixer_solve(forward, turn, lat, &cfg, &out);
+    s_command_a = out.a;
+    s_command_b = out.b;
+    s_command_d = out.d;
+    motor_set(&motor_a, out.a);
+    motor_set(&motor_b, out.b);
+    motor_set(&motor_d, out.d);
+}
+
 static void calibration_stair(const char *label, int channel)
 {
-    ESP_LOGW(TAG, "CALIB stair %s: %d..%d, %u ms per step",
+    ESP_LOGW(TAG, "CALIB stair %s: %d..%d, %u ms per step "
+                  "(mixer floors and the kick are bypassed here)",
              label, LINE_CALIB_STEP_FROM, LINE_CALIB_STEP_TO,
              (unsigned)LINE_CALIB_STEP_MS);
+    s_suppress_kick = true;
     for (int v = LINE_CALIB_STEP_FROM; v <= LINE_CALIB_STEP_TO; ++v) {
-        ESP_LOGW(TAG, "CALIB %s=%d", label, v);
-        drive(channel == 0 ? v : 0, channel == 1 ? v : 0, channel == 2 ? v : 0);
+        ESP_LOGW(TAG, "CALIB %s=%d  motor[A,B,D]=[%d,%d,%d]", label, v,
+                 s_command_a, s_command_b, s_command_d);
+        calibration_drive_raw(channel == 0 ? v : 0, channel == 1 ? v : 0,
+                              channel == 2 ? v : 0);
         vTaskDelay(pdMS_TO_TICKS(LINE_CALIB_STEP_MS));
     }
+    s_suppress_kick = false;
     zero_motor_outputs();
     vTaskDelay(pdMS_TO_TICKS(LINE_CALIB_STEP_MS));
 }
