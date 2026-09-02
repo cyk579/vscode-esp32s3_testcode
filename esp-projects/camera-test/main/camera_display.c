@@ -92,6 +92,8 @@ typedef struct {
     void *frame_callback_ctx;
     camera_display_preview_callback_t preview_callback;
     void *preview_callback_ctx;
+    camera_display_tft_status_callback_t tft_status_callback;
+    void *tft_status_callback_ctx;
     uint16_t previous_preview_width;
     uint16_t previous_preview_height;
     int64_t last_preview_us;
@@ -518,6 +520,9 @@ static void camera_preview_task(void *arg)
                         crop_left, crop_top, crop_right, crop_bottom, 0xffff)) {
                     ESP_LOGW(TAG, "TFT draw failed");
                 } else {
+                    if (s_display.tft_status_callback != NULL) {
+                        s_display.tft_status_callback(s_display.tft_status_callback_ctx);
+                    }
                     s_display.last_tft_us =
                         (uint32_t)(esp_timer_get_time() - tft_start_us);
                 }
@@ -782,6 +787,13 @@ void camera_display_set_preview_callback(camera_display_preview_callback_t callb
 {
     s_display.preview_callback = callback;
     s_display.preview_callback_ctx = user_ctx;
+}
+
+void camera_display_set_tft_status_callback(camera_display_tft_status_callback_t callback,
+                                             void *user_ctx)
+{
+    s_display.tft_status_callback = callback;
+    s_display.tft_status_callback_ctx = user_ctx;
 }
 
 bool camera_display_submit(const uint8_t *jpeg, size_t jpeg_len)

@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -18,6 +19,9 @@
 #include "line_geometry.h"
 #include "line_mixer.h"
 #include "ultrasonic.h"
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+#include "tft_st7735.h"
+#endif
 
 /* 电机引脚与已经校准过的 car-spin 工程保持一致。 */
 #define A_PWM GPIO_NUM_9
@@ -1222,6 +1226,69 @@ static const char *state_name(void)
     default:
         return "NORMAL";
     }
+}
+
+void camera_line_follow_get_debug_snapshot(camera_line_follow_debug_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+
+    bool locked = false;
+    if (s_control_mutex != NULL) {
+        locked = xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(5)) == pdTRUE;
+    }
+    snapshot->state = state_name();
+    snapshot->armed = s_armed;
+    snapshot->stby = s_stby_enabled;
+    snapshot->candidate = s_last_candidate;
+    snapshot->motor_a = s_command_a;
+    snapshot->motor_b = s_command_b;
+    snapshot->motor_d = s_command_d;
+    snapshot->ultrasonic_distance_x10 = s_ultrasonic_valid ?
+                                        (int)(s_ultrasonic_distance_cm * 10.0f + 0.5f) : -1;
+    snapshot->threshold = s_last_threshold;
+    snapshot->seed_x = s_last_seed_x;
+    snapshot->valid_rows = s_last_valid_rows;
+    snapshot->confidence = s_last_confidence;
+    if (locked) {
+        (void)xSemaphoreGive(s_control_mutex);
+    }
+}
+
+void camera_line_follow_tft_status_callback(void *user_ctx)
+{
+    (void)user_ctx;
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+    camera_line_follow_debug_snapshot_t snapshot = {0};
+    camera_line_follow_get_debug_snapshot(&snapshot);
+
+    char line[32];
+    (void)snprintf(line, sizeof(line), "STATE %s", snapshot.state);
+    (void)tft_st7735_draw_text(0, 0, line, 0xffff, 0x0000);
+    (void)snprintf(line, sizeof(line), "ARM %d STBY %d",
+                   snapshot.armed ? 1 : 0, snapshot.stby ? 1 : 0);
+    (void)tft_st7735_draw_text(0, 8, line, 0xffff, 0x0000);
+    (void)snprintf(line, sizeof(line), "M A%d B%d D%d",
+                   snapshot.motor_a, snapshot.motor_b, snapshot.motor_d);
+    (void)tft_st7735_draw_text(0, 16, line, 0xffff, 0x0000);
+
+    const int distance = snapshot.ultrasonic_distance_x10;
+    if (distance >= 0) {
+        (void)snprintf(line, sizeof(line), "US %d.%d C%d T%d",
+                       distance / 10, distance % 10,
+                       snapshot.candidate ? 1 : 0, snapshot.threshold);
+    } else {
+        (void)snprintf(line, sizeof(line), "US -- C%d T%d",
+                       snapshot.candidate ? 1 : 0, snapshot.threshold);
+    }
+    (void)tft_st7735_draw_text(0, 104, line, 0xffff, 0x0000);
+    (void)snprintf(line, sizeof(line), "SEED %d V%02d Q%03d",
+                   snapshot.seed_x, snapshot.valid_rows, snapshot.confidence);
+    (void)tft_st7735_draw_text(0, 112, line, 0xffff, 0x0000);
+    (void)snprintf(line, sizeof(line), "CTRL %d", snapshot.candidate ? 1 : 0);
+    (void)tft_st7735_draw_text(0, 120, line, 0xffff, 0x0000);
+#endif
 }
 
 static void maybe_log_summary(int64_t now)

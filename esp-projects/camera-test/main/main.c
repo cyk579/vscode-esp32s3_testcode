@@ -312,6 +312,7 @@ void app_main(void)
     if (line_follow_err == ESP_OK) {
         camera_display_set_frame_callback(camera_line_follow_frame_callback, NULL);
         camera_display_set_preview_callback(camera_line_follow_preview_callback, NULL);
+        camera_display_set_tft_status_callback(camera_line_follow_tft_status_callback, NULL);
         ESP_LOGI(TAG, "Camera black-line following enabled; TB6612 standby is held low until arm");
     } else {
         ESP_LOGE(TAG, "Camera black-line following disabled: %s", esp_err_to_name(line_follow_err));
