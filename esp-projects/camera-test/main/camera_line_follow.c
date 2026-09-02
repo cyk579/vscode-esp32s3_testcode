@@ -206,6 +206,43 @@
 #define AVOID_REACQUIRE_GRACE_MS 1000U
 #define AVOID_COOLDOWN_MS 1200U
 
+/* End-point ball handling is a separate task phase; it never changes the
+ * line-follow state enum.  Times are deliberately conservative because the
+ * camera is tilted up and the vehicle should move only after a stable visual
+ * alignment. */
+#define PAN_SERVO_PIN GPIO_NUM_1
+#define TILT_SERVO_PIN GPIO_NUM_2
+#define SERVO_TIMER LEDC_TIMER_1
+#define SERVO_PAN_CHANNEL LEDC_CHANNEL_3
+#define SERVO_TILT_CHANNEL LEDC_CHANNEL_4
+#define SERVO_RESOLUTION LEDC_TIMER_14_BIT
+#define SERVO_MAX_DUTY ((1U << 14) - 1U)
+#define SERVO_PERIOD_US 20000U
+#define BALL_PAN_CENTER_US 1500U
+#define BALL_TILT_HIGH_US 1750U
+#define BALL_SERVO_SETTLE_MS 700U
+#define BALL_SEARCH_TURN_SPEED 13
+#define BALL_ALIGN_TURN_SPEED 12
+#define BALL_PUSH_SPEED 18
+#define BALL_RETURN_SPEED 18
+#define BALL_SEARCH_TIMEOUT_MS 14000U
+#define BALL_ALIGN_TIMEOUT_MS 5000U
+#define BALL_PUSH_MS 1800U
+#define BALL_RETURN_MS 1800U
+#define BALL_ALIGN_TOLERANCE_PX 5
+#define BALL_ALIGN_CONFIRM_FRAMES 3U
+#define BALL_MIN_PIXELS 5
+#define BALL_ZONE_MIN_RUN_PIXELS 8
+#define BALL_ZONE_MIN_ROWS 3
+#define BALL_ZONE_THRESHOLD 55
+#define BALL_SCAN_TOP_PERCENT 5
+#define BALL_SCAN_BOTTOM_PERCENT 90
+#define BALL_RED_MIN_R 90
+#define BALL_RED_CHANNEL_GAP 35
+#define BALL_WHITE_MIN_LUMA 165
+#define BALL_WHITE_MAX_SATURATION 35
+#define BALL_WHITE_MIN_EDGE_PIXELS 4
+
 typedef struct {
     gpio_num_t in1;
     gpio_num_t in2;
@@ -227,6 +264,38 @@ typedef enum {
     OBSTACLE_RIGHT,
 } obstacle_state_t;
 
+typedef enum {
+    BALL_IDLE = 0,
+    BALL_SEARCH_RED,
+    BALL_ALIGN_RED,
+    BALL_PUSH_RED,
+    BALL_RETURN_RED,
+    BALL_SEARCH_WHITE,
+    BALL_ALIGN_WHITE,
+    BALL_PUSH_WHITE,
+    BALL_RETURN_WHITE,
+    BALL_DONE,
+} ball_phase_t;
+
+typedef struct {
+    bool valid;
+    int x;
+    int y;
+    int width;
+    int height;
+    int pixels;
+    int edge_score;
+} ball_blob_t;
+
+typedef struct {
+    bool valid;
+    int x;
+    int y;
+    int width;
+    int rows;
+    int score;
+} ball_zone_t;
+
 static const char *TAG = "camera_line";
 static const motor_t motor_a = {A_IN1, A_IN2, LEDC_CHANNEL_0, MOTOR_A_SIGN};
 static const motor_t motor_b = {B_IN1, B_IN2, LEDC_CHANNEL_1, MOTOR_B_SIGN};
@@ -247,6 +316,18 @@ static int64_t s_obstacle_phase_start_us;
 static int64_t s_obstacle_cooldown_until_us;
 static int64_t s_obstacle_reacquire_until_us;
 static bool s_obstacle_ready;
+static bool s_servo_initialized;
+static ball_phase_t s_ball_phase;
+static int64_t s_ball_phase_start_us;
+static uint8_t s_ball_align_frames;
+static int s_ball_x;
+static int s_ball_y;
+static int s_ball_zone_x;
+static int s_ball_zone_y;
+static bool s_ball_target_valid;
+static bool s_ball_zone_valid;
+static int s_ball_search_direction;
+static uint8_t s_ball_target_miss_frames;
 static uint8_t s_arm_frames;
 static int64_t s_motor_start_us;
 static uint8_t s_finish_frames;
@@ -920,6 +1001,488 @@ static void drive_slow_spin(int turn)
     s_suppress_kick = saved_suppress_kick;
 }
 
+static uint32_t servo_pulse_to_duty(uint32_t pulse_us)
+{
+    return (SERVO_MAX_DUTY * pulse_us) / SERVO_PERIOD_US;
+}
+
+static void servo_set_pulse(ledc_channel_t channel, uint32_t pulse_us)
+{
+    (void)ledc_set_duty(LEDC_LOW_SPEED_MODE, channel,
+                        servo_pulse_to_duty(pulse_us));
+    (void)ledc_update_duty(LEDC_LOW_SPEED_MODE, channel);
+}
+
+static esp_err_t ball_servo_init(void)
+{
+    if (s_servo_initialized) {
+        return ESP_OK;
+    }
+    const ledc_timer_config_t timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = SERVO_RESOLUTION,
+        .timer_num = SERVO_TIMER,
+        .freq_hz = 50,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    esp_err_t err = ledc_timer_config(&timer);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    const ledc_channel_config_t channels[] = {
+        {
+            .gpio_num = PAN_SERVO_PIN,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel = SERVO_PAN_CHANNEL,
+            .intr_type = LEDC_INTR_DISABLE,
+            .timer_sel = SERVO_TIMER,
+            .duty = servo_pulse_to_duty(BALL_PAN_CENTER_US),
+            .hpoint = 0,
+        },
+        {
+            .gpio_num = TILT_SERVO_PIN,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel = SERVO_TILT_CHANNEL,
+            .intr_type = LEDC_INTR_DISABLE,
+            .timer_sel = SERVO_TIMER,
+            .duty = servo_pulse_to_duty(BALL_TILT_HIGH_US),
+            .hpoint = 0,
+        },
+    };
+    for (size_t i = 0; i < sizeof(channels) / sizeof(channels[0]); ++i) {
+        err = ledc_channel_config(&channels[i]);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    servo_set_pulse(SERVO_PAN_CHANNEL, BALL_PAN_CENTER_US);
+    servo_set_pulse(SERVO_TILT_CHANNEL, BALL_TILT_HIGH_US);
+    s_servo_initialized = true;
+    ESP_LOGI(TAG, "ball servos ready: pan=center tilt=high");
+    return ESP_OK;
+}
+
+static void ball_enable_stby(void)
+{
+    if (!s_stby_enabled) {
+        gpio_set_level(STBY_GPIO, 1);
+        s_stby_enabled = true;
+    }
+}
+
+/* Ball motion deliberately bypasses the line controller's forward ramp.  It
+ * still uses the validated wheel signs and the same stiction floors. */
+static void ball_drive_direct(int a, int b, int d)
+{
+    ball_enable_stby();
+    obstacle_drive_direct(a, b, d, true);
+}
+
+static void ball_drive_spin(int direction, int speed)
+{
+    const int magnitude = speed < MOTOR_MIN_RUN_OUTPUT ? MOTOR_MIN_RUN_OUTPUT : speed;
+    const int rear = magnitude < MOTOR_B_MIN_RUN_OUTPUT ? MOTOR_B_MIN_RUN_OUTPUT : magnitude;
+    ball_drive_direct(-direction * magnitude, direction * rear,
+                      -direction * magnitude);
+}
+
+static void ball_drive_forward(int speed)
+{
+    const int magnitude = speed < MOTOR_MIN_RUN_OUTPUT ? MOTOR_MIN_RUN_OUTPUT : speed;
+    /* This is the same forward vector as line_mixer_solve(forward,0,0). */
+    ball_drive_direct(-magnitude, 0, magnitude);
+}
+
+static void ball_drive_stop(void)
+{
+    stop_motors();
+}
+
+static const char *ball_phase_name(void)
+{
+    switch (s_ball_phase) {
+    case BALL_SEARCH_RED: return "SEARCH_R";
+    case BALL_ALIGN_RED: return "ALIGN_R";
+    case BALL_PUSH_RED: return "PUSH_R";
+    case BALL_RETURN_RED: return "BACK_R";
+    case BALL_SEARCH_WHITE: return "SEARCH_W";
+    case BALL_ALIGN_WHITE: return "ALIGN_W";
+    case BALL_PUSH_WHITE: return "PUSH_W";
+    case BALL_RETURN_WHITE: return "BACK_W";
+    case BALL_DONE: return "DONE";
+    case BALL_IDLE:
+    default: return "IDLE";
+    }
+}
+
+static uint8_t ball_luma(const uint8_t *pixel, int *red, int *green, int *blue)
+{
+    const uint16_t value = ((uint16_t)pixel[0] << 8) | pixel[1];
+    const int r = ((value >> 11) & 0x1f) * 255 / 31;
+    const int g = ((value >> 5) & 0x3f) * 255 / 63;
+    const int b = (value & 0x1f) * 255 / 31;
+    if (red != NULL) *red = r;
+    if (green != NULL) *green = g;
+    if (blue != NULL) *blue = b;
+    return (uint8_t)((77 * r + 150 * g + 29 * b) >> 8);
+}
+
+static bool ball_pixel_matches(const uint8_t *frame, uint16_t width,
+                               uint16_t height, int x, int y, bool red_target)
+{
+    if (frame == NULL || x < 0 || y < 0 || x >= (int)width || y >= (int)height) {
+        return false;
+    }
+    const uint8_t *pixel = frame + (((size_t)y * width + (size_t)x) * 2U);
+    int red = 0;
+    int green = 0;
+    int blue = 0;
+    const int luma = ball_luma(pixel, &red, &green, &blue);
+    if (red_target) {
+        return red >= BALL_RED_MIN_R && red > green + BALL_RED_CHANNEL_GAP &&
+               red > blue + BALL_RED_CHANNEL_GAP;
+    }
+    /* A white ball is accepted only when it has a low-saturation, high-luma
+     * pixel.  The local contrast test in find_ball_blob rejects a white wall or
+     * a uniformly bright floor. */
+    return luma >= BALL_WHITE_MIN_LUMA &&
+           (red > green ? red - green : green - red) <= BALL_WHITE_MAX_SATURATION &&
+           (red > blue ? red - blue : blue - red) <= BALL_WHITE_MAX_SATURATION &&
+           (green > blue ? green - blue : blue - green) <= BALL_WHITE_MAX_SATURATION;
+}
+
+static bool find_ball_blob(const uint8_t *frame, uint16_t width, uint16_t height,
+                           bool red_target, ball_blob_t *blob)
+{
+    if (frame == NULL || blob == NULL || width < 16 || height < 16) {
+        return false;
+    }
+    *blob = (ball_blob_t){0};
+    const int top = (int)height * BALL_SCAN_TOP_PERCENT / 100;
+    const int bottom = (int)height * BALL_SCAN_BOTTOM_PERCENT / 100;
+    const int radius = red_target ? 6 : 7;
+    int best_score = 0;
+    int best_x = -1;
+    int best_y = -1;
+
+    /* Search every other pixel.  A local count favours a compact ball over
+     * isolated red reflections and costs little because this runs only after
+     * the line-follow finish. */
+    for (int y = top; y < bottom; y += 2) {
+        for (int x = 0; x < (int)width; x += 2) {
+            if (!ball_pixel_matches(frame, width, height, x, y, red_target)) {
+                continue;
+            }
+            int inside = 0;
+            int dark_ring = 0;
+            for (int dy = -radius; dy <= radius; dy += 2) {
+                for (int dx = -radius; dx <= radius; dx += 2) {
+                    if (dx * dx + dy * dy > radius * radius) continue;
+                    if (ball_pixel_matches(frame, width, height, x + dx, y + dy,
+                                            red_target)) {
+                        ++inside;
+                    }
+                }
+            }
+            if (!red_target) {
+                const int ring = radius + 3;
+                for (int dy = -ring; dy <= ring; dy += 2) {
+                    for (int dx = -ring; dx <= ring; dx += 2) {
+                        const int distance = dx * dx + dy * dy;
+                        if (distance < radius * radius ||
+                            distance > ring * ring) continue;
+                        const int ring_x = x + dx;
+                        const int ring_y = y + dy;
+                        if (ring_x >= 0 && ring_y >= 0 &&
+                            ring_x < (int)width && ring_y < (int)height &&
+                            !ball_pixel_matches(frame, width, height, ring_x, ring_y,
+                                                false)) {
+                            ++dark_ring;
+                        }
+                    }
+                }
+            }
+            const int score = red_target ? inside : inside * 3 + dark_ring;
+            if (!red_target && dark_ring < BALL_WHITE_MIN_EDGE_PIXELS) {
+                continue;
+            }
+            if (inside >= BALL_MIN_PIXELS && score > best_score) {
+                best_score = score;
+                best_x = x;
+                best_y = y;
+            }
+        }
+    }
+    if (best_x < 0 || best_score <= 0) {
+        return false;
+    }
+
+    int sum_x = 0;
+    int sum_y = 0;
+    int count = 0;
+    int left = width;
+    int right = 0;
+    int top_y = height;
+    int bottom_y = 0;
+    const int collect_radius = radius + 3;
+    for (int y = best_y - collect_radius; y <= best_y + collect_radius; ++y) {
+        for (int x = best_x - collect_radius; x <= best_x + collect_radius; ++x) {
+            if (!ball_pixel_matches(frame, width, height, x, y, red_target)) {
+                continue;
+            }
+            const int dx = x - best_x;
+            const int dy = y - best_y;
+            if (dx * dx + dy * dy > collect_radius * collect_radius) continue;
+            sum_x += x;
+            sum_y += y;
+            ++count;
+            if (x < left) left = x;
+            if (x > right) right = x;
+            if (y < top_y) top_y = y;
+            if (y > bottom_y) bottom_y = y;
+        }
+    }
+    if (count < BALL_MIN_PIXELS) {
+        return false;
+    }
+    blob->valid = true;
+    blob->x = sum_x / count;
+    blob->y = sum_y / count;
+    blob->width = right - left + 1;
+    blob->height = bottom_y - top_y + 1;
+    blob->pixels = count;
+    blob->edge_score = best_score;
+    return true;
+}
+
+static bool find_black_zone(const uint8_t *frame, uint16_t width, uint16_t height,
+                            ball_zone_t *zone)
+{
+    if (frame == NULL || zone == NULL || width < 24 || height < 24) {
+        return false;
+    }
+    *zone = (ball_zone_t){0};
+    const int window_w = width / 6 < BALL_ZONE_MIN_RUN_PIXELS ?
+                         BALL_ZONE_MIN_RUN_PIXELS : width / 6;
+    const int window_h = height / 8 < BALL_ZONE_MIN_ROWS ?
+                         BALL_ZONE_MIN_ROWS : height / 8;
+    int best_score = 0;
+    int best_x = -1;
+    int best_y = -1;
+    for (int y = (int)height / 10; y + window_h < (int)height * 9 / 10; y += 3) {
+        for (int x = 0; x + window_w < (int)width; x += 3) {
+            int dark = 0;
+            for (int row = 0; row < window_h; row += 2) {
+                int run = 0;
+                for (int column = 0; column < window_w; column += 2) {
+                    const uint8_t *pixel = frame +
+                        (((size_t)(y + row) * width + (size_t)(x + column)) * 2U);
+                    if (ball_luma(pixel, NULL, NULL, NULL) <= BALL_ZONE_THRESHOLD) {
+                        ++dark;
+                        ++run;
+                    } else {
+                        run = 0;
+                    }
+                }
+                if (run >= BALL_ZONE_MIN_RUN_PIXELS / 2) {
+                    dark += run;
+                }
+            }
+            if (dark > best_score) {
+                best_score = dark;
+                best_x = x;
+                best_y = y;
+            }
+        }
+    }
+    const int required = (window_w / 2) * (window_h / 3);
+    if (best_x < 0 || best_score < required) {
+        return false;
+    }
+    zone->valid = true;
+    zone->x = best_x + window_w / 2;
+    zone->y = best_y + window_h / 2;
+    zone->width = window_w;
+    zone->rows = window_h;
+    zone->score = best_score;
+    return true;
+}
+
+static bool ball_is_search_phase(void)
+{
+    return s_ball_phase == BALL_SEARCH_RED || s_ball_phase == BALL_SEARCH_WHITE;
+}
+
+static bool ball_is_red_phase(void)
+{
+    return s_ball_phase == BALL_SEARCH_RED || s_ball_phase == BALL_ALIGN_RED ||
+           s_ball_phase == BALL_PUSH_RED || s_ball_phase == BALL_RETURN_RED;
+}
+
+static void ball_begin(int64_t now)
+{
+    if (ball_servo_init() != ESP_OK) {
+        ESP_LOGE(TAG, "ball task disabled: servo init failed");
+        s_ball_phase = BALL_DONE;
+        return;
+    }
+    servo_set_pulse(SERVO_PAN_CHANNEL, BALL_PAN_CENTER_US);
+    servo_set_pulse(SERVO_TILT_CHANNEL, BALL_TILT_HIGH_US);
+    s_ball_phase = BALL_SEARCH_RED;
+    s_ball_phase_start_us = now;
+    s_ball_align_frames = 0;
+    s_ball_target_valid = false;
+    s_ball_zone_valid = false;
+    s_ball_search_direction = 1;
+    s_ball_target_miss_frames = 0;
+    ball_drive_stop();
+    ESP_LOGW(TAG, "finish task: tilt high, searching RED then WHITE");
+}
+
+static void ball_next_search(int64_t now)
+{
+    s_ball_phase = BALL_SEARCH_WHITE;
+    s_ball_phase_start_us = now;
+    s_ball_align_frames = 0;
+    s_ball_target_valid = false;
+    s_ball_zone_valid = false;
+    s_ball_search_direction = 1;
+    s_ball_target_miss_frames = 0;
+    ESP_LOGI(TAG, "red delivered; searching WHITE");
+}
+
+static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
+                               int64_t now)
+{
+    if (frame == NULL || !s_finished || s_ball_phase == BALL_IDLE ||
+        s_ball_phase == BALL_DONE) {
+        return;
+    }
+    const bool red_target = ball_is_red_phase();
+    ball_blob_t blob = {0};
+    ball_zone_t zone = {0};
+    const bool found_ball = find_ball_blob(frame, width, height, red_target, &blob);
+    bool found_zone = false;
+
+    if (ball_is_search_phase()) {
+        if (found_ball) {
+            s_ball_x = blob.x;
+            s_ball_y = blob.y;
+            s_ball_target_valid = true;
+            s_ball_phase = red_target ? BALL_ALIGN_RED : BALL_ALIGN_WHITE;
+            s_ball_phase_start_us = now;
+            s_ball_align_frames = 0;
+            s_ball_target_miss_frames = 0;
+            ball_drive_stop();
+            ESP_LOGI(TAG, "%s ball found at (%d,%d) pixels=%d; aligning",
+                     red_target ? "red" : "white", blob.x, blob.y, blob.pixels);
+            return;
+        }
+        const int64_t elapsed = now - s_ball_phase_start_us;
+        if (elapsed < (int64_t)BALL_SERVO_SETTLE_MS * 1000) {
+            ball_drive_stop();
+            return;
+        }
+        if (elapsed > (int64_t)BALL_SEARCH_TIMEOUT_MS * 1000) {
+            ESP_LOGW(TAG, "%s ball search timeout; stopping safely",
+                     red_target ? "red" : "white");
+            s_ball_phase = BALL_DONE;
+            ball_drive_stop();
+        } else {
+            if (elapsed > (int64_t)BALL_SEARCH_TIMEOUT_MS * 500 &&
+                s_ball_search_direction > 0) {
+                s_ball_search_direction = -1;
+            }
+            ball_drive_spin(s_ball_search_direction, BALL_SEARCH_TURN_SPEED);
+        }
+        return;
+    }
+
+    if (s_ball_phase == BALL_ALIGN_RED || s_ball_phase == BALL_ALIGN_WHITE) {
+        found_zone = find_black_zone(frame, width, height, &zone);
+        if (found_ball) {
+            s_ball_x = blob.x;
+            s_ball_y = blob.y;
+            s_ball_target_valid = true;
+            s_ball_target_miss_frames = 0;
+        } else if (s_ball_target_miss_frames < 3U) {
+            ++s_ball_target_miss_frames;
+        } else {
+            s_ball_phase = red_target ? BALL_SEARCH_RED : BALL_SEARCH_WHITE;
+            s_ball_phase_start_us = now;
+            s_ball_target_valid = false;
+            s_ball_zone_valid = false;
+            ESP_LOGW(TAG, "%s ball lost during alignment; resuming search",
+                     red_target ? "red" : "white");
+            return;
+        }
+        if (found_zone) {
+            s_ball_zone_x = zone.x;
+            s_ball_zone_y = zone.y;
+            s_ball_zone_valid = true;
+        }
+        if (!s_ball_target_valid || !s_ball_zone_valid) {
+            ball_drive_spin(s_ball_search_direction, BALL_ALIGN_TURN_SPEED);
+        } else {
+            const int aim_x = (s_ball_x + s_ball_zone_x) / 2;
+            const int error = aim_x - (int)width / 2;
+            if (abs(error) <= BALL_ALIGN_TOLERANCE_PX) {
+                if (s_ball_align_frames < BALL_ALIGN_CONFIRM_FRAMES) {
+                    ++s_ball_align_frames;
+                }
+                ball_drive_stop();
+            } else {
+                s_ball_align_frames = 0;
+                const int direction = error > 0 ? -1 : 1;
+                ball_drive_spin(direction, BALL_ALIGN_TURN_SPEED);
+            }
+            if (s_ball_align_frames >= BALL_ALIGN_CONFIRM_FRAMES) {
+                s_ball_phase = red_target ? BALL_PUSH_RED : BALL_PUSH_WHITE;
+                s_ball_phase_start_us = now;
+                s_ball_align_frames = 0;
+                ESP_LOGI(TAG, "%s aligned ball=(%d,%d) zone=(%d,%d); push",
+                         red_target ? "red" : "white", s_ball_x, s_ball_y,
+                         s_ball_zone_x, s_ball_zone_y);
+            }
+        }
+        if (now - s_ball_phase_start_us > (int64_t)BALL_ALIGN_TIMEOUT_MS * 1000) {
+            ESP_LOGW(TAG, "%s alignment timeout; returning to search",
+                     red_target ? "red" : "white");
+            s_ball_phase = red_target ? BALL_SEARCH_RED : BALL_SEARCH_WHITE;
+            s_ball_phase_start_us = now;
+            s_ball_target_valid = false;
+            s_ball_zone_valid = false;
+        }
+        return;
+    }
+
+    if (s_ball_phase == BALL_PUSH_RED || s_ball_phase == BALL_PUSH_WHITE) {
+        ball_drive_forward(BALL_PUSH_SPEED);
+        if (now - s_ball_phase_start_us >= (int64_t)BALL_PUSH_MS * 1000) {
+            s_ball_phase = red_target ? BALL_RETURN_RED : BALL_RETURN_WHITE;
+            s_ball_phase_start_us = now;
+            ball_drive_direct(BALL_RETURN_SPEED, 0, -BALL_RETURN_SPEED);
+            ESP_LOGI(TAG, "%s push complete; fixed-time return",
+                     red_target ? "red" : "white");
+        }
+        return;
+    }
+
+    if (s_ball_phase == BALL_RETURN_RED || s_ball_phase == BALL_RETURN_WHITE) {
+        ball_drive_direct(BALL_RETURN_SPEED, 0, -BALL_RETURN_SPEED);
+        if (now - s_ball_phase_start_us >= (int64_t)BALL_RETURN_MS * 1000) {
+            ball_drive_stop();
+            if (s_ball_phase == BALL_RETURN_RED) {
+                ball_next_search(now);
+            } else {
+                s_ball_phase = BALL_DONE;
+                ESP_LOGW(TAG, "both balls delivered; vehicle stopped");
+            }
+        }
+    }
+}
+
 static void reset_control(bool reset_forward)
 {
     s_lat_accum = 0;
@@ -1242,6 +1805,7 @@ void camera_line_follow_get_debug_snapshot(camera_line_follow_debug_snapshot_t *
     snapshot->armed = s_armed;
     snapshot->stby = s_stby_enabled;
     snapshot->candidate = s_last_candidate;
+    snapshot->ball_phase = ball_phase_name();
     snapshot->motor_a = s_command_a;
     snapshot->motor_b = s_command_b;
     snapshot->motor_d = s_command_d;
@@ -1286,7 +1850,7 @@ void camera_line_follow_tft_status_callback(void *user_ctx)
     (void)snprintf(line, sizeof(line), "SEED %d V%02d Q%03d",
                    snapshot.seed_x, snapshot.valid_rows, snapshot.confidence);
     (void)tft_st7735_draw_text(0, 112, line, 0xffff, 0x0000);
-    (void)snprintf(line, sizeof(line), "CTRL %d", snapshot.candidate ? 1 : 0);
+    (void)snprintf(line, sizeof(line), "BALL %s", snapshot.ball_phase);
     (void)tft_st7735_draw_text(0, 120, line, 0xffff, 0x0000);
 #endif
 }
@@ -1352,7 +1916,7 @@ static void maybe_log_summary(int64_t now)
              "reacq=%u/%u seed_valid=%d threshold=%d seed_x=%d line_w=%d "
              "scan_bottom=%d points=%d valid_rows=%u near_rows=%d confidence=%u "
              "near_line=%d far_error=%d corner=%d@%d pending=%d/%lldms "
-             "line_age_ms=%lld avoid=%s dist_x10=%d dist_ok=%d phase_ms=%u",
+             "line_age_ms=%lld avoid=%s dist_x10=%d dist_ok=%d phase_ms=%u ball=%s",
              state_name(), s_armed, s_stby_enabled, s_last_candidate,
              s_last_candidate_held,
              (unsigned)s_arm_frames, (unsigned)s_lost_frames,
@@ -1364,7 +1928,7 @@ static void maybe_log_summary(int64_t now)
              s_last_far_error, s_last_corner_direction, s_last_corner_row_y,
              pending, (long long)pending_ms, (long long)line_age_ms,
              obstacle_state_name(), obstacle_distance_x10, s_ultrasonic_valid,
-             (unsigned)obstacle_phase_ms);
+             (unsigned)obstacle_phase_ms, ball_phase_name());
     ESP_LOGI(TAG,
              "control forward[target,ramped]=[%d,%d] drive[in f,t,l]=[%d,%d,%d] "
              "lat[raw,filtered,delta,cmd]=[%d,%d,%d,%d] "
@@ -1406,6 +1970,7 @@ static void disarm_tracking(void)
     s_obstacle_cooldown_until_us = 0;
     s_obstacle_reacquire_until_us = 0;
     s_obstacle_ready = true;
+    s_ball_phase = BALL_IDLE;
     s_armed = false;
     s_arm_frames = 0;
     s_motor_start_us = 0;
@@ -1432,10 +1997,13 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     (void)rgb565_big_endian;
     goto done;
 #endif
-    if (!s_started || s_finished) {
-        if (s_started) {
-            stop_motors();
-        }
+    if (!s_started) {
+        goto done;
+    }
+    if (s_finished) {
+        /* The line is complete, but the same latest-frame callback now feeds
+         * the independent ball-delivery state machine. */
+        ball_process_frame(rgb565_big_endian, width, height, now);
         goto done;
     }
     if (s_first_frame_us == 0) {
@@ -1596,6 +2164,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             s_finished = true;
             s_state = LINE_STATE_NORMAL;
             stop_motors();
+            ball_begin(now);
             ESP_LOGW(TAG, "finish T stopped at row %d; heading=%d aligned=%d",
                      observation.corner_row_y, observation.heading_error,
                      heading_aligned);
@@ -2017,6 +2586,17 @@ esp_err_t camera_line_follow_start(void)
     s_obstacle_cooldown_until_us = 0;
     s_obstacle_reacquire_until_us = 0;
     s_obstacle_ready = true;
+    s_ball_phase = BALL_IDLE;
+    s_ball_phase_start_us = 0;
+    s_ball_align_frames = 0;
+    s_ball_x = 0;
+    s_ball_y = 0;
+    s_ball_zone_x = 0;
+    s_ball_zone_y = 0;
+    s_ball_target_valid = false;
+    s_ball_zone_valid = false;
+    s_ball_search_direction = 1;
+    s_ball_target_miss_frames = 0;
     s_arm_frames = 0;
     s_motor_start_us = 0;
     s_finish_frames = 0;
@@ -2100,6 +2680,7 @@ void camera_line_follow_stop(void)
     s_obstacle_cooldown_until_us = 0;
     s_obstacle_reacquire_until_us = 0;
     s_obstacle_ready = true;
+    s_ball_phase = BALL_IDLE;
     s_started = false;
     s_last_frame_us = 0;
     if (s_control_mutex != NULL) {

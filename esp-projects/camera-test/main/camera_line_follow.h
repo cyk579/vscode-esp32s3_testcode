@@ -37,6 +37,7 @@ typedef struct {
     bool armed;
     bool stby;
     bool candidate;
+    const char *ball_phase;
     int motor_a;
     int motor_b;
     int motor_d;

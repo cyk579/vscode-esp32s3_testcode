@@ -1,9 +1,10 @@
 #pragma once
 #include "esp_err.h"
 typedef enum { LEDC_LOW_SPEED_MODE = 0 } ledc_mode_t;
-typedef enum { LEDC_CHANNEL_0 = 0, LEDC_CHANNEL_1, LEDC_CHANNEL_2 } ledc_channel_t;
-typedef enum { LEDC_TIMER_0 = 0 } ledc_timer_t;
-typedef enum { LEDC_TIMER_10_BIT = 10 } ledc_timer_bit_t;
+typedef enum { LEDC_CHANNEL_0 = 0, LEDC_CHANNEL_1, LEDC_CHANNEL_2,
+               LEDC_CHANNEL_3, LEDC_CHANNEL_4 } ledc_channel_t;
+typedef enum { LEDC_TIMER_0 = 0, LEDC_TIMER_1 } ledc_timer_t;
+typedef enum { LEDC_TIMER_10_BIT = 10, LEDC_TIMER_14_BIT = 14 } ledc_timer_bit_t;
 typedef enum { LEDC_AUTO_CLK = 0 } ledc_clk_cfg_t;
 typedef enum { LEDC_INTR_DISABLE = 0 } ledc_intr_type_t;
 typedef struct { ledc_mode_t speed_mode; ledc_timer_bit_t duty_resolution;
