@@ -54,6 +54,8 @@
 #define LINE_SATURATION_MAX 60
 #define LINE_WIDTH_FILTER_OLD 3
 #define LINE_WIDTH_FILTER_NEW 1
+#define LINE_ERROR_FILTER_OLD 4
+#define LINE_ERROR_FILTER_NEW 6
 
 /* 这些值保留原有的上电、限速、换向保护和超时停车行为。 */
 #define LINE_START_DELAY_MS 600U
@@ -67,9 +69,9 @@
 /* 终点 T 停车。调巡线时可以临时置 0，避免把"误停"当成"丢线"。 */
 #define LINE_FINISH_ENABLE 1
 
-/* 速度四档现在互不相同（原来 MEDIUM 和 SLOW 都是 22，等于少一档）。 */
-#define LINE_FORWARD_FAST 18
-#define LINE_FORWARD_MEDIUM 16
+/* 实车调试阶段四档前进量统一压到最低可持续前进值。 */
+#define LINE_FORWARD_FAST 15
+#define LINE_FORWARD_MEDIUM 15
 #define LINE_FORWARD_SLOW 15
 #define LINE_FORWARD_CRAWL 15
 #define LINE_FORWARD_SLEW 4
@@ -141,8 +143,8 @@
  * 预算只剩 4，LINE_TURN_MAX 19 和 LINE_PID_TURN_MAX 10 在高速下根本到不了，
  * 而单轮可用区间 11~34 只有 3:1 动态范围，向量混控挤不开。
  * TODO(实测): ceiling 按实测最高安全轮速调整；trim 按架空/落地直行跑偏配平。 */
-#define MOTOR_PWM_CEILING 50
-#define LINE_SPEED_CAP 18
+#define MOTOR_PWM_CEILING 30
+#define LINE_SPEED_CAP 15
 #define MOTOR_TRIM_A 100
 #define MOTOR_TRIM_D 100
 
@@ -199,6 +201,9 @@ static int s_lat_accum;
 static int s_yaw_accum;
 static int s_forward_output;
 static int s_turn_output;
+static bool s_error_filter_initialized;
+static int s_lateral_control_error;
+static int s_heading_control_error;
 
 static int s_turn_direction;
 static uint8_t s_turn_hint_frames;
@@ -507,6 +512,9 @@ static void reset_control(void)
     s_yaw_accum = 0;
     s_forward_output = 0;
     s_turn_output = 0;
+    s_error_filter_initialized = false;
+    s_lateral_control_error = 0;
+    s_heading_control_error = 0;
 }
 
 static void reset_tracking(void)
@@ -541,6 +549,21 @@ static line_control_cfg_t control_cfg(void)
     return cfg;
 }
 
+static int filter_control_error(int current, int *filtered)
+{
+    if (filtered == NULL) {
+        return current;
+    }
+    if (!s_error_filter_initialized) {
+        *filtered = current;
+    } else {
+        *filtered = (LINE_ERROR_FILTER_OLD * *filtered +
+                     LINE_ERROR_FILTER_NEW * current) /
+                    (LINE_ERROR_FILTER_OLD + LINE_ERROR_FILTER_NEW);
+    }
+    return *filtered;
+}
+
 /* forward 单独限速率，避免速度档位在门限附近来回跳造成推力抖动。 */
 static void drive_normal(const line_observation_t *observation, int64_t now)
 {
@@ -555,10 +578,15 @@ static void drive_normal(const line_observation_t *observation, int64_t now)
     } else {
         s_forward_output = target;
     }
-    s_turn_output = line_control_yaw(&cfg, observation->heading_error,
+    const int lateral_error = filter_control_error(observation->lateral_error,
+                                                   &s_lateral_control_error);
+    const int heading_error = filter_control_error(observation->heading_error,
+                                                   &s_heading_control_error);
+    s_error_filter_initialized = true;
+    s_turn_output = line_control_yaw(&cfg, heading_error,
                                      &s_yaw_accum);
     drive(s_forward_output, s_turn_output,
-          line_control_strafe(&cfg, observation->lateral_error, &s_lat_accum));
+          line_control_strafe(&cfg, lateral_error, &s_lat_accum));
 }
 
 static void update_seed(const line_observation_t *observation)
