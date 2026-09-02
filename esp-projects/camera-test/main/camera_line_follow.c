@@ -68,9 +68,9 @@
 #define LINE_FINISH_ENABLE 1
 
 /* 速度四档现在互不相同（原来 MEDIUM 和 SLOW 都是 22，等于少一档）。 */
-#define LINE_FORWARD_FAST 20
-#define LINE_FORWARD_MEDIUM 18
-#define LINE_FORWARD_SLOW 16
+#define LINE_FORWARD_FAST 18
+#define LINE_FORWARD_MEDIUM 16
+#define LINE_FORWARD_SLOW 15
 #define LINE_FORWARD_CRAWL 15
 #define LINE_FORWARD_SLEW 4
 
@@ -142,7 +142,7 @@
  * 而单轮可用区间 11~34 只有 3:1 动态范围，向量混控挤不开。
  * TODO(实测): ceiling 按实测最高安全轮速调整；trim 按架空/落地直行跑偏配平。 */
 #define MOTOR_PWM_CEILING 50
-#define LINE_SPEED_CAP 20
+#define LINE_SPEED_CAP 18
 #define MOTOR_TRIM_A 100
 #define MOTOR_TRIM_D 100
 
