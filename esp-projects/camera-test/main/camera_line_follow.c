@@ -68,7 +68,7 @@
 #define LINE_MOTOR_START_RAMP_MS 700
 #define LINE_MOTOR_START_MIN_OUTPUT 14
 #define LINE_LOST_HOLD_MS 600U
-#define LINE_LOST_STOP_MS 1500U
+#define LINE_LOST_STOP_MS 1800U
 #define LINE_FRAME_TIMEOUT_MS 1200U
 #define LINE_FINISH_CONFIRM_FRAMES 5U
 /* 终点 T 停车。调巡线时可以临时置 0，避免把"误停"当成"丢线"。 */
@@ -80,6 +80,12 @@
 #define LINE_FORWARD_SLOW 20
 #define LINE_FORWARD_CRAWL 18
 #define LINE_FORWARD_SLEW 2
+
+/* A two-point partial scan is often a one-frame JPEG/lighting miss, not a
+ * genuine loss of the track. Keep the previous steering briefly while the
+ * detector catches up, but do not let partial noise extend the line age. */
+#define LINE_PARTIAL_MIN_POINTS 2
+#define LINE_PARTIAL_TRACK_HOLD_MS 450U
 
 /* 误差门限。|error| 被 ROI 夹在 55 以内（center 只能落在 48..191），所以
  * 原来的 LINE_ERROR_LARGE=60 在 NORMAL 里永远不可达，CRAWL 那一档是死的。 */
@@ -1067,6 +1073,24 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         s_last_good_observation = observation;
         s_have_last_good_observation = true;
         s_candidate_miss_frames = 0;
+    } else if (s_armed && s_state == LINE_STATE_NORMAL &&
+               !turn_pending_active(now) && s_seed_valid &&
+               observation.point_count >= LINE_PARTIAL_MIN_POINTS &&
+               observation.near_normal_rows >= LINE_PARTIAL_MIN_POINTS &&
+               s_last_line_us != 0 &&
+               now - s_last_line_us <= (int64_t)LINE_PARTIAL_TRACK_HOLD_MS * 1000 &&
+               s_candidate_miss_frames < LINE_SOFT_LOST_FRAMES) {
+        /* A partial scan is usually a one-frame JPEG/lighting miss. Keep the
+         * previous control error while showing the real points that were found. */
+        ++s_candidate_miss_frames;
+        observation.candidate = true;
+        observation.seed_x = s_seed_x;
+        observation.lateral_error = s_last_lateral_error;
+        observation.heading_error = s_last_heading_error;
+        observation.far_error = s_last_far_error;
+        observation.near_line_visible = true;
+        candidate = true;
+        held_candidate = true;
     } else if (s_armed && s_state == LINE_STATE_NORMAL &&
                !turn_pending_active(now) && s_have_last_good_observation &&
                s_candidate_miss_frames < LINE_SOFT_LOST_FRAMES) {
