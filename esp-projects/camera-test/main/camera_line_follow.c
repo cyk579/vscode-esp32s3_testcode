@@ -249,6 +249,7 @@ static int s_mix_post_b;
 static int s_mix_post_d;
 static bool s_mix_scaled;
 static bool s_mix_dropped;
+static bool s_mix_repaired;
 
 static int s_turn_direction;
 static uint8_t s_turn_hint_frames;
@@ -677,7 +678,56 @@ static int forward_ramp_cap(int64_t now)
            (int)((LINE_SPEED_CAP - LINE_MOTOR_START_MIN_OUTPUT) * elapsed / span);
 }
 
-static void drive(int forward, int turn, int lat)
+/*
+ * The generic mixer deliberately drops sub-floor wheel components so its
+ * standalone contract remains exact.  In NORMAL, however, a valid forward
+ * command must not collapse to a single wheel just because a steering pulse
+ * was scaled.  Restore only components that were requested and then dropped;
+ * the repair is bounded by the measured stiction floors and the PWM ceiling.
+ */
+static bool repair_normal_drive(const line_mixer_cfg_t *cfg,
+                                int forward,
+                                int raw_a,
+                                int raw_b,
+                                int raw_d,
+                                line_mixer_out_t *out)
+{
+    if (cfg == NULL || out == NULL || forward < LINE_MOTOR_START_MIN_OUTPUT ||
+        !out->dropped) {
+        return false;
+    }
+
+    bool repaired = false;
+    if (out->a == 0) {
+        int sign = direction_of(raw_a);
+        if (sign == 0) {
+            sign = -direction_of(forward);
+        }
+        if (sign != 0) {
+            out->a = sign * cfg->floor_ad;
+            repaired = true;
+        }
+    }
+    if (out->d == 0) {
+        int sign = direction_of(raw_d);
+        if (sign == 0) {
+            sign = direction_of(forward);
+        }
+        if (sign != 0) {
+            out->d = sign * cfg->floor_ad;
+            repaired = true;
+        }
+    }
+    /* A nonzero yaw request should keep the rear wheel over its own floor. */
+    if (out->b == 0 && raw_b != 0) {
+        out->b = direction_of(raw_b) * cfg->floor_b;
+        repaired = true;
+    }
+    return repaired;
+}
+
+static void drive_internal(int forward, int turn, int lat,
+                           bool normal_traction_guard)
 {
     const line_mixer_cfg_t cfg = {
         MOTOR_PWM_CEILING, MOTOR_MIN_RUN_OUTPUT, MOTOR_B_MIN_RUN_OUTPUT,
@@ -695,6 +745,9 @@ static void drive(int forward, int turn, int lat)
     s_mix_pre_b = turn + 2 * lat;
     s_mix_pre_d = forward_d - turn + lat;
     line_mixer_solve(forward, turn, lat, &cfg, &out);
+    s_mix_repaired = normal_traction_guard && s_armed &&
+                     repair_normal_drive(&cfg, forward, s_mix_pre_a,
+                                         s_mix_pre_b, s_mix_pre_d, &out);
     s_command_a = out.a;
     s_command_b = out.b;
     s_command_d = out.d;
@@ -706,6 +759,16 @@ static void drive(int forward, int turn, int lat)
     motor_set(&motor_a, s_command_a);
     motor_set(&motor_b, s_command_b);
     motor_set(&motor_d, s_command_d);
+}
+
+static void drive(int forward, int turn, int lat)
+{
+    drive_internal(forward, turn, lat, false);
+}
+
+static void drive_normal_vector(int forward, int turn, int lat)
+{
+    drive_internal(forward, turn, lat, true);
 }
 
 /* Use the low-speed IR spin calibration in TURN.  The direct wheel commands
@@ -735,6 +798,7 @@ static void drive_slow_spin(int turn)
     s_mix_post_d = d;
     s_mix_scaled = false;
     s_mix_dropped = false;
+    s_mix_repaired = false;
     s_command_a = a;
     s_command_b = b;
     s_command_d = d;
@@ -754,7 +818,9 @@ static void reset_control(void)
 {
     s_lat_accum = 0;
     s_yaw_accum = 0;
-    s_forward_output = 0;
+    /* Restart from a real drive value; starting at zero made the first several
+     * frames fall below the wheel stiction floors and produced no motion. */
+    s_forward_output = LINE_MOTOR_START_MIN_OUTPUT;
     s_turn_output = 0;
     s_error_filter_initialized = false;
     s_lateral_control_error = 0;
@@ -863,7 +929,7 @@ static void drive_normal(const line_observation_t *observation, int64_t now)
     s_turn_output = line_control_yaw_pd(&cfg, steer_error, steer_rate,
                                         LINE_PD_KD_HEADING, &s_yaw_accum);
     s_lat_accum = 0;
-    drive(s_forward_output, s_turn_output, 0);
+    drive_normal_vector(s_forward_output, s_turn_output, 0);
 }
 
 static void update_seed(const line_observation_t *observation)
@@ -975,7 +1041,7 @@ static void maybe_log_summary(int64_t now)
              "lat[raw,filtered,delta,cmd]=[%d,%d,%d,%d] "
              "head[raw,filtered,delta,cmd]=[%d,%d,%d,%d] "
              "mix_pre[A,B,D]=[%d,%d,%d] mix_post[A,B,D]=[%d,%d,%d] "
-             "scaled=%d dropped=%d kick[A,B,D]=[%u,%u,%u] "
+             "scaled=%d dropped=%d repaired=%d kick[A,B,D]=[%u,%u,%u] "
              "dir[A,B,D]=[%d,%d,%d] motor[A,B,D]=[%d,%d,%d]",
              s_last_forward_target, s_last_forward_ramped,
              s_last_drive_forward, s_last_drive_turn, s_last_drive_lat,
@@ -984,7 +1050,7 @@ static void maybe_log_summary(int64_t now)
              s_last_heading_delta, s_last_drive_turn,
              s_mix_pre_a, s_mix_pre_b, s_mix_pre_d,
              s_mix_post_a, s_mix_post_b, s_mix_post_d,
-             s_mix_scaled, s_mix_dropped,
+             s_mix_scaled, s_mix_dropped, s_mix_repaired,
              (unsigned)s_kick_cycles[0], (unsigned)s_kick_cycles[1],
              (unsigned)s_kick_cycles[2], s_last_direction[0],
              s_last_direction[1], s_last_direction[2],
@@ -1564,6 +1630,7 @@ esp_err_t camera_line_follow_start(void)
     s_kick_cycles[0] = 0;
     s_kick_cycles[1] = 0;
     s_kick_cycles[2] = 0;
+    s_mix_repaired = false;
     s_summary_start_us = 0;
     s_summary_camera_frames = 0;
     s_summary_processed_frames = 0;
