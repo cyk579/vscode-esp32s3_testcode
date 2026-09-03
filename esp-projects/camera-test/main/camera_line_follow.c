@@ -146,8 +146,8 @@
 #define LINE_CALIB_SPIN_MS 10000U
 
 /* 扫描几何按这个解码尺寸调过；协商到别的分辨率时绝对像素量的含义会变。 */
-#define LINE_EXPECTED_WIDTH 120
-#define LINE_EXPECTED_HEIGHT 80
+#define LINE_EXPECTED_WIDTH 160
+#define LINE_EXPECTED_HEIGHT 120
 
 /* 起转下限、启动冲量和方向符号全部复用 car-spin 的实车校准值。红外巡线
  * 工程是在同一台三轮全向车上测过的，这里不要再自行下调：B 轮实测起转

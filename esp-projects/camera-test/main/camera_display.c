@@ -19,6 +19,8 @@
 #define CAMERA_DISPLAY_SLOT_COUNT 3
 #define CAMERA_DISPLAY_MAX_JPEG_BYTES (256 * 1024)
 #define CAMERA_CONTROL_BUFFER_COUNT 2
+/* The preferred 320x240@30 stream decodes at 1/2 to 160x120.  The
+ * 480x320 fallback decodes at 1/4 to 120x80 while using the same buffers. */
 #define CAMERA_CONTROL_MAX_WIDTH 160
 #define CAMERA_CONTROL_MAX_HEIGHT 120
 #define CAMERA_CONTROL_RGB565_BYTES \
