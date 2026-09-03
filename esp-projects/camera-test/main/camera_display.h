@@ -26,9 +26,6 @@ typedef void (*camera_display_preview_callback_t)(uint8_t *rgb565_big_endian,
                                                    int64_t capture_us,
                                                    void *user_ctx);
 
-/* Called after the low-rate image transfer, leaving the status area visible. */
-typedef void (*camera_display_tft_status_callback_t)(void *user_ctx);
-
 typedef struct {
     uint32_t camera_frames;
     uint32_t processed_frames;
@@ -62,9 +59,6 @@ void camera_display_set_frame_callback(camera_display_frame_callback_t callback,
 
 void camera_display_set_preview_callback(camera_display_preview_callback_t callback,
                                          void *user_ctx);
-
-void camera_display_set_tft_status_callback(camera_display_tft_status_callback_t callback,
-                                             void *user_ctx);
 
 /**
  * Give the preview task one complete MJPEG frame.

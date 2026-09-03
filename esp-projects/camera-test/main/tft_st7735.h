@@ -29,10 +29,3 @@ bool tft_st7735_draw_rgb565_2x_crop(const uint8_t *rgb565_big_endian,
                                     uint16_t crop_right,
                                     uint16_t crop_bottom,
                                     uint16_t blank_color);
-
-/* Draw one compact ASCII status line without allocating a framebuffer. */
-bool tft_st7735_draw_text(uint16_t x,
-                          uint16_t y,
-                          const char *text,
-                          uint16_t foreground,
-                          uint16_t background);
