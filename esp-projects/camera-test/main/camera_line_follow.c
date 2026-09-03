@@ -124,15 +124,15 @@
 #define LINE_TURN_B_SPEED 13
 #define LINE_TURN_D_SPEED 15
 #define LINE_TURN_PENDING_MS 500U
-/* 摄像头在底盘前方：近场折角出现后，先让底盘向前走一小段再原地转。 */
+/* 摄像头在底盘前方：旧线消失并确认要转弯后，先让底盘向前走一小段。 */
 #define LINE_CORNER_CENTER_DELAY_MS 500U
 /* 低速调试时优先保证三轮都超过各自起转阈值；此前叠加 40% 横移后，
  * 在较低总上限下 A/D 被缩放掉，锐角阶段实际只剩 B 轮。 */
 #define LINE_CAM_PIVOT_PERCENT 0
 #define LINE_ALERT_MS 900U
 
-/* NORMAL 低速用时间脉冲而不是把 PWM 压到静摩擦死区。esp_timer 只负责
- * 切换 duty，巡线状态和最后一组 forward/turn 命令始终保留。 */
+/* NORMAL 低速用时间脉冲而不是把 PWM 压到静摩擦死区。MIN 只抬 mixer
+ * 输入的 forward，绝不逐轮改 A/B/D；esp_timer 只负责切换 duty。 */
 #define LINE_BURST_ENABLE 1
 #define LINE_BURST_PERIOD_MS 1200U
 #define LINE_BURST_ON_MS 900U
@@ -794,11 +794,7 @@ static void motor_set(const motor_t *motor, int command)
     }
 #if LINE_BURST_ENABLE
     if (burst_output) {
-        const int burst_min = LINE_BURST_MIN_OUTPUT > MOTOR_PWM_CEILING ?
-                              MOTOR_PWM_CEILING : LINE_BURST_MIN_OUTPUT;
-        if (output < burst_min) {
-            output = burst_min;
-        }
+        /* mixer 已经确定 A/B/D 的比例；burst 这里只缓存并门控 duty。 */
         s_burst_output[index] = output;
         /* OFF 只关 duty，方向脚和 kick 计数仍保持；下一次 ON 不会重新
          * 经过 motor_set，因此不会再次触发完整 startup kick。 */
@@ -859,6 +855,12 @@ static void drive_internal(int forward, int turn, int lat,
     s_last_drive_turn = turn;
     s_last_drive_lat = lat;
     forward = clamp_int(forward, forward_ramp_cap(esp_timer_get_time()));
+#if LINE_BURST_ENABLE
+    if (normal_burst && forward != 0 &&
+        abs(forward) < LINE_BURST_MIN_OUTPUT) {
+        forward = direction_of(forward) * LINE_BURST_MIN_OUTPUT;
+    }
+#endif
     s_last_forward_ramped = forward;
     const int forward_a = forward * MOTOR_TRIM_A / 100;
     const int forward_d = forward * MOTOR_TRIM_D / 100;
@@ -1377,7 +1379,15 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             reset_control();
             ESP_LOGI(TAG, "turn complete; back to NORMAL at ey=%d",
                      observation.lateral_error);
+            /* CORNER 的轮向与 NORMAL 不同。只屏蔽这一次切换产生的 kick，
+             * 并清掉刚装载的计数，避免下一帧补发；首次正常起步不受影响。 */
+            const bool saved_suppress_kick = s_suppress_kick;
+            s_suppress_kick = true;
             drive_normal(&observation, now);
+            s_kick_cycles[0] = 0;
+            s_kick_cycles[1] = 0;
+            s_kick_cycles[2] = 0;
+            s_suppress_kick = saved_suppress_kick;
             goto done;
         }
         if (s_turn_started_us != 0 &&
@@ -1460,6 +1470,25 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     }
 
     /* ---- NORMAL ---- */
+    if (s_turn_direction != 0 && s_corner_center_delay_until_us != 0) {
+        if (now < s_corner_center_delay_until_us) {
+            /* 已确认旧线消失：只前进补偿摄像头到车体中心的距离。 */
+            drive_normal_output(LINE_FORWARD_CRAWL, 0, 0);
+            goto done;
+        }
+        s_state = LINE_STATE_CORNER;
+        s_turn_frames = 0;
+        s_turn_exit_frames = 0;
+        s_turn_started_us = now;
+        s_turn_pending_until_us = 0;
+        s_corner_center_delay_until_us = 0;
+        reset_control();
+        ESP_LOGI(TAG, "corner %s center delay complete; pivoting",
+                 s_turn_direction < 0 ? "left" : "right");
+        drive_slow_spin(-s_turn_direction * LINE_PIVOT_TURN);
+        goto done;
+    }
+
     if (candidate) {
         s_state = LINE_STATE_NORMAL;
         s_lost_frames = 0;
@@ -1469,7 +1498,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             update_seed(&observation);
         }
 
-        /* 近场折角先挂起；只有旧线随后消失才进入 CORNER 原地慢转。 */
+        /* 近场折角这里只记录 pending；旧线消失后才开始车体中心补偿。 */
         const int trigger_y = (int)height * LINE_TURN_TRIGGER_PERCENT / 100;
         if (observation.corner_direction != 0 &&
             observation.corner_row_y >= trigger_y) {
@@ -1484,16 +1513,8 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 s_corner_center_delay_until_us = 0;
             }
             if (s_turn_hint_frames >= LINE_TURN_HINT_FRAMES) {
-                if (s_corner_center_delay_until_us == 0) {
-                    s_corner_center_delay_until_us = now +
-                                                     (int64_t)LINE_CORNER_CENTER_DELAY_MS *
-                                                         1000;
-                }
                 s_turn_pending_until_us = now +
                                            (int64_t)LINE_TURN_PENDING_MS * 1000;
-                if (s_turn_pending_until_us < s_corner_center_delay_until_us) {
-                    s_turn_pending_until_us = s_corner_center_delay_until_us;
-                }
             }
         } else if (!turn_pending_active(now)) {
             s_turn_hint_frames = 0;
@@ -1505,29 +1526,13 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         goto done;
     }
 
-    /* 近场折角已经提示但旧线刚消失时，先用 NORMAL 的短脉冲前进补偿
-     * 摄像头到车体中心的前向距离；不改状态、不清历史，也不提前原地转。 */
-    if (s_turn_direction != 0 && s_corner_center_delay_until_us != 0 &&
-        now < s_corner_center_delay_until_us) {
-        if (s_turn_pending_until_us < s_corner_center_delay_until_us) {
-            s_turn_pending_until_us = s_corner_center_delay_until_us;
-        }
+    if (turn_pending_active(now)) {
+        /* pending + 旧线消失才锁定本次转弯，并从此刻开始完整的中心补偿。 */
+        s_corner_center_delay_until_us = now +
+                                         (int64_t)LINE_CORNER_CENTER_DELAY_MS * 1000;
+        s_turn_pending_until_us = 0;
         s_state = LINE_STATE_NORMAL;
         drive_normal_output(LINE_FORWARD_CRAWL, 0, 0);
-        goto done;
-    }
-
-    if (turn_pending_active(now)) {
-        s_state = LINE_STATE_CORNER;
-        s_turn_frames = 0;
-        s_turn_exit_frames = 0;
-        s_turn_started_us = now;
-        s_turn_pending_until_us = 0;
-        s_corner_center_delay_until_us = 0;
-        reset_control();
-        ESP_LOGI(TAG, "corner %s confirmed after old line loss; pivoting",
-                 s_turn_direction < 0 ? "left" : "right");
-        drive_slow_spin(-s_turn_direction * LINE_PIVOT_TURN);
         goto done;
     }
 
