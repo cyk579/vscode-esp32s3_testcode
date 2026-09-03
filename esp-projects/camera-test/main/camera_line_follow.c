@@ -17,6 +17,7 @@
 #include "line_control.h"
 #include "line_geometry.h"
 #include "line_mixer.h"
+#include "ultrasonic.h"
 
 /* 电机引脚与已经校准过的 car-spin 工程保持一致。 */
 #define A_PWM GPIO_NUM_9
@@ -70,7 +71,7 @@
 #define LINE_LOST_STOP_MS 1800U
 #define LINE_FRAME_TIMEOUT_MS 1200U
 #define LINE_FINISH_CONFIRM_FRAMES 5U
-/* 终点 T 停车。调巡线时可以临时置 0，避免把"误停"当成"丢线"。 */
+/* 终点 T 停车；固定避障路线完成后才会启用。 */
 #define LINE_FINISH_ENABLE 1
 
 /* 22% 是 car-spin 已验证的低速可持续区间；斜坡仍按控制周期平滑上升。 */
@@ -184,6 +185,27 @@
 #define MOTOR_B_SIGN 1
 #define MOTOR_D_SIGN -1
 
+/* HC-SR04 obstacle route. Motion timing is independent of camera FPS. */
+#define ULTRASONIC_TRIG GPIO_NUM_18
+#define ULTRASONIC_ECHO GPIO_NUM_11
+#define ULTRASONIC_MIN_CM 2.0f
+#define ULTRASONIC_MAX_CM 400.0f
+#define OBSTACLE_DETECT_CM 10.0f
+#define OBSTACLE_CLOSE_CONFIRM_SAMPLES 2U
+#define ULTRASONIC_PERIOD_MS 60U
+#define AVOID_BRAKE_MS 500U
+#define AVOID_LEFT_MS 2500U
+#define AVOID_FORWARD_MS 2000U
+#define AVOID_RIGHT_MS 2500U
+#define AVOID_REACQUIRE_GRACE_MS 1000U
+#define AVOID_LEFT_SIDE_SPEED 18
+#define AVOID_LEFT_B_SPEED 25
+#define AVOID_RIGHT_A_SPEED 15
+#define AVOID_RIGHT_B_SPEED 25
+#define AVOID_RIGHT_D_SPEED 20
+#define AVOID_FORWARD_A_SPEED 25
+#define AVOID_FORWARD_D_SPEED 20
+
 typedef struct {
     gpio_num_t in1;
     gpio_num_t in2;
@@ -197,6 +219,14 @@ typedef enum {
     LINE_STATE_LOST,
 } line_state_t;
 
+typedef enum {
+    OBSTACLE_IDLE = 0,
+    OBSTACLE_BRAKE,
+    OBSTACLE_LEFT,
+    OBSTACLE_FORWARD,
+    OBSTACLE_RIGHT,
+} obstacle_state_t;
+
 static const char *TAG = "camera_line";
 static const motor_t motor_a = {A_IN1, A_IN2, LEDC_CHANNEL_0, MOTOR_A_SIGN};
 static const motor_t motor_b = {B_IN1, B_IN2, LEDC_CHANNEL_1, MOTOR_B_SIGN};
@@ -206,6 +236,16 @@ static volatile bool s_started;
 static bool s_armed;
 static bool s_finished;
 static bool s_stby_enabled;
+static volatile float s_ultrasonic_distance_cm = -1.0f;
+static volatile bool s_ultrasonic_valid;
+static volatile uint32_t s_ultrasonic_sequence;
+static bool s_ultrasonic_task_created;
+static obstacle_state_t s_obstacle_state;
+static uint32_t s_obstacle_close_samples;
+static uint32_t s_obstacle_last_sequence;
+static int64_t s_obstacle_phase_start_us;
+static int64_t s_obstacle_reacquire_until_us;
+static bool s_obstacle_completed;
 static uint8_t s_arm_frames;
 static int64_t s_motor_start_us;
 static uint8_t s_finish_frames;
@@ -332,6 +372,7 @@ static line_overlay_snapshot_t s_overlay_snapshot;
 static SemaphoreHandle_t s_overlay_mutex;
 
 static void camera_line_follow_watchdog_task(void *arg);
+static void camera_ultrasonic_task(void *arg);
 #if LINE_CALIB_MODE
 static void camera_line_calibration_task(void *arg);
 #endif
@@ -992,6 +1033,163 @@ static void reset_tracking(void)
     s_state = LINE_STATE_NORMAL;
 }
 
+static const char *obstacle_state_name(void)
+{
+    switch (s_obstacle_state) {
+    case OBSTACLE_BRAKE:
+        return "BRAKE";
+    case OBSTACLE_LEFT:
+        return "LEFT";
+    case OBSTACLE_FORWARD:
+        return "FORWARD";
+    case OBSTACLE_RIGHT:
+        return "RIGHT";
+    case OBSTACLE_IDLE:
+    default:
+        return "IDLE";
+    }
+}
+
+static uint32_t obstacle_elapsed_ms(int64_t now)
+{
+    if (s_obstacle_phase_start_us == 0 || now <= s_obstacle_phase_start_us) {
+        return 0;
+    }
+    const int64_t elapsed_us = now - s_obstacle_phase_start_us;
+    if (elapsed_us >= (int64_t)UINT32_MAX * 1000) {
+        return UINT32_MAX;
+    }
+    return (uint32_t)(elapsed_us / 1000);
+}
+
+static void obstacle_drive_direct(int a, int b, int d)
+{
+    normal_burst_deactivate();
+    s_last_forward_target = 0;
+    s_last_forward_ramped = 0;
+    s_last_drive_forward = 0;
+    s_last_drive_turn = 0;
+    s_last_drive_lat = 0;
+    s_mix_pre_a = a;
+    s_mix_pre_b = b;
+    s_mix_pre_d = d;
+    s_mix_post_a = a;
+    s_mix_post_b = b;
+    s_mix_post_d = d;
+    s_mix_scaled = false;
+    s_mix_dropped = false;
+    s_command_a = a;
+    s_command_b = b;
+    s_command_d = d;
+    motor_set(&motor_a, a);
+    motor_set(&motor_b, b);
+    motor_set(&motor_d, d);
+}
+
+static void obstacle_update_sensor(void)
+{
+    const uint32_t sequence = s_ultrasonic_sequence;
+    if (sequence == s_obstacle_last_sequence) {
+        return;
+    }
+    s_obstacle_last_sequence = sequence;
+    const float distance = s_ultrasonic_distance_cm;
+    const bool close = s_ultrasonic_valid &&
+                       distance >= ULTRASONIC_MIN_CM &&
+                       distance <= OBSTACLE_DETECT_CM;
+    if (close) {
+        if (s_obstacle_close_samples < UINT32_MAX) {
+            ++s_obstacle_close_samples;
+        }
+    } else {
+        s_obstacle_close_samples = 0;
+    }
+}
+
+static void obstacle_begin(int64_t now)
+{
+    s_obstacle_state = OBSTACLE_BRAKE;
+    s_obstacle_phase_start_us = now;
+    s_obstacle_close_samples = 0;
+    s_obstacle_reacquire_until_us = 0;
+    reset_control();
+    zero_motor_outputs();
+    ESP_LOGW(TAG, "obstacle %.1fcm confirmed; fixed avoidance route started",
+             (double)s_ultrasonic_distance_cm);
+}
+
+static void obstacle_finish(int64_t now, uint16_t width)
+{
+    s_obstacle_state = OBSTACLE_IDLE;
+    s_obstacle_phase_start_us = 0;
+    s_obstacle_close_samples = 0;
+    s_obstacle_completed = true;
+    s_obstacle_reacquire_until_us =
+        now + (int64_t)AVOID_REACQUIRE_GRACE_MS * 1000;
+
+    /* The timed lateral route invalidates the previous line seed. */
+    reset_tracking();
+    s_last_line_us = now;
+    s_reacquire_x = (int)width / 2;
+    zero_motor_outputs();
+    ESP_LOGI(TAG, "avoidance complete; visual line follow and finish-T enabled");
+}
+
+/* Return true while the fixed obstacle route owns the motors. */
+static bool obstacle_step(int64_t now, uint16_t width, bool line_available)
+{
+    obstacle_update_sensor();
+
+    if (s_obstacle_state == OBSTACLE_IDLE) {
+        if (!s_obstacle_completed && s_armed && !s_finished && line_available &&
+            s_obstacle_close_samples >= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
+            obstacle_begin(now);
+            return true;
+        }
+        return false;
+    }
+
+    const uint32_t elapsed = obstacle_elapsed_ms(now);
+    switch (s_obstacle_state) {
+    case OBSTACLE_BRAKE:
+        zero_motor_outputs();
+        if (elapsed >= AVOID_BRAKE_MS) {
+            s_obstacle_state = OBSTACLE_LEFT;
+            s_obstacle_phase_start_us = now;
+            ESP_LOGI(TAG, "avoidance: left shift for %ums", (unsigned)AVOID_LEFT_MS);
+        }
+        break;
+    case OBSTACLE_LEFT:
+        obstacle_drive_direct(-AVOID_LEFT_SIDE_SPEED, -AVOID_LEFT_B_SPEED,
+                              -AVOID_LEFT_SIDE_SPEED);
+        if (elapsed >= AVOID_LEFT_MS) {
+            s_obstacle_state = OBSTACLE_FORWARD;
+            s_obstacle_phase_start_us = now;
+            ESP_LOGI(TAG, "avoidance: forward for %ums", (unsigned)AVOID_FORWARD_MS);
+        }
+        break;
+    case OBSTACLE_FORWARD:
+        obstacle_drive_direct(AVOID_FORWARD_A_SPEED, 0, AVOID_FORWARD_D_SPEED);
+        if (elapsed >= AVOID_FORWARD_MS) {
+            s_obstacle_state = OBSTACLE_RIGHT;
+            s_obstacle_phase_start_us = now;
+            ESP_LOGI(TAG, "avoidance: right shift for %ums", (unsigned)AVOID_RIGHT_MS);
+        }
+        break;
+    case OBSTACLE_RIGHT:
+        obstacle_drive_direct(AVOID_RIGHT_A_SPEED, AVOID_RIGHT_B_SPEED,
+                              AVOID_RIGHT_D_SPEED);
+        if (elapsed >= AVOID_RIGHT_MS) {
+            obstacle_finish(now, width);
+        }
+        break;
+    case OBSTACLE_IDLE:
+    default:
+        break;
+    }
+    return true;
+}
+
 static line_control_cfg_t control_cfg(void)
 {
     const line_control_cfg_t cfg = {
@@ -1146,7 +1344,8 @@ bool camera_line_follow_status_callback(camera_display_status_t *status,
     status->lateral_error = s_last_lateral_error;
     status->heading_error = s_last_heading_error;
     status->turn_command = s_last_drive_turn;
-    status->ultrasonic_cm = -1;
+    status->ultrasonic_cm = s_ultrasonic_valid ?
+                            (int)(s_ultrasonic_distance_cm + 0.5f) : -1;
 
     (void)xSemaphoreGive(s_control_mutex);
     return true;
@@ -1239,6 +1438,11 @@ static void maybe_log_summary(int64_t now)
              (unsigned)s_kick_cycles[2], s_last_direction[0],
              s_last_direction[1], s_last_direction[2],
              s_command_a, s_command_b, s_command_d);
+    ESP_LOGI(TAG, "route avoid=%s phase_ms=%u distance_x10=%d valid=%d done=%d",
+             obstacle_state_name(), (unsigned)obstacle_elapsed_ms(now),
+             s_ultrasonic_valid ?
+                 (int)(s_ultrasonic_distance_cm * 10.0f + 0.5f) : -1,
+             s_ultrasonic_valid, s_obstacle_completed);
 
     s_summary_camera_frames = pipeline.camera_frames;
     s_summary_processed_frames = pipeline.processed_frames;
@@ -1255,6 +1459,10 @@ static void maybe_log_summary(int64_t now)
 static void disarm_tracking(void)
 {
     stop_motors();
+    s_obstacle_state = OBSTACLE_IDLE;
+    s_obstacle_close_samples = 0;
+    s_obstacle_phase_start_us = 0;
+    s_obstacle_reacquire_until_us = 0;
     s_armed = false;
     s_arm_frames = 0;
     s_motor_start_us = 0;
@@ -1386,10 +1594,16 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         goto done;
     }
 
+    /* The fixed route owns the motors until its timed right shift ends. */
+    if (obstacle_step(now, width, candidate && s_state == LINE_STATE_NORMAL)) {
+        goto done;
+    }
+
     /* ---- 终点 T：双侧敞开的横杆 + 下方仍有立柱 ---- */
     if (!observation.finish_candidate) {
         s_finish_frames = 0;
-    } else if (LINE_FINISH_ENABLE && candidate && s_state == LINE_STATE_NORMAL) {
+    } else if (LINE_FINISH_ENABLE && s_obstacle_completed && candidate &&
+               s_state == LINE_STATE_NORMAL) {
         if (s_finish_frames < LINE_FINISH_CONFIRM_FRAMES) {
             ++s_finish_frames;
         }
@@ -1582,6 +1796,8 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     /* ---- LOST：只在最后可信种子附近重捕获 ---- */
     if (s_state == LINE_STATE_LOST) {
         const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
+        const bool obstacle_grace = s_obstacle_reacquire_until_us != 0 &&
+                                    now < s_obstacle_reacquire_until_us;
         if (candidate) {
             const int confirm_window = positive_percent((int)width,
                                                         LINE_SEARCH_HALF_PERCENT,
@@ -1607,6 +1823,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 s_reacquire_frames = 0;
                 update_seed(&observation);
                 s_last_line_us = now;
+                s_obstacle_reacquire_until_us = 0;
                 reset_control();
                 drive_normal(&observation, now);
                 goto done;
@@ -1624,7 +1841,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         } else {
             s_reacquire_frames = 0;
             s_reacquire_x = s_seed_x;
-            if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
+            if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000 || obstacle_grace) {
                 drive(LINE_FORWARD_CRAWL, 0, 0);
             } else {
                 zero_motor_outputs();
@@ -1658,6 +1875,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
 
     if (candidate) {
         s_state = LINE_STATE_NORMAL;
+        s_obstacle_reacquire_until_us = 0;
         s_lost_frames = 0;
         s_reacquire_frames = 0;
         if (!partial_candidate) {
@@ -1710,7 +1928,9 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     reset_control();
     {
         const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
-        if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000) {
+        const bool obstacle_grace = s_obstacle_reacquire_until_us != 0 &&
+                                    now < s_obstacle_reacquire_until_us;
+        if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000 || obstacle_grace) {
             drive(LINE_FORWARD_CRAWL, 0, 0);
         } else {
             zero_motor_outputs();
@@ -1817,6 +2037,25 @@ static void camera_line_calibration_task(void *arg)
 }
 #endif
 
+static void camera_ultrasonic_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        if (!s_started) {
+            vTaskDelay(pdMS_TO_TICKS(ULTRASONIC_PERIOD_MS));
+            continue;
+        }
+
+        const float distance = ultrasonic_read_cm();
+        const bool valid = distance >= ULTRASONIC_MIN_CM &&
+                           distance <= ULTRASONIC_MAX_CM;
+        s_ultrasonic_distance_cm = valid ? distance : -1.0f;
+        s_ultrasonic_valid = valid;
+        ++s_ultrasonic_sequence;
+        vTaskDelay(pdMS_TO_TICKS(ULTRASONIC_PERIOD_MS));
+    }
+}
+
 static void camera_line_follow_watchdog_task(void *arg)
 {
     (void)arg;
@@ -1905,10 +2144,20 @@ esp_err_t camera_line_follow_start(void)
         }
     }
 
+    ultrasonic_init(ULTRASONIC_TRIG, ULTRASONIC_ECHO);
     s_started = true;
     s_armed = false;
     s_finished = false;
     s_stby_enabled = false;
+    s_ultrasonic_distance_cm = -1.0f;
+    s_ultrasonic_valid = false;
+    s_ultrasonic_sequence = 0;
+    s_obstacle_state = OBSTACLE_IDLE;
+    s_obstacle_close_samples = 0;
+    s_obstacle_last_sequence = 0;
+    s_obstacle_phase_start_us = 0;
+    s_obstacle_reacquire_until_us = 0;
+    s_obstacle_completed = false;
     s_arm_frames = 0;
     s_motor_start_us = 0;
     s_finish_frames = 0;
@@ -1945,6 +2194,16 @@ esp_err_t camera_line_follow_start(void)
     gpio_set_level(STBY_GPIO, 0);
     stop_motors();
 
+    if (!s_ultrasonic_task_created) {
+        if (xTaskCreate(camera_ultrasonic_task, "camera_ultrasonic", 2048,
+                        NULL, 1, NULL) != pdPASS) {
+            s_started = false;
+            ESP_LOGE(TAG, "Could not create ultrasonic task");
+            return ESP_ERR_NO_MEM;
+        }
+        s_ultrasonic_task_created = true;
+    }
+
     if (!s_watchdog_created) {
         if (xTaskCreate(camera_line_follow_watchdog_task, "camera_line_wd", 3072,
                         NULL, 2, NULL) != pdPASS) {
@@ -1975,6 +2234,11 @@ void camera_line_follow_stop(void)
         (void)xSemaphoreTake(s_control_mutex, portMAX_DELAY);
     }
     stop_motors();
+    s_obstacle_state = OBSTACLE_IDLE;
+    s_obstacle_close_samples = 0;
+    s_obstacle_phase_start_us = 0;
+    s_obstacle_reacquire_until_us = 0;
+    s_obstacle_completed = false;
     s_started = false;
     s_last_frame_us = 0;
     if (s_control_mutex != NULL) {
