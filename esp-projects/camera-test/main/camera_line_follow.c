@@ -32,8 +32,13 @@
 
 /* 解码器输出大端字节序 RGB565；画面左右相反时改为 1。 */
 #define CAMERA_LINE_MIRROR_X 0
-/* Negative values shift the desired track center left in the camera image. */
-#define CAMERA_LINE_CENTER_BIAS_PX (-4)
+/*
+ * 实车量得底盘中心约在线左侧 5 cm。旧的 120x80 画面标定为左移 18 px；
+ * 现在优先使用 160x120，按宽度同比换算后仍保持相同的物理偏置。
+ * 该偏置只修正 NORMAL 的近场横向参考，不写入 far_error，避免无故降速。
+ */
+#define CAMERA_LINE_CENTER_BIAS_PX (-18)
+#define CAMERA_LINE_BIAS_REFERENCE_WIDTH 120
 
 /* 摄像头相对车体的安装旋转。扫描坐标系永远是车体视角（sy 越大越靠近车），
  * 缓冲区按这个值反查，不做整帧旋转拷贝，所以改它不增加单帧耗时。
@@ -58,15 +63,17 @@
 #define LINE_WIDTH_FILTER_NEW 1
 #define LINE_ERROR_FILTER_OLD 2
 #define LINE_ERROR_FILTER_NEW 4
+#define LINE_DERIVATIVE_FILTER_OLD 1
+#define LINE_DERIVATIVE_FILTER_NEW 2
 #define LINE_PD_KD_LAT 20
-#define LINE_PD_KD_HEADING 50
+#define LINE_PD_KD_HEADING 60
 
 /* 这些值保留原有的上电、限速、换向保护和超时停车行为。 */
 #define LINE_START_DELAY_MS 600U
 #define LINE_ARM_CONFIRM_FRAMES 3U
 #define LINE_ARM_MIN_VALID_ROWS 4U
 #define LINE_MOTOR_START_RAMP_MS 700
-#define LINE_MOTOR_START_MIN_OUTPUT 14
+#define LINE_MOTOR_START_MIN_OUTPUT 18
 #define LINE_LOST_HOLD_MS 600U
 #define LINE_LOST_STOP_MS 1800U
 #define LINE_FRAME_TIMEOUT_MS 1200U
@@ -74,12 +81,11 @@
 /* 终点 T 停车。调巡线时可以临时置 0，避免把"误停"当成"丢线"。 */
 #define LINE_FINISH_ENABLE 1
 
-/* 持续速度略低于 17:15 版，给首个右锐角留出视觉制动距离；
- * 静摩擦由下方独立的短时 30% 启动脉冲克服。 */
+/* 保持当前巡线速度档，增大的只是启动/混控扭矩余量，避免再次冲过锐角。 */
 #define LINE_FORWARD_FAST 27
 #define LINE_FORWARD_MEDIUM 25
 #define LINE_FORWARD_SLOW 22
-#define LINE_FORWARD_CRAWL 18
+#define LINE_FORWARD_CRAWL 20
 #define LINE_FORWARD_SLEW 8
 
 /* A two-point partial scan is often a one-frame JPEG/lighting miss, not a
@@ -152,14 +158,15 @@
 /* 起转下限、启动冲量和方向符号全部复用 car-spin 的实车校准值。红外巡线
  * 工程是在同一台三轮全向车上测过的，这里不要再自行下调：B 轮实测起转
  * 需要 13，低于该值它完全不转，而卡死的后轮会把旋转中心从几何中心挪到
- * 后轮接地点，摄像头的横向扫过量随之放大。 */
+ * 后轮接地点，摄像头的横向扫过量随之放大。落地负载比架空测试大，正常巡线
+ * 的起转地板在已测值上各留 2 个百分点余量。 */
 #define PWM_MAX 1023U
-#define MOTOR_MIN_RUN_OUTPUT 11
-#define MOTOR_B_MIN_RUN_OUTPUT 13
-#define START_KICK_OUTPUT 30
-#define START_KICK_CYCLES 6U
-/* 持续巡航上限为 27%；30% 只用于起步/换向破静摩擦。 */
-#define MOTOR_PWM_CEILING 30
+#define MOTOR_MIN_RUN_OUTPUT 13
+#define MOTOR_B_MIN_RUN_OUTPUT 15
+#define START_KICK_OUTPUT 32
+#define START_KICK_CYCLES 8U
+/* 34% 是 car-spin 已验证的单轮余量；正常速度意图仍由 LINE_SPEED_CAP 控制。 */
+#define MOTOR_PWM_CEILING 34
 #define LINE_SPEED_CAP 27
 #define MOTOR_TRIM_A 90
 #define MOTOR_TRIM_D 100
@@ -577,13 +584,16 @@ static bool observe_line(uint8_t *frame,
     observation->threshold = source_threshold;
     if (candidate && CAMERA_LINE_CENTER_BIAS_PX != 0 && width >= 2) {
         /* Shift only the lateral reference. Heading is a difference of two
-         * errors, so the same optical offset cancels out there. */
-        const int bias = CAMERA_LINE_CENTER_BIAS_PX * 100 / ((int)width / 2);
+         * errors, so the same optical offset cancels out there. Scale the
+         * known 120-pixel calibration to whichever control width negotiated. */
+        const int reference_width = CAMERA_LINE_BIAS_REFERENCE_WIDTH > 0 ?
+                                    CAMERA_LINE_BIAS_REFERENCE_WIDTH : (int)width;
+        const int bias_px = CAMERA_LINE_CENTER_BIAS_PX * (int)width /
+                            reference_width;
+        const int bias = bias_px * 100 / ((int)width / 2);
         const int signed_bias = CAMERA_LINE_MIRROR_X ? -bias : bias;
         observation->lateral_error = clamp_int(observation->lateral_error +
                                                signed_bias, 100);
-        observation->far_error = clamp_int(observation->far_error +
-                                           signed_bias, 100);
     }
     if (draw_overlay) {
         render_tracking_overlay(frame, &cfg, observation);
@@ -909,8 +919,16 @@ static void drive_normal(const line_observation_t *observation, int64_t now)
                               lateral_error - previous_lateral : 0;
     const int heading_delta = s_error_filter_initialized ?
                               heading_error - previous_heading : 0;
-    s_lateral_error_rate = (s_lateral_error_rate * 2 + lateral_delta) / 3;
-    s_heading_error_rate = (s_heading_error_rate * 2 + heading_delta) / 3;
+    /* D 项保留一阶滤波，但让新一帧占 2/3，接近经典微分控制的即时响应；
+     * P、限幅和 dither 不变，避免把噪声直接变成抖动。 */
+    s_lateral_error_rate = (s_lateral_error_rate * LINE_DERIVATIVE_FILTER_OLD +
+                            lateral_delta * LINE_DERIVATIVE_FILTER_NEW) /
+                           (LINE_DERIVATIVE_FILTER_OLD +
+                            LINE_DERIVATIVE_FILTER_NEW);
+    s_heading_error_rate = (s_heading_error_rate * LINE_DERIVATIVE_FILTER_OLD +
+                            heading_delta * LINE_DERIVATIVE_FILTER_NEW) /
+                           (LINE_DERIVATIVE_FILTER_OLD +
+                            LINE_DERIVATIVE_FILTER_NEW);
     s_last_lateral_raw = observation->lateral_error;
     s_last_lateral_filtered = lateral_error;
     s_last_lateral_delta = s_lateral_error_rate;
@@ -926,9 +944,12 @@ static void drive_normal(const line_observation_t *observation, int64_t now)
     const int steer_error = heading_error -
                             (LINE_PID_KP_LAT * lateral_for_steer) /
                             (LINE_PID_KH > 0 ? LINE_PID_KH : 1);
+    /* line_control_yaw_pd() multiplies one combined derivative by KD_HEADING.
+     * Express the lateral part with its own KD so the two D gains retain their
+     * intended units instead of accidentally reusing the lateral P gain. */
     const int steer_rate = s_heading_error_rate -
-                           (LINE_PID_KP_LAT * s_lateral_error_rate) /
-                           (LINE_PID_KH > 0 ? LINE_PID_KH : 1);
+                           (LINE_PD_KD_LAT * s_lateral_error_rate) /
+                           (LINE_PD_KD_HEADING > 0 ? LINE_PD_KD_HEADING : 1);
     s_turn_output = line_control_yaw_pd(&cfg, steer_error, steer_rate,
                                         LINE_PD_KD_HEADING, &s_yaw_accum);
     s_lat_accum = 0;
