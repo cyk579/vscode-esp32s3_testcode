@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* The 128x160 panel is used in landscape so a 320x240 UVC frame scales to
@@ -29,3 +30,9 @@ bool tft_st7735_draw_rgb565_2x_crop(const uint8_t *rgb565_big_endian,
                                     uint16_t crop_right,
                                     uint16_t crop_bottom,
                                     uint16_t blank_color);
+
+/* Stream a small fixed-width text page without allocating a framebuffer. */
+bool tft_st7735_draw_text_lines(const char *const lines[],
+                                size_t line_count,
+                                uint16_t foreground,
+                                uint16_t background);

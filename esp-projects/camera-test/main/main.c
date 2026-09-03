@@ -311,7 +311,7 @@ void app_main(void)
     esp_err_t line_follow_err = camera_line_follow_start();
     if (line_follow_err == ESP_OK) {
         camera_display_set_frame_callback(camera_line_follow_frame_callback, NULL);
-        camera_display_set_preview_callback(camera_line_follow_preview_callback, NULL);
+        camera_display_set_status_callback(camera_line_follow_status_callback, NULL);
         ESP_LOGI(TAG, "Camera black-line following enabled; TB6612 standby is held low until arm");
     } else {
         ESP_LOGE(TAG, "Camera black-line following disabled: %s", esp_err_to_name(line_follow_err));
@@ -323,9 +323,9 @@ void app_main(void)
     esp_err_t display_err = camera_display_start();
     if (display_err == ESP_OK) {
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
-        ESP_LOGI(TAG, "Camera JPEG decoder ready; TFT preview enabled (160x128 landscape)");
+        ESP_LOGI(TAG, "Camera JPEG decoder ready; TFT status page enabled (160x128 landscape)");
 #else
-        ESP_LOGI(TAG, "Camera JPEG decoder ready; TFT preview disabled (competition mode)");
+        ESP_LOGI(TAG, "Camera JPEG decoder ready; TFT status page disabled");
 #endif
     } else {
         ESP_LOGW(TAG, "Camera JPEG decoder unavailable: %s; PC streaming remains available",

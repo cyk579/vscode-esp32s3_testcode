@@ -23,6 +23,85 @@ static const char *TAG = "tft";
 static spi_device_handle_t s_tft;
 static bool s_initialized;
 
+/* Small 5x7 ASCII subset used by the diagnostic page.  Rows are packed with
+ * bit 4 at the left; the renderer streams one TFT row at a time and never
+ * allocates a full-screen buffer. */
+static const uint8_t s_font[][7] = {
+    {0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11}, /* A */
+    {0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e}, /* B */
+    {0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e}, /* C */
+    {0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e}, /* D */
+    {0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f}, /* E */
+    {0x0e, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0f}, /* G */
+    {0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11}, /* H */
+    {0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1f}, /* I */
+    {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f}, /* L */
+    {0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11}, /* M */
+    {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11}, /* N */
+    {0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}, /* O */
+    {0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10}, /* P */
+    {0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11}, /* R */
+    {0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e}, /* S */
+    {0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}, /* T */
+    {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}, /* U */
+    {0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04}, /* Y */
+    {0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e}, /* 0 */
+    {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e}, /* 1 */
+    {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f}, /* 2 */
+    {0x1e, 0x01, 0x01, 0x0e, 0x01, 0x01, 0x1e}, /* 3 */
+    {0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02}, /* 4 */
+    {0x1f, 0x10, 0x10, 0x1e, 0x01, 0x01, 0x1e}, /* 5 */
+    {0x0e, 0x10, 0x10, 0x1e, 0x11, 0x11, 0x0e}, /* 6 */
+    {0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}, /* 7 */
+    {0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e}, /* 8 */
+    {0x0e, 0x11, 0x11, 0x0f, 0x01, 0x01, 0x0e}, /* 9 */
+    {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00}, /* : */
+    {0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00}, /* - */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* space */
+    {0x1f, 0x11, 0x05, 0x02, 0x04, 0x00, 0x04}, /* fallback */
+};
+
+static const uint8_t *font_glyph(char ch)
+{
+    if (ch >= 'a' && ch <= 'z') {
+        ch = (char)(ch - ('a' - 'A'));
+    }
+    switch (ch) {
+    case 'A': return s_font[0];
+    case 'B': return s_font[1];
+    case 'C': return s_font[2];
+    case 'D': return s_font[3];
+    case 'E': return s_font[4];
+    case 'G': return s_font[5];
+    case 'H': return s_font[6];
+    case 'I': return s_font[7];
+    case 'L': return s_font[8];
+    case 'M': return s_font[9];
+    case 'N': return s_font[10];
+    case 'O': return s_font[11];
+    case 'P': return s_font[12];
+    case 'R': return s_font[13];
+    case 'S': return s_font[14];
+    case 'T': return s_font[15];
+    case 'U': return s_font[16];
+    case 'Y': return s_font[17];
+    case '0': return s_font[18];
+    case '1': return s_font[19];
+    case '2': return s_font[20];
+    case '3': return s_font[21];
+    case '4': return s_font[22];
+    case '5': return s_font[23];
+    case '6': return s_font[24];
+    case '7': return s_font[25];
+    case '8': return s_font[26];
+    case '9': return s_font[27];
+    case ':': return s_font[28];
+    case '-': return s_font[29];
+    case ' ': return s_font[30];
+    default: return s_font[31];
+    }
+}
+
 static esp_err_t write_bytes(const void *data, size_t len, int dc)
 {
     gpio_set_level(TFT_DC, dc);
@@ -206,6 +285,61 @@ bool tft_st7735_draw_rgb565_2x_crop(const uint8_t *rgb565_big_endian,
             }
         }
         if (write_data(line, (size_t)width * 2) != ESP_OK) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool tft_st7735_draw_text_lines(const char *const lines[],
+                                size_t line_count,
+                                uint16_t foreground,
+                                uint16_t background)
+{
+    if (!s_initialized || lines == NULL) {
+        return false;
+    }
+
+    const size_t rows = TFT_ST7735_HEIGHT / 8;
+    const size_t columns = TFT_ST7735_WIDTH / 6;
+    if (line_count > rows) {
+        line_count = rows;
+    }
+    if (set_window(0, 0, TFT_ST7735_WIDTH - 1, TFT_ST7735_HEIGHT - 1) != ESP_OK) {
+        return false;
+    }
+
+    uint8_t line[TFT_ST7735_WIDTH * 2];
+    for (uint16_t y = 0; y < TFT_ST7735_HEIGHT; ++y) {
+        for (uint16_t x = 0; x < TFT_ST7735_WIDTH; ++x) {
+            line[(size_t)x * 2] = (uint8_t)(background >> 8);
+            line[(size_t)x * 2 + 1] = (uint8_t)background;
+        }
+
+        const size_t text_row = y / 8;
+        const uint8_t glyph_row = (uint8_t)(y % 8);
+        const char *text = text_row < line_count ? lines[text_row] : NULL;
+        if (text != NULL) {
+            for (size_t column = 0; column < columns; ++column) {
+                const char ch = text[column];
+                if (ch == '\0') {
+                    break;
+                }
+                const uint8_t *glyph = font_glyph(ch);
+                const uint8_t bits = glyph_row < 7 ? glyph[glyph_row] : 0;
+                for (size_t glyph_x = 0; glyph_x < 5; ++glyph_x) {
+                    if ((bits & (uint8_t)(1U << (4U - glyph_x))) == 0) {
+                        continue;
+                    }
+                    const size_t x = column * 6 + glyph_x;
+                    if (x < TFT_ST7735_WIDTH) {
+                        line[x * 2] = (uint8_t)(foreground >> 8);
+                        line[x * 2 + 1] = (uint8_t)foreground;
+                    }
+                }
+            }
+        }
+        if (write_data(line, sizeof(line)) != ESP_OK) {
             return false;
         }
     }

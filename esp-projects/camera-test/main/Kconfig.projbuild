@@ -6,12 +6,12 @@ menu "Example Configuration"
             Enables streaming of captured video.
 
     config EXAMPLE_ENABLE_TFT_PREVIEW
-        bool "Enable TFT preview"
+        bool "Enable TFT status page"
         default y
         help
-            Enables a throttled ST7735 debug preview at about 2.5 FPS. Camera
-            control decoding uses a small independent buffer (about 120x80 for
-            the default 480x320 stream); the TFT preview is decoupled from it.
+            Enables a low-priority ST7735 status page at about 2 Hz. No camera
+            preview frame is decoded for the display, so camera control remains
+            independent from TFT updates.
 
     config EXAMPLE_ENABLE_CAMERA_LINE_FOLLOW
         bool "Enable camera black-line following"

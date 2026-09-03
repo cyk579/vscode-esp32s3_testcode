@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "camera_display.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -23,7 +24,11 @@ void camera_line_follow_frame_callback(uint8_t *rgb565_big_endian,
                                        bool draw_overlay,
                                        void *user_ctx);
 
-/* Draw the latest control result on the independently decoded TFT preview. */
+/* Supplies a recent control snapshot to the independent TFT status task. */
+bool camera_line_follow_status_callback(camera_display_status_t *status,
+                                        void *user_ctx);
+
+/* Retained for source compatibility; image preview is disabled. */
 void camera_line_follow_preview_callback(uint8_t *rgb565_big_endian,
                                          uint16_t width,
                                          uint16_t height,

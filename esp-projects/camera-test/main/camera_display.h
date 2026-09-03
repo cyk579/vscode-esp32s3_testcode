@@ -17,6 +17,29 @@ typedef void (*camera_display_frame_callback_t)(uint8_t *rgb565_big_endian,
                                                 bool draw_overlay,
                                                 void *user_ctx);
 
+typedef enum {
+    CAMERA_DISPLAY_STATUS_NORMAL = 0,
+    CAMERA_DISPLAY_STATUS_CORNER,
+    CAMERA_DISPLAY_STATUS_LOST,
+    CAMERA_DISPLAY_STATUS_ALIGN,
+} camera_display_status_state_t;
+
+typedef struct {
+    camera_display_status_state_t state;
+    bool armed;
+    bool stby;
+    int motor_a;
+    int motor_b;
+    int motor_d;
+    int lateral_error;
+    int heading_error;
+    int turn_command;
+    int ultrasonic_cm;
+} camera_display_status_t;
+
+typedef bool (*camera_display_status_callback_t)(camera_display_status_t *status,
+                                                 void *user_ctx);
+
 /* Called by the low-priority preview task with an independent RGB565 frame. */
 typedef void (*camera_display_preview_callback_t)(uint8_t *rgb565_big_endian,
                                                    uint16_t width,
@@ -42,7 +65,7 @@ typedef struct {
     uint32_t last_control_sequence;
 } camera_display_pipeline_stats_t;
 
-/** Initialise the asynchronous JPEG decoder and the optional ST7735 preview. */
+/** Initialise the asynchronous JPEG decoder and the optional TFT status page. */
 esp_err_t camera_display_start(void);
 
 /**
@@ -57,15 +80,14 @@ esp_err_t camera_display_start(void);
 void camera_display_set_frame_callback(camera_display_frame_callback_t callback,
                                        void *user_ctx);
 
+void camera_display_set_status_callback(camera_display_status_callback_t callback,
+                                         void *user_ctx);
+
+/* Kept for source compatibility; the image-preview callback is no longer run. */
 void camera_display_set_preview_callback(camera_display_preview_callback_t callback,
                                          void *user_ctx);
 
-/**
- * Give the preview task one complete MJPEG frame.
- *
- * The function is non-blocking and intentionally drops stale frames.  The
- * caller retains ownership of @p jpeg as soon as this function returns.
- */
+/** Give the control decoder one complete MJPEG frame. */
 bool camera_display_submit(const uint8_t *jpeg, size_t jpeg_len);
 
 /* Read cumulative UVC, decoded, and dropped-frame counters. */

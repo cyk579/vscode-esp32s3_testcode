@@ -1125,6 +1125,33 @@ static const char *state_name(void)
     }
 }
 
+bool camera_line_follow_status_callback(camera_display_status_t *status,
+                                        void *user_ctx)
+{
+    (void)user_ctx;
+    if (status == NULL || s_control_mutex == NULL ||
+        xSemaphoreTake(s_control_mutex, 0) != pdTRUE) {
+        return false;
+    }
+
+    status->state = s_post_corner_align ? CAMERA_DISPLAY_STATUS_ALIGN :
+                    (s_state == LINE_STATE_CORNER ? CAMERA_DISPLAY_STATUS_CORNER :
+                     (s_state == LINE_STATE_LOST ? CAMERA_DISPLAY_STATUS_LOST :
+                      CAMERA_DISPLAY_STATUS_NORMAL));
+    status->armed = s_armed;
+    status->stby = s_stby_enabled;
+    status->motor_a = s_command_a;
+    status->motor_b = s_command_b;
+    status->motor_d = s_command_d;
+    status->lateral_error = s_last_lateral_error;
+    status->heading_error = s_last_heading_error;
+    status->turn_command = s_last_drive_turn;
+    status->ultrasonic_cm = -1;
+
+    (void)xSemaphoreGive(s_control_mutex);
+    return true;
+}
+
 static void maybe_log_summary(int64_t now)
 {
     camera_display_pipeline_stats_t pipeline = {0};
@@ -1309,7 +1336,12 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         candidate = true;
         partial_candidate = true;
     }
-    save_overlay_snapshot(width, height, &observation, 0);
+    /* Image preview is disabled; avoid copying overlay points on every
+     * control frame.  Keep the old path available if a future display client
+     * explicitly requests it. */
+    if (draw_overlay) {
+        save_overlay_snapshot(width, height, &observation, 0);
+    }
     s_last_scan_bottom_y = observation.scan_bottom_y;
     s_last_point_count = observation.point_count;
     s_last_near_normal_rows = observation.near_normal_rows;
