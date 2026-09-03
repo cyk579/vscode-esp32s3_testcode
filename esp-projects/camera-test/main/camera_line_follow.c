@@ -166,7 +166,7 @@
 #define PWM_MAX 1023U
 #define MOTOR_MIN_RUN_OUTPUT 11
 #define MOTOR_B_MIN_RUN_OUTPUT 13
-#define START_KICK_OUTPUT 30
+#define START_KICK_OUTPUT 27
 #define START_KICK_CYCLES 3U
 /* 正常巡航保持 22%，只给短暂起转脉冲留到 24%，避免再次卡在静摩擦区。 */
 #define MOTOR_PWM_CEILING 30
