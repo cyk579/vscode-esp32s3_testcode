@@ -4,6 +4,7 @@ import argparse
 import os
 import socket
 import sys
+import time
 
 try:
     import cv2
@@ -58,6 +59,8 @@ frame_count = 0
 stream = bytearray()
 saved = False
 stop = False
+ball_markers = {}
+ball_phase = 'IDLE'
 max_frames = args.frames or (1 if args.headless else 0)
 max_stream_bytes = 2 * 1024 * 1024
 
@@ -87,6 +90,32 @@ try:
                     del stream[:newline + 1]
                     if line.startswith(b'STATUS:'):
                         print(f'ESP32 status: {line.decode("ascii", errors="replace")}')
+                    elif line.startswith(b'DETECT '):
+                        fields = line.decode('ascii', errors='replace').split()
+                        if len(fields) >= 2 and fields[1] == 'CLEAR':
+                            ball_markers.clear()
+                            ball_phase = 'IDLE'
+                        elif len(fields) >= 7:
+                            try:
+                                colour = fields[1].lower()
+                                # DETECT coordinates are in the control frame
+                                # used by the ESP32 detector. New firmware
+                                # appends that frame's width and height; keep
+                                # the known 120x80 mode as a compatibility
+                                # fallback for older firmware.
+                                frame_w = int(fields[7]) if len(fields) >= 9 else 120
+                                frame_h = int(fields[8]) if len(fields) >= 9 else 80
+                                if frame_w <= 0 or frame_h <= 0:
+                                    frame_w, frame_h = 120, 80
+                                ball_markers[colour] = {
+                                    'x': int(fields[2]), 'y': int(fields[3]),
+                                    'w': int(fields[4]), 'h': int(fields[5]),
+                                    'phase': fields[6], 'frame_w': frame_w,
+                                    'frame_h': frame_h, 'time': time.monotonic(),
+                                }
+                                ball_phase = fields[6]
+                            except ValueError:
+                                pass
 
                 soi = stream.find(b'\xff\xd8')
                 if soi == -1:
@@ -129,6 +158,31 @@ try:
 
                 frame_count += 1
                 if not args.headless:
+                    # DETECT coordinates are from the ESP32 control image;
+                    # scale them to the full-resolution JPEG shown here.
+                    image_h, image_w = image.shape[:2]
+                    for colour, marker in list(ball_markers.items()):
+                        if time.monotonic() - marker['time'] > 2.0:
+                            del ball_markers[colour]
+                            continue
+                        sx = image_w / marker['frame_w']
+                        sy = image_h / marker['frame_h']
+                        cx = int(marker['x'] * sx)
+                        cy = int(marker['y'] * sy)
+                        half_w = max(4, int(marker['w'] * sx / 2.0))
+                        half_h = max(4, int(marker['h'] * sy / 2.0))
+                        color = (0, 0, 255) if colour == 'red' else (255, 180, 0)
+                        cv2.rectangle(image, (cx - half_w, cy - half_h),
+                                      (cx + half_w, cy + half_h), color, 2)
+                        cv2.drawMarker(image, (cx, cy), color,
+                                       cv2.MARKER_CROSS, 14, 2)
+                        cv2.putText(image, f'{colour.upper()} {marker["phase"]}',
+                                    (max(0, cx - half_w), max(18, cy - half_h - 6)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2,
+                                    cv2.LINE_AA)
+                    cv2.putText(image, f'ESP32: {ball_phase}', (8, 24),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2,
+                                cv2.LINE_AA)
                     cv2.imshow('ESP32 USB camera', image)
                     if cv2.waitKey(1) == 27:
                         stop = True

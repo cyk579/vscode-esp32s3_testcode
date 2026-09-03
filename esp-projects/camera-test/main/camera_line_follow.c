@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "camera_display.h"
 #include "driver/gpio.h"
@@ -18,6 +19,7 @@
 #include "line_control.h"
 #include "line_geometry.h"
 #include "line_mixer.h"
+#include "tcp_server.h"
 #include "ultrasonic.h"
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
 #include "tft_st7735.h"
@@ -229,12 +231,9 @@
 #define BALL_ALIGN_TIMEOUT_MS 5000U
 #define BALL_PUSH_MS 1800U
 #define BALL_RETURN_MS 1800U
-#define BALL_ALIGN_TOLERANCE_PX 5
-#define BALL_ALIGN_CONFIRM_FRAMES 3U
-#define BALL_MIN_PIXELS 5
-#define BALL_ZONE_MIN_RUN_PIXELS 8
-#define BALL_ZONE_MIN_ROWS 3
-#define BALL_ZONE_THRESHOLD 55
+#define BALL_ALIGN_TOLERANCE_PX 7
+#define BALL_ALIGN_CONFIRM_FRAMES 4U
+#define BALL_MIN_PIXELS 8
 #define BALL_SCAN_TOP_PERCENT 5
 #define BALL_SCAN_BOTTOM_PERCENT 90
 #define BALL_RED_MIN_R 90
@@ -242,6 +241,11 @@
 #define BALL_WHITE_MIN_LUMA 165
 #define BALL_WHITE_MAX_SATURATION 35
 #define BALL_WHITE_MIN_EDGE_PIXELS 4
+#define BALL_ZONE_MIN_RUN_PIXELS 8
+#define BALL_ZONE_MIN_ROWS 3
+#define BALL_ZONE_THRESHOLD 55
+#define BALL_GRID_STEP 2
+#define BALL_GRID_MAX_CELLS 4800
 
 /* subject2-findball is a standalone endpoint test image.  The vehicle is
  * placed at the finish and must enter the ball state machine directly; the
@@ -327,10 +331,7 @@ static int64_t s_ball_phase_start_us;
 static uint8_t s_ball_align_frames;
 static int s_ball_x;
 static int s_ball_y;
-static int s_ball_zone_x;
-static int s_ball_zone_y;
 static bool s_ball_target_valid;
-static bool s_ball_zone_valid;
 static int s_ball_search_direction;
 static uint8_t s_ball_target_miss_frames;
 static uint8_t s_arm_frames;
@@ -1157,6 +1158,9 @@ static bool ball_pixel_matches(const uint8_t *frame, uint16_t width,
            (green > blue ? green - blue : blue - green) <= BALL_WHITE_MAX_SATURATION;
 }
 
+static uint8_t s_ball_visited[BALL_GRID_MAX_CELLS];
+static uint16_t s_ball_queue[BALL_GRID_MAX_CELLS];
+
 static bool find_ball_blob(const uint8_t *frame, uint16_t width, uint16_t height,
                            bool red_target, ball_blob_t *blob)
 {
@@ -1164,104 +1168,149 @@ static bool find_ball_blob(const uint8_t *frame, uint16_t width, uint16_t height
         return false;
     }
     *blob = (ball_blob_t){0};
+    const int grid_w = ((int)width + BALL_GRID_STEP - 1) / BALL_GRID_STEP;
+    const int grid_h = ((int)height + BALL_GRID_STEP - 1) / BALL_GRID_STEP;
+    const size_t cells = (size_t)grid_w * (size_t)grid_h;
+    if (cells > BALL_GRID_MAX_CELLS) {
+        return false;
+    }
+    memset(s_ball_visited, 0, cells);
+
     const int top = (int)height * BALL_SCAN_TOP_PERCENT / 100;
     const int bottom = (int)height * BALL_SCAN_BOTTOM_PERCENT / 100;
-    const int radius = red_target ? 6 : 7;
     int best_score = 0;
-    int best_x = -1;
-    int best_y = -1;
+    ball_blob_t best = {0};
 
-    /* Search every other pixel.  A local count favours a compact ball over
-     * isolated red reflections and costs little because this runs only after
-     * the line-follow finish. */
-    for (int y = top; y < bottom; y += 2) {
-        for (int x = 0; x < (int)width; x += 2) {
-            if (!ball_pixel_matches(frame, width, height, x, y, red_target)) {
+    /* Flood-fill the colour mask at half resolution.  A valid ball must be a
+     * compact, reasonably round component; isolated highlights and large
+     * coloured areas therefore cannot win merely by having one bright pixel. */
+    for (int gy = 0; gy < grid_h; ++gy) {
+        const int seed_y = gy * BALL_GRID_STEP;
+        if (seed_y < top || seed_y >= bottom) continue;
+        for (int gx = 0; gx < grid_w; ++gx) {
+            const size_t seed = (size_t)gy * grid_w + (size_t)gx;
+            const int seed_x = gx * BALL_GRID_STEP;
+            if (s_ball_visited[seed] ||
+                !ball_pixel_matches(frame, width, height, seed_x, seed_y, red_target)) {
                 continue;
             }
-            int inside = 0;
-            int dark_ring = 0;
-            for (int dy = -radius; dy <= radius; dy += 2) {
-                for (int dx = -radius; dx <= radius; dx += 2) {
-                    if (dx * dx + dy * dy > radius * radius) continue;
-                    if (ball_pixel_matches(frame, width, height, x + dx, y + dy,
-                                            red_target)) {
-                        ++inside;
-                    }
-                }
-            }
-            if (!red_target) {
-                const int ring = radius + 3;
-                for (int dy = -ring; dy <= ring; dy += 2) {
-                    for (int dx = -ring; dx <= ring; dx += 2) {
-                        const int distance = dx * dx + dy * dy;
-                        if (distance < radius * radius ||
-                            distance > ring * ring) continue;
-                        const int ring_x = x + dx;
-                        const int ring_y = y + dy;
-                        if (ring_x >= 0 && ring_y >= 0 &&
-                            ring_x < (int)width && ring_y < (int)height &&
-                            !ball_pixel_matches(frame, width, height, ring_x, ring_y,
-                                                false)) {
-                            ++dark_ring;
+            s_ball_visited[seed] = 1;
+            size_t head = 0;
+            size_t tail = 0;
+            s_ball_queue[tail++] = (uint16_t)seed;
+            int count = 0;
+            int sum_x = 0;
+            int sum_y = 0;
+            int left = width;
+            int right = 0;
+            int top_y = height;
+            int bottom_y = 0;
+            while (head < tail) {
+                const uint16_t cell = s_ball_queue[head++];
+                const int cell_x = (cell % grid_w) * BALL_GRID_STEP;
+                const int cell_y = (cell / grid_w) * BALL_GRID_STEP;
+                ++count;
+                sum_x += cell_x;
+                sum_y += cell_y;
+                if (cell_x < left) left = cell_x;
+                if (cell_x > right) right = cell_x;
+                if (cell_y < top_y) top_y = cell_y;
+                if (cell_y > bottom_y) bottom_y = cell_y;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0) continue;
+                        const int nx = (cell % grid_w) + dx;
+                        const int ny = (cell / grid_w) + dy;
+                        if (nx < 0 || ny < 0 || nx >= grid_w || ny >= grid_h) continue;
+                        const size_t next = (size_t)ny * grid_w + (size_t)nx;
+                        if (s_ball_visited[next]) continue;
+                        const int pixel_x = nx * BALL_GRID_STEP;
+                        const int pixel_y = ny * BALL_GRID_STEP;
+                        if (pixel_y < top || pixel_y >= bottom ||
+                            !ball_pixel_matches(frame, width, height, pixel_x, pixel_y,
+                                                 red_target)) {
+                            continue;
+                        }
+                        s_ball_visited[next] = 1;
+                        if (tail < BALL_GRID_MAX_CELLS) {
+                            s_ball_queue[tail++] = (uint16_t)next;
                         }
                     }
                 }
             }
-            const int score = red_target ? inside : inside * 3 + dark_ring;
-            if (!red_target && dark_ring < BALL_WHITE_MIN_EDGE_PIXELS) {
-                continue;
-            }
-            if (inside >= BALL_MIN_PIXELS && score > best_score) {
-                best_score = score;
-                best_x = x;
-                best_y = y;
-            }
-        }
-    }
-    if (best_x < 0 || best_score <= 0) {
-        return false;
-    }
 
-    int sum_x = 0;
-    int sum_y = 0;
-    int count = 0;
-    int left = width;
-    int right = 0;
-    int top_y = height;
-    int bottom_y = 0;
-    const int collect_radius = radius + 3;
-    for (int y = best_y - collect_radius; y <= best_y + collect_radius; ++y) {
-        for (int x = best_x - collect_radius; x <= best_x + collect_radius; ++x) {
-            if (!ball_pixel_matches(frame, width, height, x, y, red_target)) {
+            const int box_w = right - left + BALL_GRID_STEP;
+            const int box_h = bottom_y - top_y + BALL_GRID_STEP;
+            /* count is the number of colour samples on the half-resolution
+             * grid, so compare it with the bounding box in grid cells. Using
+             * full-resolution pixel area here underestimates fill by 4x and
+             * rejects a valid 5 cm ball at the control resolution. */
+            const int sample_box_w = (right - left) / BALL_GRID_STEP + 1;
+            const int sample_box_h = (bottom_y - top_y) / BALL_GRID_STEP + 1;
+            const int sample_box_area = sample_box_w * sample_box_h;
+            const int fill_percent = sample_box_area > 0 ?
+                                     count * 100 / sample_box_area : 0;
+            if (count < BALL_MIN_PIXELS || box_w < 4 || box_h < 4 ||
+                fill_percent < (red_target ? 28 : 22) ||
+                box_w > (int)width * 3 / 4 || box_h > (int)height * 3 / 4 ||
+                box_w > box_h * 3 || box_h > box_w * 3) {
                 continue;
             }
-            const int dx = x - best_x;
-            const int dy = y - best_y;
-            if (dx * dx + dy * dy > collect_radius * collect_radius) continue;
-            sum_x += x;
-            sum_y += y;
-            ++count;
-            if (x < left) left = x;
-            if (x > right) right = x;
-            if (y < top_y) top_y = y;
-            if (y > bottom_y) bottom_y = y;
+
+            int edge_score = 0;
+            if (!red_target) {
+                for (int y = top_y - 3; y <= bottom_y + 3; y += BALL_GRID_STEP) {
+                    for (int x = left - 3; x <= right + 3; x += BALL_GRID_STEP) {
+                        if (x < 0 || y < 0 || x >= (int)width || y >= (int)height) continue;
+                        if ((x >= left && x <= right && y >= top_y && y <= bottom_y) ||
+                            ball_pixel_matches(frame, width, height, x, y, false)) {
+                            continue;
+                        }
+                        ++edge_score;
+                    }
+                }
+                if (edge_score < BALL_WHITE_MIN_EDGE_PIXELS) continue;
+            }
+
+            const int score = count * fill_percent + edge_score * 6;
+            if (score > best_score) {
+                best_score = score;
+                best.valid = true;
+                best.x = sum_x / count;
+                best.y = sum_y / count;
+                best.width = box_w;
+                best.height = box_h;
+                best.pixels = count * BALL_GRID_STEP * BALL_GRID_STEP;
+                best.edge_score = edge_score;
+            }
         }
     }
-    if (count < BALL_MIN_PIXELS) {
-        return false;
-    }
-    blob->valid = true;
-    blob->x = sum_x / count;
-    blob->y = sum_y / count;
-    blob->width = right - left + 1;
-    blob->height = bottom_y - top_y + 1;
-    blob->pixels = count;
-    blob->edge_score = best_score;
+    if (best_score <= 0) return false;
+    *blob = best;
     return true;
 }
 
-static bool find_black_zone(const uint8_t *frame, uint16_t width, uint16_t height,
+static void ball_stream_detect(const char *colour, const ball_blob_t *blob,
+                               uint16_t frame_width, uint16_t frame_height)
+{
+    if (colour == NULL || blob == NULL || !blob->valid) return;
+    char line[96];
+    const int len = snprintf(line, sizeof(line), "DETECT %s %d %d %d %d %s %u %u\n",
+                             colour, blob->x, blob->y, blob->width, blob->height,
+                             ball_phase_name(), (unsigned)frame_width,
+                             (unsigned)frame_height);
+    if (len > 0 && (size_t)len < sizeof(line)) {
+        (void)tcp_server_send((uint8_t *)line, (size_t)len);
+    }
+}
+
+static void ball_stream_clear(void)
+{
+    static const uint8_t clear[] = "DETECT CLEAR\n";
+    (void)tcp_server_send((uint8_t *)clear, sizeof(clear) - 1U);
+}
+
+static bool __attribute__((unused)) find_black_zone(const uint8_t *frame, uint16_t width, uint16_t height,
                             ball_zone_t *zone)
 {
     if (frame == NULL || zone == NULL || width < 24 || height < 24) {
@@ -1338,7 +1387,6 @@ static void ball_begin(int64_t now)
     s_ball_phase_start_us = now;
     s_ball_align_frames = 0;
     s_ball_target_valid = false;
-    s_ball_zone_valid = false;
     s_ball_search_direction = 1;
     s_ball_target_miss_frames = 0;
     ball_drive_stop();
@@ -1347,11 +1395,11 @@ static void ball_begin(int64_t now)
 
 static void ball_next_search(int64_t now)
 {
+    ball_stream_clear();
     s_ball_phase = BALL_SEARCH_WHITE;
     s_ball_phase_start_us = now;
     s_ball_align_frames = 0;
     s_ball_target_valid = false;
-    s_ball_zone_valid = false;
     s_ball_search_direction = 1;
     s_ball_target_miss_frames = 0;
     ESP_LOGI(TAG, "red delivered; searching WHITE");
@@ -1366,9 +1414,7 @@ static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
     }
     const bool red_target = ball_is_red_phase();
     ball_blob_t blob = {0};
-    ball_zone_t zone = {0};
     const bool found_ball = find_ball_blob(frame, width, height, red_target, &blob);
-    bool found_zone = false;
 
     if (ball_is_search_phase()) {
         if (found_ball) {
@@ -1382,6 +1428,8 @@ static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
             ball_drive_stop();
             ESP_LOGI(TAG, "%s ball found at (%d,%d) pixels=%d; aligning",
                      red_target ? "red" : "white", blob.x, blob.y, blob.pixels);
+            ball_stream_detect(red_target ? "RED" : "WHITE", &blob,
+                               width, height);
             return;
         }
         const int64_t elapsed = now - s_ball_phase_start_us;
@@ -1405,33 +1453,30 @@ static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
     }
 
     if (s_ball_phase == BALL_ALIGN_RED || s_ball_phase == BALL_ALIGN_WHITE) {
-        found_zone = find_black_zone(frame, width, height, &zone);
         if (found_ball) {
             s_ball_x = blob.x;
             s_ball_y = blob.y;
             s_ball_target_valid = true;
             s_ball_target_miss_frames = 0;
+            ball_stream_detect(red_target ? "RED" : "WHITE", &blob,
+                               width, height);
         } else if (s_ball_target_miss_frames < 3U) {
             ++s_ball_target_miss_frames;
         } else {
             s_ball_phase = red_target ? BALL_SEARCH_RED : BALL_SEARCH_WHITE;
             s_ball_phase_start_us = now;
             s_ball_target_valid = false;
-            s_ball_zone_valid = false;
             ESP_LOGW(TAG, "%s ball lost during alignment; resuming search",
                      red_target ? "red" : "white");
             return;
         }
-        if (found_zone) {
-            s_ball_zone_x = zone.x;
-            s_ball_zone_y = zone.y;
-            s_ball_zone_valid = true;
-        }
-        if (!s_ball_target_valid || !s_ball_zone_valid) {
+        if (!s_ball_target_valid) {
             ball_drive_spin(s_ball_search_direction, BALL_ALIGN_TURN_SPEED);
         } else {
-            const int aim_x = (s_ball_x + s_ball_zone_x) / 2;
-            const int error = aim_x - (int)width / 2;
+            /* For ball pickup the camera optical axis is the useful target:
+             * keep the ball itself centred, rather than averaging it with a
+             * separately detected black zone that may be a false candidate. */
+            const int error = s_ball_x - (int)width / 2;
             if (abs(error) <= BALL_ALIGN_TOLERANCE_PX) {
                 if (s_ball_align_frames < BALL_ALIGN_CONFIRM_FRAMES) {
                     ++s_ball_align_frames;
@@ -1446,9 +1491,8 @@ static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
                 s_ball_phase = red_target ? BALL_PUSH_RED : BALL_PUSH_WHITE;
                 s_ball_phase_start_us = now;
                 s_ball_align_frames = 0;
-                ESP_LOGI(TAG, "%s aligned ball=(%d,%d) zone=(%d,%d); push",
-                         red_target ? "red" : "white", s_ball_x, s_ball_y,
-                         s_ball_zone_x, s_ball_zone_y);
+                ESP_LOGI(TAG, "%s aligned ball=(%d,%d); push",
+                         red_target ? "red" : "white", s_ball_x, s_ball_y);
             }
         }
         if (now - s_ball_phase_start_us > (int64_t)BALL_ALIGN_TIMEOUT_MS * 1000) {
@@ -1457,7 +1501,6 @@ static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
             s_ball_phase = red_target ? BALL_SEARCH_RED : BALL_SEARCH_WHITE;
             s_ball_phase_start_us = now;
             s_ball_target_valid = false;
-            s_ball_zone_valid = false;
         }
         return;
     }
@@ -1482,6 +1525,7 @@ static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
                 ball_next_search(now);
             } else {
                 s_ball_phase = BALL_DONE;
+                ball_stream_clear();
                 ESP_LOGW(TAG, "both balls delivered; vehicle stopped");
             }
         }
@@ -2603,10 +2647,7 @@ esp_err_t camera_line_follow_start(void)
     s_ball_align_frames = 0;
     s_ball_x = 0;
     s_ball_y = 0;
-    s_ball_zone_x = 0;
-    s_ball_zone_y = 0;
     s_ball_target_valid = false;
-    s_ball_zone_valid = false;
     s_ball_search_direction = 1;
     s_ball_target_miss_frames = 0;
     s_arm_frames = 0;
