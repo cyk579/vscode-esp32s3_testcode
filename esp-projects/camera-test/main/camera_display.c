@@ -24,6 +24,7 @@
 #define CAMERA_CONTROL_RGB565_BYTES \
     ((size_t)CAMERA_CONTROL_MAX_WIDTH * CAMERA_CONTROL_MAX_HEIGHT * 2)
 #define CAMERA_DISPLAY_JPEG_WORK_BYTES (16 * 1024)
+#define CAMERA_DECODE_IDLE_YIELD_FRAMES 4U
 
 #define CAMERA_BINARY_ROI_TOP_PERCENT 30
 #define CAMERA_BINARY_ROI_BOTTOM_PERCENT 100
@@ -520,6 +521,7 @@ static void camera_decode_task(void *arg)
 {
     (void)arg;
     jpeg_frame_ref_t frame;
+    uint8_t frames_since_idle_yield = 0;
     while (true) {
         if (xQueueReceive(s_display.ready_slots, &frame, portMAX_DELAY) != pdTRUE) {
             continue;
@@ -574,10 +576,12 @@ static void camera_decode_task(void *arg)
          * the old preview decode path is intentionally disabled. */
         release_jpeg_slot(frame.slot);
 
-        /* Keep the latest-frame pipeline responsive while allowing the idle
-         * task on CPU0 to run; this also prevents the decode loop from
-         * tripping the task watchdog under sustained camera input. */
-        vTaskDelay(1);
+        /* One tick is 10 ms in this build. Yield periodically so CPU0 idle can
+         * feed the watchdog without adding that delay to every decoded frame. */
+        if (++frames_since_idle_yield >= CAMERA_DECODE_IDLE_YIELD_FRAMES) {
+            frames_since_idle_yield = 0;
+            vTaskDelay(1);
+        }
     }
 }
 

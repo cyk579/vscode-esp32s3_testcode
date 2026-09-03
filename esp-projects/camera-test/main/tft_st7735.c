@@ -18,6 +18,8 @@
 #define TFT_SPI_CLOCK_HZ 8000000
 /* MX+MY+MV landscape; this panel uses RGB order (BGR bit cleared). */
 #define TFT_MADCTL_LANDSCAPE 0xA0
+#define TFT_TEXT_MARGIN_X 4U
+#define TFT_TEXT_MARGIN_Y 4U
 
 static const char *TAG = "tft";
 static spi_device_handle_t s_tft;
@@ -300,8 +302,8 @@ bool tft_st7735_draw_text_lines(const char *const lines[],
         return false;
     }
 
-    const size_t rows = TFT_ST7735_HEIGHT / 8;
-    const size_t columns = TFT_ST7735_WIDTH / 6;
+    const size_t rows = (TFT_ST7735_HEIGHT - TFT_TEXT_MARGIN_Y) / 8;
+    const size_t columns = (TFT_ST7735_WIDTH - TFT_TEXT_MARGIN_X) / 6;
     if (line_count > rows) {
         line_count = rows;
     }
@@ -316,9 +318,12 @@ bool tft_st7735_draw_text_lines(const char *const lines[],
             line[(size_t)x * 2 + 1] = (uint8_t)background;
         }
 
-        const size_t text_row = y / 8;
-        const uint8_t glyph_row = (uint8_t)(y % 8);
-        const char *text = text_row < line_count ? lines[text_row] : NULL;
+        const bool in_text_area = y >= TFT_TEXT_MARGIN_Y;
+        const size_t text_y = in_text_area ? y - TFT_TEXT_MARGIN_Y : 0;
+        const size_t text_row = text_y / 8;
+        const uint8_t glyph_row = (uint8_t)(text_y % 8);
+        const char *text = in_text_area && text_row < line_count ?
+                           lines[text_row] : NULL;
         if (text != NULL) {
             for (size_t column = 0; column < columns; ++column) {
                 const char ch = text[column];
@@ -331,7 +336,7 @@ bool tft_st7735_draw_text_lines(const char *const lines[],
                     if ((bits & (uint8_t)(1U << (4U - glyph_x))) == 0) {
                         continue;
                     }
-                    const size_t x = column * 6 + glyph_x;
+                    const size_t x = TFT_TEXT_MARGIN_X + column * 6 + glyph_x;
                     if (x < TFT_ST7735_WIDTH) {
                         line[x * 2] = (uint8_t)(foreground >> 8);
                         line[x * 2 + 1] = (uint8_t)foreground;

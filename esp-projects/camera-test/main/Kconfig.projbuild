@@ -7,7 +7,7 @@ menu "Example Configuration"
 
     config EXAMPLE_ENABLE_TFT_PREVIEW
         bool "Enable TFT status page"
-        default y
+        default n
         help
             Enables a low-priority ST7735 status page at about 2 Hz. No camera
             preview frame is decoded for the display, so camera control remains

@@ -108,8 +108,8 @@
 #define LINE_LAT_MIN_OUTPUT 11
 #define LINE_SEED_SLEW_PX 12
 
-/* 折角：事件行进入画面下方 85% 才动手；更远处只降速，避免提前转弯。 */
-#define LINE_TURN_TRIGGER_PERCENT 85
+/* 折角：事件行进入画面下方 88% 才动手；更远处只降速，避免提前转弯。 */
+#define LINE_TURN_TRIGGER_PERCENT 88
 #define LINE_TURN_HINT_FRAMES 1U
 #define LINE_TURN_EXIT_FRAMES 2U
 /* 旋转至少持续这么久才接受退出，否则第一帧还在看入弯前那条线就会假退出，
@@ -131,7 +131,7 @@
 #define LINE_TURN_D_SPEED 15
 #define LINE_TURN_PENDING_MS 500U
 /* 摄像头在底盘前方：旧线消失并确认要转弯后，先让底盘向前走一小段。 */
-#define LINE_CORNER_CENTER_DELAY_MS 500U
+#define LINE_CORNER_CENTER_DELAY_MS 800U
 /* 低速调试时优先保证三轮都超过各自起转阈值；此前叠加 40% 横移后，
  * 在较低总上限下 A/D 被缩放掉，锐角阶段实际只剩 B 轮。 */
 #define LINE_CAM_PIVOT_PERCENT 0
@@ -140,9 +140,9 @@
 /* NORMAL 低速用时间脉冲而不是把 PWM 压到静摩擦死区。MIN 只抬 mixer
  * 输入的 forward，绝不逐轮改 A/B/D；esp_timer 只负责切换 duty。 */
 #define LINE_BURST_ENABLE 1
-#define LINE_BURST_PERIOD_MS 1200U
-#define LINE_BURST_ON_MS 1050U
-#define LINE_BURST_MIN_OUTPUT 28
+#define LINE_BURST_PERIOD_MS 800U
+#define LINE_BURST_ON_MS 780U
+#define LINE_BURST_MIN_OUTPUT 26
 #define LINE_BURST_TICK_MS 5U
 
 /* 直线回中只补一个很小的 yaw，8 个误差单位以内保持死区，避免来回抖动。 */
@@ -1594,8 +1594,12 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         goto done;
     }
 
-    /* The fixed route owns the motors until its timed right shift ends. */
-    if (obstacle_step(now, width, candidate && s_state == LINE_STATE_NORMAL)) {
+    /* A visible/pending corner has priority over starting obstacle avoidance. */
+    const bool obstacle_line_ready = candidate &&
+                                     s_state == LINE_STATE_NORMAL &&
+                                     observation.corner_direction == 0 &&
+                                     !turn_pending_active(now);
+    if (obstacle_step(now, width, obstacle_line_ready)) {
         goto done;
     }
 
