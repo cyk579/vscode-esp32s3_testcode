@@ -125,7 +125,7 @@
 #define LINE_TURN_D_SPEED 15
 #define LINE_TURN_PENDING_MS 500U
 /* 摄像头在底盘前方：近场折角出现后，先让底盘向前走一小段再原地转。 */
-#define LINE_CORNER_CENTER_DELAY_MS 300U
+#define LINE_CORNER_CENTER_DELAY_MS 500U
 /* 低速调试时优先保证三轮都超过各自起转阈值；此前叠加 40% 横移后，
  * 在较低总上限下 A/D 被缩放掉，锐角阶段实际只剩 B 轮。 */
 #define LINE_CAM_PIVOT_PERCENT 0
