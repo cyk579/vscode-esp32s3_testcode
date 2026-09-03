@@ -174,8 +174,9 @@
 #define MOTOR_B_MIN_RUN_OUTPUT 13
 #define START_KICK_OUTPUT 27
 #define START_KICK_CYCLES 3U
-/* 正常巡航保持 22%，burst 前进下限为 27%，给转向混控留出三轮起转余量。 */
-#define MOTOR_PWM_CEILING 40
+/* 正常巡航保持 22%，burst 前进下限为 27%，给转向混控留出三轮起转余量。
+ * 对 f=27、turn=±13 的 NORMAL 向量，44 比最大实际轮值 40 多留 4 个单位。 */
+#define MOTOR_PWM_CEILING 44
 #define LINE_SPEED_CAP 30
 #define MOTOR_TRIM_A 90
 #define MOTOR_TRIM_D 100
