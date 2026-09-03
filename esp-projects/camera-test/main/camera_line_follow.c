@@ -194,17 +194,18 @@
 #define OBSTACLE_CLOSE_CONFIRM_SAMPLES 2U
 #define ULTRASONIC_PERIOD_MS 60U
 #define AVOID_BRAKE_MS 500U
-#define AVOID_LEFT_MS 2500U
-#define AVOID_FORWARD_MS 2000U
-#define AVOID_RIGHT_MS 2500U
+#define AVOID_LEFT_MS 1500U
+#define AVOID_FORWARD_MS 1500U
+#define AVOID_RIGHT_MS 1500U
 #define AVOID_REACQUIRE_GRACE_MS 1000U
-#define AVOID_LEFT_SIDE_SPEED 18
-#define AVOID_LEFT_B_SPEED 25
-#define AVOID_RIGHT_A_SPEED 15
-#define AVOID_RIGHT_B_SPEED 25
-#define AVOID_RIGHT_D_SPEED 20
-#define AVOID_FORWARD_A_SPEED 25
-#define AVOID_FORWARD_D_SPEED 20
+#define AVOID_LEFT_A_SPEED 24
+#define AVOID_LEFT_B_SPEED 30
+#define AVOID_LEFT_D_SPEED 18
+#define AVOID_RIGHT_A_SPEED 18
+#define AVOID_RIGHT_B_SPEED 30
+#define AVOID_RIGHT_D_SPEED 24
+#define AVOID_FORWARD_A_SPEED 20
+#define AVOID_FORWARD_D_SPEED 25
 
 typedef struct {
     gpio_num_t in1;
@@ -1160,8 +1161,8 @@ static bool obstacle_step(int64_t now, uint16_t width, bool line_available)
         }
         break;
     case OBSTACLE_LEFT:
-        obstacle_drive_direct(-AVOID_LEFT_SIDE_SPEED, -AVOID_LEFT_B_SPEED,
-                              -AVOID_LEFT_SIDE_SPEED);
+        obstacle_drive_direct(-AVOID_LEFT_A_SPEED, -AVOID_LEFT_B_SPEED,
+                              -AVOID_LEFT_D_SPEED);
         if (elapsed >= AVOID_LEFT_MS) {
             s_obstacle_state = OBSTACLE_FORWARD;
             s_obstacle_phase_start_us = now;
