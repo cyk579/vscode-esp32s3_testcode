@@ -134,7 +134,7 @@
 /* NORMAL 低速用时间脉冲而不是把 PWM 压到静摩擦死区。esp_timer 只负责
  * 切换 duty，巡线状态和最后一组 forward/turn 命令始终保留。 */
 #define LINE_BURST_ENABLE 1
-#define LINE_BURST_PERIOD_MS 100U
+#define LINE_BURST_PERIOD_MS 160U
 #define LINE_BURST_ON_MS 40U
 #define LINE_BURST_MIN_OUTPUT 24
 #define LINE_BURST_TICK_MS 5U
