@@ -116,6 +116,11 @@
 #define LINE_TURN_MIN_MS 250U
 #define LINE_TURN_EXIT_ERROR 30
 #define LINE_TURN_TIMEOUT_MS 2500U
+/* 出弯后先低速回中，连续稳定若干帧再恢复 NORMAL；超时只作为兜底。 */
+#define LINE_POST_CORNER_ALIGN_LATERAL_ERROR 18
+#define LINE_POST_CORNER_ALIGN_HEADING_ERROR 8
+#define LINE_POST_CORNER_ALIGN_FRAMES 4U
+#define LINE_POST_CORNER_ALIGN_TIMEOUT_MS 1200U
 /* 绕摄像头旋转：lat = turn * a/(2L)。偏航量必须够大，否则 a/d = lat - turn
  * 落在起转值以下会被混控丢掉，只剩后轮在推。
  * TODO(实测): LINE_CAM_PIVOT_PERCENT 用尺子量 a 和 L 后填 a*100/(2L)。 */
@@ -136,7 +141,7 @@
 #define LINE_BURST_ENABLE 1
 #define LINE_BURST_PERIOD_MS 1200U
 #define LINE_BURST_ON_MS 900U
-#define LINE_BURST_MIN_OUTPUT 24
+#define LINE_BURST_MIN_OUTPUT 26
 #define LINE_BURST_TICK_MS 5U
 
 /* 直线回中只补一个很小的 yaw，8 个误差单位以内保持死区，避免来回抖动。 */
@@ -168,7 +173,7 @@
 #define MOTOR_B_MIN_RUN_OUTPUT 13
 #define START_KICK_OUTPUT 27
 #define START_KICK_CYCLES 3U
-/* 正常巡航保持 22%，只给短暂起转脉冲留到 24%，避免再次卡在静摩擦区。 */
+/* 正常巡航保持 22%，只给短暂起转脉冲留到 26%，避免再次卡在静摩擦区。 */
 #define MOTOR_PWM_CEILING 30
 #define LINE_SPEED_CAP 30
 #define MOTOR_TRIM_A 90
@@ -264,6 +269,9 @@ static int s_turn_direction;
 static uint8_t s_turn_hint_frames;
 static int64_t s_turn_pending_until_us;
 static int64_t s_corner_center_delay_until_us;
+static bool s_post_corner_align;
+static uint8_t s_post_corner_align_frames;
+static int64_t s_post_corner_align_started_us;
 static uint8_t s_turn_exit_frames;
 static uint32_t s_turn_frames;
 static int64_t s_turn_started_us;
@@ -528,7 +536,7 @@ static void render_preview_overlay(uint8_t *frame, uint16_t width, uint16_t heig
 
 static int state_search_half_percent(void)
 {
-    if (s_state == LINE_STATE_CORNER) {
+    if (s_state == LINE_STATE_CORNER && !s_post_corner_align) {
         const int percent = LINE_CORNER_WINDOW_START_PERCENT +
                             (int)s_turn_frames * LINE_CORNER_WINDOW_GROW_PERCENT;
         return percent > LINE_CORNER_WINDOW_MAX_PERCENT ?
@@ -568,9 +576,11 @@ static bool observe_line(uint8_t *frame,
     cfg.height = height;
     cfg.threshold = source_threshold;
     /* 折角旋转时不要用旧种子：新赛道会从侧面转到中间来，应该在整条 ROI 底部
-     * 重新找最靠中心的黑线，而不是围着入弯前的位置猜。 */
-    cfg.use_history = s_seed_valid && s_state != LINE_STATE_CORNER;
-    cfg.seed_x = s_state == LINE_STATE_CORNER ? (int)width / 2 : s_seed_x;
+     * 重新找最靠中心的黑线，而不是围着入弯前的位置猜。出弯回中阶段已经停止
+     * 旋转，重新沿用 seed 附近的历史跟踪，避免把回中误判成一次新折角。 */
+    const bool corner_spin = s_state == LINE_STATE_CORNER && !s_post_corner_align;
+    cfg.use_history = s_seed_valid && !corner_spin;
+    cfg.seed_x = corner_spin ? (int)width / 2 : s_seed_x;
     cfg.search_half_percent = state_search_half_percent();
     cfg.expected_width = s_line_width;
     cfg.rotation = CAMERA_LINE_ROTATION;
@@ -971,6 +981,9 @@ static void reset_tracking(void)
     s_turn_hint_frames = 0;
     s_turn_pending_until_us = 0;
     s_corner_center_delay_until_us = 0;
+    s_post_corner_align = false;
+    s_post_corner_align_frames = 0;
+    s_post_corner_align_started_us = 0;
     s_turn_exit_frames = 0;
     s_turn_frames = 0;
     s_turn_started_us = 0;
@@ -1007,8 +1020,11 @@ static int filter_control_error(int current, int *filtered)
     return *filtered;
 }
 
-/* forward 单独限速率，避免速度档位在门限附近来回跳造成推力抖动。 */
-static void drive_normal(const line_observation_t *observation, int64_t now)
+/* forward 单独限速率，避免速度档位在门限附近来回跳造成推力抖动。
+ * forward_cap 只限制本次实际输出，保留原有误差滤波、yaw PD 和 ramp 状态。 */
+static void drive_normal_limited(const line_observation_t *observation,
+                                 int64_t now,
+                                 int forward_cap)
 {
     const line_control_cfg_t cfg = control_cfg();
     const bool alert = s_alert_until_us != 0 && now < s_alert_until_us;
@@ -1062,7 +1078,16 @@ static void drive_normal(const line_observation_t *observation, int64_t now)
     s_turn_output = line_control_yaw_pd(&cfg, steer_error, steer_rate,
                                         LINE_PD_KD_HEADING, &s_yaw_accum);
     s_lat_accum = 0;
-    drive_normal_output(s_forward_output, s_turn_output, 0);
+    int forward = s_forward_output;
+    if (forward_cap > 0 && forward > forward_cap) {
+        forward = forward_cap;
+    }
+    drive_normal_output(forward, s_turn_output, 0);
+}
+
+static void drive_normal(const line_observation_t *observation, int64_t now)
+{
+    drive_normal_limited(observation, now, 0);
 }
 
 static void update_seed(const line_observation_t *observation)
@@ -1256,7 +1281,8 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     line_observation_t observation = {0};
     s_last_frame_width = width;
     s_last_frame_height = height;
-    if (s_state == LINE_STATE_CORNER && s_turn_frames < UINT32_MAX) {
+    if (s_state == LINE_STATE_CORNER && !s_post_corner_align &&
+        s_turn_frames < UINT32_MAX) {
         ++s_turn_frames;
     }
     if (s_state == LINE_STATE_LOST && s_lost_frames < UINT32_MAX) {
@@ -1350,6 +1376,110 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
 
     /* ---- 折角：绕摄像头原地旋转，用近场闭环退出 ---- */
     if (s_state == LINE_STATE_CORNER) {
+        if (s_post_corner_align) {
+            const bool align_sample = candidate && observation.near_line_visible &&
+                                      observation.corner_direction == 0;
+            const bool in_band = align_sample &&
+                                 abs(observation.lateral_error) <=
+                                     LINE_POST_CORNER_ALIGN_LATERAL_ERROR &&
+                                 abs(observation.heading_error) <=
+                                     LINE_POST_CORNER_ALIGN_HEADING_ERROR;
+            if (candidate) {
+                s_last_line_us = now;
+                update_seed(&observation);
+            }
+            if (in_band) {
+                if (s_post_corner_align_frames < LINE_POST_CORNER_ALIGN_FRAMES) {
+                    ++s_post_corner_align_frames;
+                }
+            } else {
+                s_post_corner_align_frames = 0;
+            }
+
+            const bool timed_out = s_post_corner_align_started_us != 0 &&
+                                   now - s_post_corner_align_started_us >=
+                                       (int64_t)LINE_POST_CORNER_ALIGN_TIMEOUT_MS *
+                                       1000;
+            const bool leave_align =
+                s_post_corner_align_frames >= LINE_POST_CORNER_ALIGN_FRAMES ||
+                timed_out;
+            if (leave_align) {
+                if (timed_out && !candidate) {
+                    /* 超时仍没有新线时交给现有 LOST 重捕获/停车保护，
+                     * 不让回中阶段无限期保持电机输出。 */
+                    s_post_corner_align = false;
+                    s_post_corner_align_frames = 0;
+                    s_post_corner_align_started_us = 0;
+                    s_state = LINE_STATE_LOST;
+                    s_lost_frames = 1;
+                    s_reacquire_frames = 0;
+                    s_reacquire_x = s_seed_x;
+                    s_turn_direction = 0;
+                    s_turn_frames = 0;
+                    s_turn_exit_frames = 0;
+                    s_turn_started_us = 0;
+                    s_corner_center_delay_until_us = 0;
+                    s_turn_pending_until_us = 0;
+                    reset_control();
+                    zero_motor_outputs();
+                    ESP_LOGW(TAG,
+                             "post-corner align timeout without line; "
+                             "entering LOST");
+                    goto done;
+                }
+                s_post_corner_align = false;
+                s_post_corner_align_frames = 0;
+                s_post_corner_align_started_us = 0;
+                s_state = LINE_STATE_NORMAL;
+                s_turn_direction = 0;
+                s_turn_frames = 0;
+                s_turn_exit_frames = 0;
+                s_turn_started_us = 0;
+                s_corner_center_delay_until_us = 0;
+                s_turn_pending_until_us = 0;
+                s_lost_frames = 0;
+                s_reacquire_frames = 0;
+                s_last_line_us = now;
+                reset_control();
+                if (timed_out && !in_band) {
+                    ESP_LOGW(TAG,
+                             "post-corner align timeout; resuming NORMAL "
+                             "at lat=%d head=%d",
+                             observation.lateral_error,
+                             observation.heading_error);
+                } else {
+                    ESP_LOGI(TAG,
+                             "post-corner align complete; resuming NORMAL "
+                             "at lat=%d head=%d",
+                             observation.lateral_error,
+                             observation.heading_error);
+                }
+                /* 轮向可能刚从旋转切回前进，首个 NORMAL 输出不再触发
+                 * startup kick；正常起步的 kick 逻辑保持不变。 */
+                const bool saved_suppress_kick = s_suppress_kick;
+                s_suppress_kick = true;
+                if (candidate) {
+                    drive_normal(&observation, now);
+                } else {
+                    drive(LINE_FORWARD_CRAWL, 0, 0);
+                }
+                s_kick_cycles[0] = 0;
+                s_kick_cycles[1] = 0;
+                s_kick_cycles[2] = 0;
+                s_suppress_kick = saved_suppress_kick;
+                goto done;
+            }
+
+            /* 出弯回中期间只保留低速前进和现有 yaw 校正；没有新点时
+             * 沿用上一帧的转向，直到重捕获或超时交给 LOST 保护。 */
+            if (candidate) {
+                drive_normal_limited(&observation, now, LINE_FORWARD_CRAWL);
+            } else {
+                drive(LINE_FORWARD_CRAWL, s_turn_output, 0);
+            }
+            goto done;
+        }
+
         const bool settled = s_turn_started_us != 0 &&
                              now - s_turn_started_us >=
                                  (int64_t)LINE_TURN_MIN_MS * 1000;
@@ -1364,12 +1494,17 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             s_turn_exit_frames = 0;
         }
         if (s_turn_exit_frames >= LINE_TURN_EXIT_FRAMES) {
-            s_state = LINE_STATE_NORMAL;
+            /* 原地转向完成只代表新线已被看到；底盘中心仍可能落在线外。
+             * 保持 CORNER 状态，先进入短暂的低速回中阶段。 */
+            s_post_corner_align = true;
+            s_post_corner_align_frames = 0;
+            s_post_corner_align_started_us = now;
             s_turn_direction = 0;
             s_turn_frames = 0;
             s_turn_exit_frames = 0;
             s_turn_started_us = 0;
             s_corner_center_delay_until_us = 0;
+            s_turn_pending_until_us = 0;
             /* 出弯后一段时间内限速：赛道右上角两个直角弯之间只有 10 cm。 */
             s_alert_until_us = now + (int64_t)LINE_ALERT_MS * 1000;
             s_lost_frames = 0;
@@ -1377,13 +1512,13 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             s_last_line_us = now;
             update_seed(&observation);
             reset_control();
-            ESP_LOGI(TAG, "turn complete; back to NORMAL at ey=%d",
+            ESP_LOGI(TAG, "turn complete; post-corner align start at ey=%d",
                      observation.lateral_error);
-            /* CORNER 的轮向与 NORMAL 不同。只屏蔽这一次切换产生的 kick，
-             * 并清掉刚装载的计数，避免下一帧补发；首次正常起步不受影响。 */
+            /* CORNER 的轮向与回中前进不同。只屏蔽这一次切换产生的 kick，
+             * 并清掉刚装载的计数，避免下一帧补发。 */
             const bool saved_suppress_kick = s_suppress_kick;
             s_suppress_kick = true;
-            drive_normal(&observation, now);
+            drive_normal_limited(&observation, now, LINE_FORWARD_CRAWL);
             s_kick_cycles[0] = 0;
             s_kick_cycles[1] = 0;
             s_kick_cycles[2] = 0;
