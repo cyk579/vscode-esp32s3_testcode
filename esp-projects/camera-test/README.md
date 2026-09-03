@@ -7,7 +7,7 @@
 3. 默认从解码后的画面识别白底黑线，并驱动三轮 TB6612 小车巡线；
 4. 可选通过 Wi-Fi 回传到电脑，实时预览并保存第一张有效照片。
 
-当前比赛默认配置为：巡线开启，TFT 状态页、Wi-Fi streaming 与舵机测试关闭。需要现场诊断时可单独开启 TFT 状态页，它只以约 2 Hz 显示缓存参数，不解码或显示摄像头图像。
+当前实车默认配置为：巡线和 TFT 状态页开启，Wi-Fi streaming 与舵机测试关闭。TFT 只以约 2 Hz 显示缓存参数，不解码或显示摄像头图像。
 
 关闭 `Enable camera black-line following` 后，本工程仍可作为单纯的摄像头解码/枚举测试使用。
 
@@ -52,7 +52,7 @@ ESP32-S3 原生 USB OTG 的引脚固定如下：
 
 ### ST7735 显示屏
 
-本仓库已经按 `LQ_TFT18SPIV33`、常见 `ST7735`、`128x160` 分辨率适配。程序以横屏方式工作。控制链路将当前 `480x320` JPEG 缩放为约 `120x80`；TFT 不再解码摄像头图像，只由低优先级任务约每 500 ms 显示一次缓存状态。`Example Configuration -> Enable TFT status page` 默认关闭，需要实车诊断时再显式开启。
+本仓库已经按 `LQ_TFT18SPIV33`、常见 `ST7735`、`128x160` 分辨率适配。程序以横屏方式工作。控制链路将当前 `480x320` JPEG 缩放为约 `120x80`；TFT 不再解码摄像头图像，只由低优先级任务约每 500 ms 显示一次缓存状态。`Example Configuration -> Enable TFT status page` 默认开启。
 
 | ESP32-S3 | TFT | 说明 |
 | --- | --- | --- |
@@ -130,12 +130,12 @@ idf.py -p COM6 -b 115200 flash
 
 ## 查看图像：屏幕和电脑
 
-显式开启 TFT 状态页并接好屏幕后，屏幕约以 2 Hz 显示 `state`、`armed/STBY`、三轮输出、横向/方向误差、转向命令、摄像头/控制 FPS、丢帧数和超声波距离。状态页由低优先级独立任务读取最近缓存，不参与控制帧回调，也没有额外 JPEG 解码或预览 framebuffer。
+接好屏幕后，屏幕约以 2 Hz 显示 `state`、`armed/STBY`、三轮输出、横向/方向误差、转向命令、摄像头/控制 FPS、丢帧数和超声波距离。状态页由低优先级独立任务读取最近缓存，不参与控制帧回调，也没有额外 JPEG 解码或预览 framebuffer。
 
 建议按以下顺序做首次功能验证：
 
 1. 同时接好 TFT（仅在启用 preview 时使用）、摄像头的电源与共地，再接摄像头 `D- -> GPIO19`、`D+ -> GPIO20`。
-2. 启用状态页时观察参数是否约每 500 ms 更新；关闭状态页时通过串口查看解码/巡线统计。
+2. 观察状态页参数是否约每 500 ms 更新；摄像头控制统计同时通过串口查看。
 3. 摄像头巡线模式不需要电脑端播放器；需要取证时再连接播放器保存一张照片。
 
 只有在 `Enable streaming` 开启时，程序才会先创建 Wi-Fi 热点，再初始化 USB Host；默认巡线配置关闭该选项，因此应通过串口日志判断固件是否运行到应用层。启用 streaming 时，即使 D+/D- 接反也应该能看到热点；热点不存在时先检查开发板供电或 UART0 日志。
@@ -212,7 +212,7 @@ STBY motor[A,B,D]
 
 其中 `camera_fps` 是 UVC 输入帧率，`processed_fps` 是实际完成解码/巡线的帧率，`control_fps` 是电机控制刷新率；`line_us_avg/max` 用 `esp_timer_get_time()` 统计单帧巡线耗时。比赛时通过 UART 观察这些统计，不依赖 TFT 或 Wi-Fi。
 
-需要只测试摄像头而不让车动时，在 `idf.py menuconfig -> Example Configuration` 关闭 `Enable camera black-line following`，并把 TB6612 的 `STBY` 固定拉低。TFT 状态页默认关闭，需要时开启 `Enable TFT status page`；不要同时开启舵机测试，舵机配置会与整车接线/LEDC 资源冲突。
+需要只测试摄像头而不让车动时，在 `idf.py menuconfig -> Example Configuration` 关闭 `Enable camera black-line following`，并把 TB6612 的 `STBY` 固定拉低。需要时可关闭 `Enable TFT status page`；不要同时开启舵机测试，舵机配置会与整车接线/LEDC 资源冲突。
 
 ## 舵机测试动作
 
