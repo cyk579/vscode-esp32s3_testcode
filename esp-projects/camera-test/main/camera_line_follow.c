@@ -108,7 +108,7 @@
 #define LINE_SEED_SLEW_PX 12
 
 /* 折角：事件行进入画面下方 88% 才动手；更远处只降速，避免提前转弯。 */
-#define LINE_TURN_TRIGGER_PERCENT 80
+#define LINE_TURN_TRIGGER_PERCENT 88
 #define LINE_TURN_HINT_FRAMES 1U
 #define LINE_TURN_EXIT_FRAMES 2U
 /* 旋转至少持续这么久才接受退出，否则第一帧还在看入弯前那条线就会假退出，
@@ -125,7 +125,7 @@
 #define LINE_TURN_D_SPEED 15
 #define LINE_TURN_PENDING_MS 500U
 /* 摄像头在底盘前方：近场折角出现后，先让底盘向前走一小段再原地转。 */
-#define LINE_CORNER_CENTER_DELAY_MS 120U
+#define LINE_CORNER_CENTER_DELAY_MS 300U
 /* 低速调试时优先保证三轮都超过各自起转阈值；此前叠加 40% 横移后，
  * 在较低总上限下 A/D 被缩放掉，锐角阶段实际只剩 B 轮。 */
 #define LINE_CAM_PIVOT_PERCENT 0
@@ -134,9 +134,9 @@
 /* NORMAL 低速用时间脉冲而不是把 PWM 压到静摩擦死区。esp_timer 只负责
  * 切换 duty，巡线状态和最后一组 forward/turn 命令始终保留。 */
 #define LINE_BURST_ENABLE 1
-#define LINE_BURST_PERIOD_MS 250U
-#define LINE_BURST_ON_MS 200U
-#define LINE_BURST_MIN_OUTPUT 24
+#define LINE_BURST_PERIOD_MS 800U
+#define LINE_BURST_ON_MS 700U
+#define LINE_BURST_MIN_OUTPUT 26
 #define LINE_BURST_TICK_MS 5U
 
 /* 直线回中只补一个很小的 yaw，8 个误差单位以内保持死区，避免来回抖动。 */
@@ -166,7 +166,7 @@
 #define PWM_MAX 1023U
 #define MOTOR_MIN_RUN_OUTPUT 11
 #define MOTOR_B_MIN_RUN_OUTPUT 13
-#define START_KICK_OUTPUT 27
+#define START_KICK_OUTPUT 30
 #define START_KICK_CYCLES 3U
 /* 正常巡航保持 22%，只给短暂起转脉冲留到 24%，避免再次卡在静摩擦区。 */
 #define MOTOR_PWM_CEILING 30
