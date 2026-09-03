@@ -703,8 +703,15 @@ static bool repair_normal_drive(const line_mixer_cfg_t *cfg,
                                 int raw_d,
                                 line_mixer_out_t *out)
 {
-    if (cfg == NULL || out == NULL || forward < LINE_MOTOR_START_MIN_OUTPUT ||
-        !out->dropped) {
+    if (cfg == NULL || out == NULL || forward < LINE_MOTOR_START_MIN_OUTPUT) {
+        return false;
+    }
+
+    /* Exact cancellation (for example forward_a + turn == 0) produces a zero
+     * wheel without setting line_mixer's dropped flag. Check the actual output,
+     * not only that flag, or the normal vector can still collapse to one wheel. */
+    if (!out->dropped && out->a != 0 && out->d != 0 &&
+        (raw_b == 0 || out->b != 0)) {
         return false;
     }
 
