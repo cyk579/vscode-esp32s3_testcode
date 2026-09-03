@@ -63,12 +63,30 @@ ball_markers = {}
 ball_phase = 'IDLE'
 max_frames = args.frames or (1 if args.headless else 0)
 max_stream_bytes = 2 * 1024 * 1024
+CONNECT_RETRIES = 20
+
+
+def connect_stream(host, port):
+    last_error = None
+    for attempt in range(CONNECT_RETRIES):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        try:
+            sock.connect((host, port))
+            sock.settimeout(None)
+            return sock
+        except OSError as error:
+            last_error = error
+            sock.close()
+            if attempt + 1 < CONNECT_RETRIES:
+                print(f'Waiting for ESP32 stream ({attempt + 1}/{CONNECT_RETRIES})...')
+                time.sleep(1.0)
+    raise last_error
 
 print(f'Connecting to {args.host}:{args.port}...')
 
 try:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.connect((args.host, args.port))
+    with connect_stream(args.host, args.port) as sock:
         print('Receiving MJPEG data. Press Esc in the preview window to exit.')
 
         while not stop:
@@ -130,6 +148,14 @@ try:
 
                 eoi = stream.find(b'\xff\xd9', 2)
                 if eoi == -1:
+                    # A truncated JPEG may never contain an EOI marker.  Do
+                    # not let it block the stream forever: a later SOI is a
+                    # reliable resynchronization point for MJPEG frames.
+                    next_soi = stream.find(b'\xff\xd8', 2)
+                    if next_soi != -1:
+                        print('Discarding incomplete JPEG frame')
+                        del stream[:next_soi]
+                        continue
                     if len(stream) > max_stream_bytes:
                         print('Discarding oversized incomplete JPEG frame')
                         del stream[:2]
@@ -169,15 +195,17 @@ try:
                         sy = image_h / marker['frame_h']
                         cx = int(marker['x'] * sx)
                         cy = int(marker['y'] * sy)
-                        half_w = max(4, int(marker['w'] * sx / 2.0))
-                        half_h = max(4, int(marker['h'] * sy / 2.0))
-                        color = (0, 0, 255) if colour == 'red' else (255, 180, 0)
-                        cv2.rectangle(image, (cx - half_w, cy - half_h),
-                                      (cx + half_w, cy + half_h), color, 2)
+                        # The detector reports a compact blob.  Draw a circle
+                        # around it so the preview reflects the ball shape,
+                        # rather than suggesting a rectangular target area.
+                        radius = max(8, int(max(marker['w'] * sx,
+                                               marker['h'] * sy) / 2.0))
+                        color = (0, 0, 255) if colour == 'red' else (0, 255, 0)
+                        cv2.circle(image, (cx, cy), radius, color, 3)
                         cv2.drawMarker(image, (cx, cy), color,
                                        cv2.MARKER_CROSS, 14, 2)
                         cv2.putText(image, f'{colour.upper()} {marker["phase"]}',
-                                    (max(0, cx - half_w), max(18, cy - half_h - 6)),
+                                    (max(0, cx - radius), max(18, cy - radius - 6)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2,
                                     cv2.LINE_AA)
                     cv2.putText(image, f'ESP32: {ball_phase}', (8, 24),
@@ -191,6 +219,11 @@ try:
                     stop = True
                     break
 finally:
-    cv2.destroyAllWindows()
+    # opencv-python-headless exposes these APIs but raises when no GUI backend
+    # is compiled in.  Do not mask the real connection/stream error on exit.
+    try:
+        cv2.destroyAllWindows()
+    except cv2.error:
+        pass
 
 print(f'Frames received: {frame_count}; first frame saved: {saved}')

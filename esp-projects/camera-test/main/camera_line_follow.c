@@ -225,22 +225,20 @@
 #define BALL_SERVO_SETTLE_MS 700U
 #define BALL_SEARCH_TURN_SPEED 13
 #define BALL_ALIGN_TURN_SPEED 12
-#define BALL_PUSH_SPEED 18
-#define BALL_RETURN_SPEED 18
 #define BALL_SEARCH_TIMEOUT_MS 14000U
 #define BALL_ALIGN_TIMEOUT_MS 5000U
-#define BALL_PUSH_MS 1800U
-#define BALL_RETURN_MS 1800U
 #define BALL_ALIGN_TOLERANCE_PX 7
 #define BALL_ALIGN_CONFIRM_FRAMES 4U
-#define BALL_MIN_PIXELS 8
+#define BALL_MIN_PIXELS 10
 #define BALL_SCAN_TOP_PERCENT 5
 #define BALL_SCAN_BOTTOM_PERCENT 90
 #define BALL_RED_MIN_R 90
 #define BALL_RED_CHANNEL_GAP 35
-#define BALL_WHITE_MIN_LUMA 165
-#define BALL_WHITE_MAX_SATURATION 35
-#define BALL_WHITE_MIN_EDGE_PIXELS 4
+#define BALL_GREEN_MIN_G 70
+#define BALL_GREEN_CHANNEL_GAP 25
+#define BALL_MIN_LUMA 35
+#define BALL_MIN_FILL_PERCENT 40
+#define BALL_MIN_EDGE_PIXELS 6
 #define BALL_ZONE_MIN_RUN_PIXELS 8
 #define BALL_ZONE_MIN_ROWS 3
 #define BALL_ZONE_THRESHOLD 55
@@ -277,14 +275,15 @@ typedef enum {
     BALL_IDLE = 0,
     BALL_SEARCH_RED,
     BALL_ALIGN_RED,
-    BALL_PUSH_RED,
-    BALL_RETURN_RED,
-    BALL_SEARCH_WHITE,
-    BALL_ALIGN_WHITE,
-    BALL_PUSH_WHITE,
-    BALL_RETURN_WHITE,
+    BALL_SEARCH_GREEN,
+    BALL_ALIGN_GREEN,
     BALL_DONE,
 } ball_phase_t;
+
+typedef enum {
+    BALL_COLOUR_RED = 0,
+    BALL_COLOUR_GREEN,
+} ball_colour_t;
 
 typedef struct {
     bool valid;
@@ -1093,13 +1092,6 @@ static void ball_drive_spin(int direction, int speed)
                       -direction * magnitude);
 }
 
-static void ball_drive_forward(int speed)
-{
-    const int magnitude = speed < MOTOR_MIN_RUN_OUTPUT ? MOTOR_MIN_RUN_OUTPUT : speed;
-    /* This is the same forward vector as line_mixer_solve(forward,0,0). */
-    ball_drive_direct(-magnitude, 0, magnitude);
-}
-
 static void ball_drive_stop(void)
 {
     stop_motors();
@@ -1110,12 +1102,8 @@ static const char *ball_phase_name(void)
     switch (s_ball_phase) {
     case BALL_SEARCH_RED: return "SEARCH_R";
     case BALL_ALIGN_RED: return "ALIGN_R";
-    case BALL_PUSH_RED: return "PUSH_R";
-    case BALL_RETURN_RED: return "BACK_R";
-    case BALL_SEARCH_WHITE: return "SEARCH_W";
-    case BALL_ALIGN_WHITE: return "ALIGN_W";
-    case BALL_PUSH_WHITE: return "PUSH_W";
-    case BALL_RETURN_WHITE: return "BACK_W";
+    case BALL_SEARCH_GREEN: return "SEARCH_G";
+    case BALL_ALIGN_GREEN: return "ALIGN_G";
     case BALL_DONE: return "DONE";
     case BALL_IDLE:
     default: return "IDLE";
@@ -1135,7 +1123,8 @@ static uint8_t ball_luma(const uint8_t *pixel, int *red, int *green, int *blue)
 }
 
 static bool ball_pixel_matches(const uint8_t *frame, uint16_t width,
-                               uint16_t height, int x, int y, bool red_target)
+                               uint16_t height, int x, int y,
+                               ball_colour_t colour)
 {
     if (frame == NULL || x < 0 || y < 0 || x >= (int)width || y >= (int)height) {
         return false;
@@ -1145,24 +1134,21 @@ static bool ball_pixel_matches(const uint8_t *frame, uint16_t width,
     int green = 0;
     int blue = 0;
     const int luma = ball_luma(pixel, &red, &green, &blue);
-    if (red_target) {
-        return red >= BALL_RED_MIN_R && red > green + BALL_RED_CHANNEL_GAP &&
+    if (colour == BALL_COLOUR_RED) {
+        return luma >= BALL_MIN_LUMA && red >= BALL_RED_MIN_R &&
+               red > green + BALL_RED_CHANNEL_GAP &&
                red > blue + BALL_RED_CHANNEL_GAP;
     }
-    /* A white ball is accepted only when it has a low-saturation, high-luma
-     * pixel.  The local contrast test in find_ball_blob rejects a white wall or
-     * a uniformly bright floor. */
-    return luma >= BALL_WHITE_MIN_LUMA &&
-           (red > green ? red - green : green - red) <= BALL_WHITE_MAX_SATURATION &&
-           (red > blue ? red - blue : blue - red) <= BALL_WHITE_MAX_SATURATION &&
-           (green > blue ? green - blue : blue - green) <= BALL_WHITE_MAX_SATURATION;
+    return luma >= BALL_MIN_LUMA && green >= BALL_GREEN_MIN_G &&
+           green > red + BALL_GREEN_CHANNEL_GAP &&
+           green > blue + BALL_GREEN_CHANNEL_GAP;
 }
 
 static uint8_t s_ball_visited[BALL_GRID_MAX_CELLS];
 static uint16_t s_ball_queue[BALL_GRID_MAX_CELLS];
 
 static bool find_ball_blob(const uint8_t *frame, uint16_t width, uint16_t height,
-                           bool red_target, ball_blob_t *blob)
+                           ball_colour_t colour, ball_blob_t *blob)
 {
     if (frame == NULL || blob == NULL || width < 16 || height < 16) {
         return false;
@@ -1191,7 +1177,7 @@ static bool find_ball_blob(const uint8_t *frame, uint16_t width, uint16_t height
             const size_t seed = (size_t)gy * grid_w + (size_t)gx;
             const int seed_x = gx * BALL_GRID_STEP;
             if (s_ball_visited[seed] ||
-                !ball_pixel_matches(frame, width, height, seed_x, seed_y, red_target)) {
+                !ball_pixel_matches(frame, width, height, seed_x, seed_y, colour)) {
                 continue;
             }
             s_ball_visited[seed] = 1;
@@ -1228,7 +1214,7 @@ static bool find_ball_blob(const uint8_t *frame, uint16_t width, uint16_t height
                         const int pixel_y = ny * BALL_GRID_STEP;
                         if (pixel_y < top || pixel_y >= bottom ||
                             !ball_pixel_matches(frame, width, height, pixel_x, pixel_y,
-                                                 red_target)) {
+                                                 colour)) {
                             continue;
                         }
                         s_ball_visited[next] = 1;
@@ -1251,26 +1237,24 @@ static bool find_ball_blob(const uint8_t *frame, uint16_t width, uint16_t height
             const int fill_percent = sample_box_area > 0 ?
                                      count * 100 / sample_box_area : 0;
             if (count < BALL_MIN_PIXELS || box_w < 4 || box_h < 4 ||
-                fill_percent < (red_target ? 28 : 22) ||
+                fill_percent < BALL_MIN_FILL_PERCENT ||
                 box_w > (int)width * 3 / 4 || box_h > (int)height * 3 / 4 ||
-                box_w > box_h * 3 || box_h > box_w * 3) {
+                box_w > box_h * 18 / 10 || box_h > box_w * 18 / 10) {
                 continue;
             }
 
             int edge_score = 0;
-            if (!red_target) {
-                for (int y = top_y - 3; y <= bottom_y + 3; y += BALL_GRID_STEP) {
-                    for (int x = left - 3; x <= right + 3; x += BALL_GRID_STEP) {
-                        if (x < 0 || y < 0 || x >= (int)width || y >= (int)height) continue;
-                        if ((x >= left && x <= right && y >= top_y && y <= bottom_y) ||
-                            ball_pixel_matches(frame, width, height, x, y, false)) {
-                            continue;
-                        }
-                        ++edge_score;
+            for (int y = top_y - 3; y <= bottom_y + 3; y += BALL_GRID_STEP) {
+                for (int x = left - 3; x <= right + 3; x += BALL_GRID_STEP) {
+                    if (x < 0 || y < 0 || x >= (int)width || y >= (int)height) continue;
+                    if ((x >= left && x <= right && y >= top_y && y <= bottom_y) ||
+                        ball_pixel_matches(frame, width, height, x, y, colour)) {
+                        continue;
                     }
+                    ++edge_score;
                 }
-                if (edge_score < BALL_WHITE_MIN_EDGE_PIXELS) continue;
             }
+            if (edge_score < BALL_MIN_EDGE_PIXELS) continue;
 
             const int score = count * fill_percent + edge_score * 6;
             if (score > best_score) {
@@ -1365,13 +1349,18 @@ static bool __attribute__((unused)) find_black_zone(const uint8_t *frame, uint16
 
 static bool ball_is_search_phase(void)
 {
-    return s_ball_phase == BALL_SEARCH_RED || s_ball_phase == BALL_SEARCH_WHITE;
+    return s_ball_phase == BALL_SEARCH_RED || s_ball_phase == BALL_SEARCH_GREEN;
 }
 
-static bool ball_is_red_phase(void)
+static ball_colour_t ball_target_colour(void)
 {
-    return s_ball_phase == BALL_SEARCH_RED || s_ball_phase == BALL_ALIGN_RED ||
-           s_ball_phase == BALL_PUSH_RED || s_ball_phase == BALL_RETURN_RED;
+    return (s_ball_phase == BALL_SEARCH_RED || s_ball_phase == BALL_ALIGN_RED) ?
+           BALL_COLOUR_RED : BALL_COLOUR_GREEN;
+}
+
+static const char *ball_colour_name(ball_colour_t colour)
+{
+    return colour == BALL_COLOUR_RED ? "red" : "green";
 }
 
 static void ball_begin(int64_t now)
@@ -1390,19 +1379,21 @@ static void ball_begin(int64_t now)
     s_ball_search_direction = 1;
     s_ball_target_miss_frames = 0;
     ball_drive_stop();
-    ESP_LOGW(TAG, "finish task: tilt high, searching RED then WHITE");
+    ball_stream_clear();
+    ESP_LOGW(TAG, "finish task: tilt high, searching RED then GREEN");
 }
 
 static void ball_next_search(int64_t now)
 {
     ball_stream_clear();
-    s_ball_phase = BALL_SEARCH_WHITE;
+    s_ball_phase = BALL_SEARCH_GREEN;
     s_ball_phase_start_us = now;
     s_ball_align_frames = 0;
     s_ball_target_valid = false;
     s_ball_search_direction = 1;
     s_ball_target_miss_frames = 0;
-    ESP_LOGI(TAG, "red delivered; searching WHITE");
+    ball_drive_stop();
+    ESP_LOGI(TAG, "red centered; searching GREEN");
 }
 
 static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
@@ -1412,23 +1403,24 @@ static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
         s_ball_phase == BALL_DONE) {
         return;
     }
-    const bool red_target = ball_is_red_phase();
+    const ball_colour_t colour = ball_target_colour();
+    const bool red_target = colour == BALL_COLOUR_RED;
     ball_blob_t blob = {0};
-    const bool found_ball = find_ball_blob(frame, width, height, red_target, &blob);
+    const bool found_ball = find_ball_blob(frame, width, height, colour, &blob);
 
     if (ball_is_search_phase()) {
         if (found_ball) {
             s_ball_x = blob.x;
             s_ball_y = blob.y;
             s_ball_target_valid = true;
-            s_ball_phase = red_target ? BALL_ALIGN_RED : BALL_ALIGN_WHITE;
+            s_ball_phase = red_target ? BALL_ALIGN_RED : BALL_ALIGN_GREEN;
             s_ball_phase_start_us = now;
             s_ball_align_frames = 0;
             s_ball_target_miss_frames = 0;
             ball_drive_stop();
             ESP_LOGI(TAG, "%s ball found at (%d,%d) pixels=%d; aligning",
-                     red_target ? "red" : "white", blob.x, blob.y, blob.pixels);
-            ball_stream_detect(red_target ? "RED" : "WHITE", &blob,
+                     ball_colour_name(colour), blob.x, blob.y, blob.pixels);
+            ball_stream_detect(red_target ? "RED" : "GREEN", &blob,
                                width, height);
             return;
         }
@@ -1439,7 +1431,7 @@ static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
         }
         if (elapsed > (int64_t)BALL_SEARCH_TIMEOUT_MS * 1000) {
             ESP_LOGW(TAG, "%s ball search timeout; stopping safely",
-                     red_target ? "red" : "white");
+                     ball_colour_name(colour));
             s_ball_phase = BALL_DONE;
             ball_drive_stop();
         } else {
@@ -1452,30 +1444,29 @@ static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
         return;
     }
 
-    if (s_ball_phase == BALL_ALIGN_RED || s_ball_phase == BALL_ALIGN_WHITE) {
+    if (s_ball_phase == BALL_ALIGN_RED || s_ball_phase == BALL_ALIGN_GREEN) {
         if (found_ball) {
             s_ball_x = blob.x;
             s_ball_y = blob.y;
             s_ball_target_valid = true;
             s_ball_target_miss_frames = 0;
-            ball_stream_detect(red_target ? "RED" : "WHITE", &blob,
+            ball_stream_detect(red_target ? "RED" : "GREEN", &blob,
                                width, height);
         } else if (s_ball_target_miss_frames < 3U) {
             ++s_ball_target_miss_frames;
         } else {
-            s_ball_phase = red_target ? BALL_SEARCH_RED : BALL_SEARCH_WHITE;
+            s_ball_phase = red_target ? BALL_SEARCH_RED : BALL_SEARCH_GREEN;
             s_ball_phase_start_us = now;
             s_ball_target_valid = false;
             ESP_LOGW(TAG, "%s ball lost during alignment; resuming search",
-                     red_target ? "red" : "white");
+                     ball_colour_name(colour));
             return;
         }
         if (!s_ball_target_valid) {
             ball_drive_spin(s_ball_search_direction, BALL_ALIGN_TURN_SPEED);
         } else {
-            /* For ball pickup the camera optical axis is the useful target:
-             * keep the ball itself centred, rather than averaging it with a
-             * separately detected black zone that may be a false candidate. */
+            /* The camera optical axis is the target: keep the ball itself
+             * centred instead of using unrelated scene features. */
             const int error = s_ball_x - (int)width / 2;
             if (abs(error) <= BALL_ALIGN_TOLERANCE_PX) {
                 if (s_ball_align_frames < BALL_ALIGN_CONFIRM_FRAMES) {
@@ -1488,47 +1479,27 @@ static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
                 ball_drive_spin(direction, BALL_ALIGN_TURN_SPEED);
             }
             if (s_ball_align_frames >= BALL_ALIGN_CONFIRM_FRAMES) {
-                s_ball_phase = red_target ? BALL_PUSH_RED : BALL_PUSH_WHITE;
-                s_ball_phase_start_us = now;
+                ball_drive_stop();
                 s_ball_align_frames = 0;
-                ESP_LOGI(TAG, "%s aligned ball=(%d,%d); push",
-                         red_target ? "red" : "white", s_ball_x, s_ball_y);
+                ESP_LOGI(TAG, "%s centered ball=(%d,%d); vehicle stopped",
+                         ball_colour_name(colour), s_ball_x, s_ball_y);
+                if (red_target) {
+                    ball_next_search(now);
+                } else {
+                    s_ball_phase = BALL_DONE;
+                    ESP_LOGW(TAG, "red and green centered; vehicle stopped");
+                }
+                return;
             }
         }
         if (now - s_ball_phase_start_us > (int64_t)BALL_ALIGN_TIMEOUT_MS * 1000) {
             ESP_LOGW(TAG, "%s alignment timeout; returning to search",
-                     red_target ? "red" : "white");
-            s_ball_phase = red_target ? BALL_SEARCH_RED : BALL_SEARCH_WHITE;
+                     ball_colour_name(colour));
+            s_ball_phase = red_target ? BALL_SEARCH_RED : BALL_SEARCH_GREEN;
             s_ball_phase_start_us = now;
             s_ball_target_valid = false;
         }
         return;
-    }
-
-    if (s_ball_phase == BALL_PUSH_RED || s_ball_phase == BALL_PUSH_WHITE) {
-        ball_drive_forward(BALL_PUSH_SPEED);
-        if (now - s_ball_phase_start_us >= (int64_t)BALL_PUSH_MS * 1000) {
-            s_ball_phase = red_target ? BALL_RETURN_RED : BALL_RETURN_WHITE;
-            s_ball_phase_start_us = now;
-            ball_drive_direct(BALL_RETURN_SPEED, 0, -BALL_RETURN_SPEED);
-            ESP_LOGI(TAG, "%s push complete; fixed-time return",
-                     red_target ? "red" : "white");
-        }
-        return;
-    }
-
-    if (s_ball_phase == BALL_RETURN_RED || s_ball_phase == BALL_RETURN_WHITE) {
-        ball_drive_direct(BALL_RETURN_SPEED, 0, -BALL_RETURN_SPEED);
-        if (now - s_ball_phase_start_us >= (int64_t)BALL_RETURN_MS * 1000) {
-            ball_drive_stop();
-            if (s_ball_phase == BALL_RETURN_RED) {
-                ball_next_search(now);
-            } else {
-                s_ball_phase = BALL_DONE;
-                ball_stream_clear();
-                ESP_LOGW(TAG, "both balls delivered; vehicle stopped");
-            }
-        }
     }
 }
 
