@@ -102,7 +102,7 @@
 #define LINE_PID_KP_LAT 45
 #define LINE_PID_KH 130
 #define LINE_PID_SCALE 100
-#define LINE_TURN_MAX 16
+#define LINE_TURN_MAX 13
 #define LINE_YAW_MIN_OUTPUT 13
 #define LINE_LAT_MAX 16
 #define LINE_LAT_MIN_OUTPUT 11
@@ -142,7 +142,7 @@
 #define LINE_BURST_ENABLE 1
 #define LINE_BURST_PERIOD_MS 800U
 #define LINE_BURST_ON_MS 780U
-#define LINE_BURST_MIN_OUTPUT 26
+#define LINE_BURST_MIN_OUTPUT 27
 #define LINE_BURST_TICK_MS 5U
 
 /* 直线回中只补一个很小的 yaw，8 个误差单位以内保持死区，避免来回抖动。 */
@@ -174,8 +174,8 @@
 #define MOTOR_B_MIN_RUN_OUTPUT 13
 #define START_KICK_OUTPUT 27
 #define START_KICK_CYCLES 3U
-/* 正常巡航保持 22%，只给短暂起转脉冲留到 26%，避免再次卡在静摩擦区。 */
-#define MOTOR_PWM_CEILING 30
+/* 正常巡航保持 22%，burst 前进下限为 27%，给转向混控留出三轮起转余量。 */
+#define MOTOR_PWM_CEILING 40
 #define LINE_SPEED_CAP 30
 #define MOTOR_TRIM_A 90
 #define MOTOR_TRIM_D 100
