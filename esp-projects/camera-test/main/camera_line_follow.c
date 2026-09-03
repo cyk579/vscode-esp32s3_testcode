@@ -124,10 +124,25 @@
 #define LINE_TURN_B_SPEED 13
 #define LINE_TURN_D_SPEED 15
 #define LINE_TURN_PENDING_MS 500U
+/* 摄像头在底盘前方：近场折角出现后，先让底盘向前走一小段再原地转。 */
+#define LINE_CORNER_CENTER_DELAY_MS 120U
 /* 低速调试时优先保证三轮都超过各自起转阈值；此前叠加 40% 横移后，
  * 在较低总上限下 A/D 被缩放掉，锐角阶段实际只剩 B 轮。 */
 #define LINE_CAM_PIVOT_PERCENT 0
 #define LINE_ALERT_MS 900U
+
+/* NORMAL 低速用时间脉冲而不是把 PWM 压到静摩擦死区。esp_timer 只负责
+ * 切换 duty，巡线状态和最后一组 forward/turn 命令始终保留。 */
+#define LINE_BURST_ENABLE 1
+#define LINE_BURST_PERIOD_MS 100U
+#define LINE_BURST_ON_MS 40U
+#define LINE_BURST_MIN_OUTPUT 24
+#define LINE_BURST_TICK_MS 5U
+
+/* 直线回中只补一个很小的 yaw，8 个误差单位以内保持死区，避免来回抖动。 */
+#define LINE_CENTER_YAW_DEADBAND 8
+#define LINE_CENTER_YAW_GAIN 18
+#define LINE_CENTER_YAW_MAX 5
 
 /* 校准模式：置 1 后不跑视觉，直接按脚本输出电机命令并打日志。
  * 把车放在赛道板上（不要架空，静摩擦要真实），看串口 + 卷尺就能得到
@@ -248,6 +263,7 @@ static bool s_mix_dropped;
 static int s_turn_direction;
 static uint8_t s_turn_hint_frames;
 static int64_t s_turn_pending_until_us;
+static int64_t s_corner_center_delay_until_us;
 static uint8_t s_turn_exit_frames;
 static uint32_t s_turn_frames;
 static int64_t s_turn_started_us;
@@ -259,6 +275,16 @@ static int s_command_b;
 static int s_command_d;
 static int s_last_direction[3];
 static uint8_t s_kick_cycles[3];
+
+#if LINE_BURST_ENABLE
+static esp_timer_handle_t s_burst_timer;
+static volatile bool s_burst_active;
+static volatile bool s_burst_on;
+static volatile bool s_burst_timer_running;
+static volatile bool s_burst_context;
+static volatile int s_burst_output[3];
+static int64_t s_burst_epoch_us;
+#endif
 
 static uint32_t s_control_frames;
 static uint32_t s_line_us_sum;
@@ -585,6 +611,135 @@ static void set_motor_duty(const motor_t *motor, int output)
     (void)ledc_update_duty(LEDC_LOW_SPEED_MODE, motor->channel);
 }
 
+#if LINE_BURST_ENABLE
+static uint64_t burst_period_us(void)
+{
+    const uint32_t period_ms = LINE_BURST_PERIOD_MS == 0 ? 1U :
+                               LINE_BURST_PERIOD_MS;
+    return (uint64_t)period_ms * 1000U;
+}
+
+static uint64_t burst_on_us(void)
+{
+    const uint64_t period = burst_period_us();
+    uint32_t on_ms = LINE_BURST_ON_MS;
+    if (on_ms == 0) {
+        on_ms = 1U;
+    }
+    uint64_t on = (uint64_t)on_ms * 1000U;
+    /* 至少留出一个 tick 的 OFF 窗口，避免参数误设成连续输出。 */
+    const uint64_t tick = (uint64_t)(LINE_BURST_TICK_MS == 0 ? 1U :
+                                     LINE_BURST_TICK_MS) * 1000U;
+    if (on >= period) {
+        on = period > tick ? period - tick : period;
+    }
+    return on;
+}
+
+static void burst_apply_duty(bool on)
+{
+    const int output_a = on ? s_burst_output[0] : 0;
+    const int output_b = on ? s_burst_output[1] : 0;
+    const int output_d = on ? s_burst_output[2] : 0;
+    set_motor_duty(&motor_a, output_a);
+    set_motor_duty(&motor_b, output_b);
+    set_motor_duty(&motor_d, output_d);
+}
+
+static void normal_burst_timer_callback(void *arg)
+{
+    (void)arg;
+    if (!s_burst_active) {
+        return;
+    }
+    /* 真正的停车路径仍由 process/watchdog 调用 stop_motors；这里仅把 duty
+     * 拉低，绝不改 armed、state、seed 或任何巡线历史。 */
+    if (!s_started || !s_armed || !s_stby_enabled || s_finished) {
+        s_burst_on = false;
+        burst_apply_duty(false);
+        return;
+    }
+
+    const int64_t elapsed = esp_timer_get_time() - s_burst_epoch_us;
+    const uint64_t period = burst_period_us();
+    const uint64_t on_time = burst_on_us();
+    bool on = true;
+    if (elapsed >= 0) {
+        on = ((uint64_t)elapsed % period) < on_time;
+    }
+    if (on != s_burst_on) {
+        s_burst_on = on;
+        burst_apply_duty(on);
+    }
+}
+
+static bool normal_burst_activate(void)
+{
+    if (s_burst_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = normal_burst_timer_callback,
+            .arg = NULL,
+            .name = "line_burst",
+        };
+        const esp_err_t err = esp_timer_create(&args, &s_burst_timer);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "NORMAL burst timer unavailable (%s); using direct duty",
+                     esp_err_to_name(err));
+            return false;
+        }
+    }
+
+    if (!s_burst_active) {
+        s_burst_active = true;
+        s_burst_on = true;
+        s_burst_epoch_us = esp_timer_get_time();
+        s_burst_output[0] = 0;
+        s_burst_output[1] = 0;
+        s_burst_output[2] = 0;
+    }
+    if (!s_burst_timer_running) {
+        const uint64_t tick_us = (uint64_t)(LINE_BURST_TICK_MS == 0 ? 1U :
+                                            LINE_BURST_TICK_MS) * 1000U;
+        const esp_err_t err = esp_timer_start_periodic(s_burst_timer, tick_us);
+        if (err != ESP_OK) {
+            s_burst_active = false;
+            s_burst_on = false;
+            ESP_LOGW(TAG, "NORMAL burst timer start failed (%s); using direct duty",
+                     esp_err_to_name(err));
+            return false;
+        }
+        s_burst_timer_running = true;
+    }
+    return true;
+}
+
+static void normal_burst_deactivate(void)
+{
+    if (!s_burst_active && !s_burst_timer_running) {
+        return;
+    }
+    s_burst_active = false;
+    if (s_burst_timer_running && s_burst_timer != NULL) {
+        (void)esp_timer_stop(s_burst_timer);
+        s_burst_timer_running = false;
+    }
+    s_burst_on = false;
+    s_burst_output[0] = 0;
+    s_burst_output[1] = 0;
+    s_burst_output[2] = 0;
+    burst_apply_duty(false);
+}
+#else
+static bool normal_burst_activate(void)
+{
+    return false;
+}
+
+static void normal_burst_deactivate(void)
+{
+}
+#endif
+
 static void motor_set(const motor_t *motor, int command)
 {
     /* command 是混控层有符号 PWM；换向时先清零，避免 TB6612 硬切方向。 */
@@ -592,6 +747,11 @@ static void motor_set(const motor_t *motor, int command)
     const int speed = clamp_int(command * motor->sign, MOTOR_PWM_CEILING);
     const int direction = (speed > 0) - (speed < 0);
     const bool direction_changed = direction != s_last_direction[index];
+#if LINE_BURST_ENABLE
+    const bool burst_output = s_burst_context && s_burst_active;
+#else
+    const bool burst_output = false;
+#endif
 
     if (direction_changed) {
         set_motor_duty(motor, 0);
@@ -599,12 +759,22 @@ static void motor_set(const motor_t *motor, int command)
         gpio_set_level(motor->in2, speed < 0);
         s_last_direction[index] = direction;
         s_kick_cycles[index] = direction == 0 ? 0 : START_KICK_CYCLES;
+#if LINE_BURST_ENABLE
+        if (burst_output) {
+            s_burst_output[index] = 0;
+        }
+#endif
     }
 
     if (direction == 0) {
         s_kick_cycles[index] = 0;
         gpio_set_level(motor->in1, 0);
         gpio_set_level(motor->in2, 0);
+#if LINE_BURST_ENABLE
+        if (burst_output) {
+            s_burst_output[index] = 0;
+        }
+#endif
         set_motor_duty(motor, 0);
         return;
     }
@@ -622,11 +792,28 @@ static void motor_set(const motor_t *motor, int command)
         }
         --s_kick_cycles[index];
     }
+#if LINE_BURST_ENABLE
+    if (burst_output) {
+        const int burst_min = LINE_BURST_MIN_OUTPUT > MOTOR_PWM_CEILING ?
+                              MOTOR_PWM_CEILING : LINE_BURST_MIN_OUTPUT;
+        if (output < burst_min) {
+            output = burst_min;
+        }
+        s_burst_output[index] = output;
+        /* OFF 只关 duty，方向脚和 kick 计数仍保持；下一次 ON 不会重新
+         * 经过 motor_set，因此不会再次触发完整 startup kick。 */
+        set_motor_duty(motor, s_burst_on ? output : 0);
+        return;
+    }
+#endif
     set_motor_duty(motor, output);
 }
 
 static void zero_motor_outputs(void)
 {
+    /* 进入真正的停车/非 NORMAL 路径时先停掉时间脉冲；这不会清理巡线
+     * 历史，只保证 timer 不会在停车后再次拉高 duty。 */
+    normal_burst_deactivate();
     motor_set(&motor_a, 0);
     motor_set(&motor_b, 0);
     motor_set(&motor_d, 0);
@@ -660,7 +847,8 @@ static int forward_ramp_cap(int64_t now)
            (int)((LINE_SPEED_CAP - LINE_MOTOR_START_MIN_OUTPUT) * elapsed / span);
 }
 
-static void drive(int forward, int turn, int lat)
+static void drive_internal(int forward, int turn, int lat,
+                           bool normal_burst)
 {
     const line_mixer_cfg_t cfg = {
         MOTOR_PWM_CEILING, MOTOR_MIN_RUN_OUTPUT, MOTOR_B_MIN_RUN_OUTPUT,
@@ -686,9 +874,30 @@ static void drive(int forward, int turn, int lat)
     s_mix_post_d = out.d;
     s_mix_scaled = out.scaled;
     s_mix_dropped = out.dropped;
+#if LINE_BURST_ENABLE
+    const bool burst_ready = normal_burst && normal_burst_activate();
+    s_burst_context = burst_ready;
+#else
+    const bool burst_ready = false;
+#endif
     motor_set(&motor_a, s_command_a);
     motor_set(&motor_b, s_command_b);
     motor_set(&motor_d, s_command_d);
+#if LINE_BURST_ENABLE
+    s_burst_context = false;
+#endif
+    (void)burst_ready;
+}
+
+static void drive(int forward, int turn, int lat)
+{
+    normal_burst_deactivate();
+    drive_internal(forward, turn, lat, false);
+}
+
+static void drive_normal_output(int forward, int turn, int lat)
+{
+    drive_internal(forward, turn, lat, true);
 }
 
 /* Use the low-speed IR spin calibration in TURN.  The direct wheel commands
@@ -696,6 +905,7 @@ static void drive(int forward, int turn, int lat)
  * sweep past the line before the next frame is processed. */
 static void drive_slow_spin(int turn)
 {
+    normal_burst_deactivate();
     const int direction = direction_of(turn);
     if (direction == 0) {
         zero_motor_outputs();
@@ -758,6 +968,7 @@ static void reset_tracking(void)
     s_turn_direction = 0;
     s_turn_hint_frames = 0;
     s_turn_pending_until_us = 0;
+    s_corner_center_delay_until_us = 0;
     s_turn_exit_frames = 0;
     s_turn_frames = 0;
     s_turn_started_us = 0;
@@ -833,16 +1044,23 @@ static void drive_normal(const line_observation_t *observation, int64_t now)
      * 死区内保留有宽度的中心区域，避免小车左右来回校正。 */
     const int lateral_for_steer = abs(lateral_error) <= LINE_ERROR_DEADBAND ?
                                    0 : lateral_error;
+    /* 摄像头在底盘前方时，单靠远端 heading 容易留下一个长期横向偏差。
+     * 在现有误差上叠加很小的连续 yaw；小误差保持独立 deadband，避免把
+     * 摄像头量化噪声变成左右抖动。 */
+    const int center_yaw = abs(lateral_error) <= LINE_CENTER_YAW_DEADBAND ?
+                           0 :
+                           clamp_int((LINE_CENTER_YAW_GAIN * lateral_error) / 100,
+                                     LINE_CENTER_YAW_MAX);
     const int steer_error = heading_error -
                             (LINE_PID_KP_LAT * lateral_for_steer) /
-                            (LINE_PID_KH > 0 ? LINE_PID_KH : 1);
+                            (LINE_PID_KH > 0 ? LINE_PID_KH : 1) - center_yaw;
     const int steer_rate = s_heading_error_rate -
                            (LINE_PID_KP_LAT * s_lateral_error_rate) /
                            (LINE_PID_KH > 0 ? LINE_PID_KH : 1);
     s_turn_output = line_control_yaw_pd(&cfg, steer_error, steer_rate,
                                         LINE_PD_KD_HEADING, &s_yaw_accum);
     s_lat_accum = 0;
-    drive(s_forward_output, s_turn_output, 0);
+    drive_normal_output(s_forward_output, s_turn_output, 0);
 }
 
 static void update_seed(const line_observation_t *observation)
@@ -1149,6 +1367,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             s_turn_frames = 0;
             s_turn_exit_frames = 0;
             s_turn_started_us = 0;
+            s_corner_center_delay_until_us = 0;
             /* 出弯后一段时间内限速：赛道右上角两个直角弯之间只有 10 cm。 */
             s_alert_until_us = now + (int64_t)LINE_ALERT_MS * 1000;
             s_lost_frames = 0;
@@ -1167,6 +1386,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             s_lost_frames = 1;
             s_turn_direction = 0;
             s_turn_started_us = 0;
+            s_corner_center_delay_until_us = 0;
             s_reacquire_frames = 0;
             s_reacquire_x = s_seed_x;
             zero_motor_outputs();
@@ -1261,17 +1481,39 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 s_turn_direction = observation.corner_direction;
                 s_turn_hint_frames = 1;
                 s_turn_pending_until_us = 0;
+                s_corner_center_delay_until_us = 0;
             }
             if (s_turn_hint_frames >= LINE_TURN_HINT_FRAMES) {
+                if (s_corner_center_delay_until_us == 0) {
+                    s_corner_center_delay_until_us = now +
+                                                     (int64_t)LINE_CORNER_CENTER_DELAY_MS *
+                                                         1000;
+                }
                 s_turn_pending_until_us = now +
                                            (int64_t)LINE_TURN_PENDING_MS * 1000;
+                if (s_turn_pending_until_us < s_corner_center_delay_until_us) {
+                    s_turn_pending_until_us = s_corner_center_delay_until_us;
+                }
             }
         } else if (!turn_pending_active(now)) {
             s_turn_hint_frames = 0;
             s_turn_direction = 0;
             s_turn_pending_until_us = 0;
+            s_corner_center_delay_until_us = 0;
         }
         drive_normal(&observation, now);
+        goto done;
+    }
+
+    /* 近场折角已经提示但旧线刚消失时，先用 NORMAL 的短脉冲前进补偿
+     * 摄像头到车体中心的前向距离；不改状态、不清历史，也不提前原地转。 */
+    if (s_turn_direction != 0 && s_corner_center_delay_until_us != 0 &&
+        now < s_corner_center_delay_until_us) {
+        if (s_turn_pending_until_us < s_corner_center_delay_until_us) {
+            s_turn_pending_until_us = s_corner_center_delay_until_us;
+        }
+        s_state = LINE_STATE_NORMAL;
+        drive_normal_output(LINE_FORWARD_CRAWL, 0, 0);
         goto done;
     }
 
@@ -1281,6 +1523,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         s_turn_exit_frames = 0;
         s_turn_started_us = now;
         s_turn_pending_until_us = 0;
+        s_corner_center_delay_until_us = 0;
         reset_control();
         ESP_LOGI(TAG, "corner %s confirmed after old line loss; pivoting",
                  s_turn_direction < 0 ? "left" : "right");
@@ -1331,6 +1574,7 @@ done:
  */
 static void calibration_drive_raw(int forward, int turn, int lat)
 {
+    normal_burst_deactivate();
     const line_mixer_cfg_t cfg = {
         MOTOR_PWM_CEILING, 0, 0, MOTOR_TRIM_A, MOTOR_TRIM_D,
     };
