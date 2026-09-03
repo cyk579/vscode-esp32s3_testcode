@@ -41,26 +41,26 @@
  * Forward is deliberately A/D only: [-25, 0, +20].
  * Change only these values while tuning the physical route.
  */
-#define FORWARD_A_CMD (-25)
+#define FORWARD_A_CMD (-20)
 #define FORWARD_B_CMD 0
-#define FORWARD_D_CMD 20
+#define FORWARD_D_CMD 25
 
-#define LEFT_A_CMD (-18)
-#define LEFT_B_CMD (-25)
+#define LEFT_A_CMD (-24)
+#define LEFT_B_CMD (-30)
 #define LEFT_D_CMD (-18)
 
 #define RETURN_FORWARD_A_CMD FORWARD_A_CMD
 #define RETURN_FORWARD_B_CMD FORWARD_B_CMD
 #define RETURN_FORWARD_D_CMD FORWARD_D_CMD
 
-#define RIGHT_A_CMD 15
-#define RIGHT_B_CMD 25
-#define RIGHT_D_CMD 20
+#define RIGHT_A_CMD 18
+#define RIGHT_B_CMD 30
+#define RIGHT_D_CMD 24
 
 #define STOP_WAIT_MS 500U
-#define LEFT_SHIFT_MS 2500U
-#define FORWARD_AFTER_LEFT_MS 2000U
-#define RIGHT_SHIFT_MS 2500U
+#define LEFT_SHIFT_MS 1500U
+#define FORWARD_AFTER_LEFT_MS 1000U
+#define RIGHT_SHIFT_MS 1500U
 
 #define MOTOR_PWM_LIMIT 40
 #define PWM_MAX 1023U
