@@ -130,7 +130,7 @@
 #define LINE_TURN_D_SPEED 15
 #define LINE_TURN_PENDING_MS 500U
 /* 摄像头在底盘前方：旧线消失并确认要转弯后，先让底盘向前走一小段。 */
-#define LINE_CORNER_CENTER_DELAY_MS 500U
+#define LINE_CORNER_CENTER_DELAY_MS 800U
 /* 低速调试时优先保证三轮都超过各自起转阈值；此前叠加 40% 横移后，
  * 在较低总上限下 A/D 被缩放掉，锐角阶段实际只剩 B 轮。 */
 #define LINE_CAM_PIVOT_PERCENT 0
@@ -140,8 +140,8 @@
  * 输入的 forward，绝不逐轮改 A/B/D；esp_timer 只负责切换 duty。 */
 #define LINE_BURST_ENABLE 1
 #define LINE_BURST_PERIOD_MS 1200U
-#define LINE_BURST_ON_MS 900U
-#define LINE_BURST_MIN_OUTPUT 26
+#define LINE_BURST_ON_MS 1100U
+#define LINE_BURST_MIN_OUTPUT 28
 #define LINE_BURST_TICK_MS 5U
 
 /* 直线回中只补一个很小的 yaw，8 个误差单位以内保持死区，避免来回抖动。 */
