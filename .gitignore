@@ -1,0 +1,9 @@
+.vscode/
+.claude/
+**/build/
+**/managed_components/
+**/__pycache__/
+**/*.pyc
+**/*.exe
+/esp-projects/camera-test/
+/esp-projects/car-spin/
