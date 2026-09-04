@@ -92,9 +92,51 @@ static int check_corner(int direction, int y)
     return candidate && observation.corner_direction == direction ? 0 : 1;
 }
 
+/* The control frame is 160x120 for a 320x240 camera mode and 120x80 for
+ * 480x320.  The same physical tilt must yield the same heading at both
+ * sizes, otherwise the yaw gain silently changes with the negotiated mode. */
+#define SCALE_MAX_W 160
+#define SCALE_MAX_H 120
+static uint8_t scale_frame[SCALE_MAX_W * SCALE_MAX_H * 2];
+
+static int tilt_heading(int w, int h)
+{
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            /* Line from bottom centre to 1/4 width at the top: identical
+             * geometry at any resolution.  Tape is 5% of the width. */
+            const int cx = w / 2 - (h - 1 - y) * (w / 4) / (h - 1);
+            const int dark = (x - cx) * (x - cx) * 400 <= w * w;
+            const uint16_t v = dark ? 0 : (uint16_t)0xf79e;
+            uint8_t *p = scale_frame + (((size_t)y * w + (size_t)x) * 2U);
+            p[0] = (uint8_t)(v >> 8);
+            p[1] = (uint8_t)v;
+        }
+    }
+    line_scan_cfg_t cfg = base_cfg();
+    cfg.width = (uint16_t)w;
+    cfg.height = (uint16_t)h;
+    cfg.seed_x = w / 2;
+    cfg.expected_width = w / 20;
+    line_observation_t obs;
+    const bool candidate = line_geometry_track(scale_frame, &cfg, &obs);
+    printf("tilt %dx%d candidate=%d rows=%u ey=%d eth=%d far=%d\n", w, h,
+           candidate, (unsigned)obs.valid_rows, obs.lateral_error,
+           obs.heading_error, obs.far_error);
+    return candidate ? obs.heading_error : 9999;
+}
+
 int main(void)
 {
     int failures = 0;
+    {
+        const int small = tilt_heading(120, 80);
+        const int large = tilt_heading(160, 120);
+        if (small >= 0 || large >= 0 || small - large > 3 || large - small > 3) {
+            printf("FAIL: heading scale differs between frame sizes\n");
+            ++failures;
+        }
+    }
     failures += check_corner(-1, 31);
     failures += check_corner(1, 31);
     failures += check_corner(-1, 17);

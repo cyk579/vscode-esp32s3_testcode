@@ -159,7 +159,7 @@ static void scenario_offset(int w)
     check(name, "no finish", !obs.finish_candidate, "phantom finish");
 }
 
-/* heading 的绝对标度由 LINE_HEADING_ROWS 定义，控制器的 KH 必须跟它配套；
+/* heading 的绝对标度由 LINE_HEADING_ROWS_PERMILLE 定义，控制器的 KH 必须跟它配套；
  * 这里断言的是符号和单调性，以及陡斜线能给出可用的量级。 */
 static int scenario_tilted(int w, int dx)
 {

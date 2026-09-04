@@ -92,10 +92,12 @@
 #define LINE_FORWARD_SLEW 4
 
 /* A short scan miss is often a JPEG/lighting miss, not a genuine loss of the
- * track. The control callback can arrive below 5 Hz while the decoder is
- * busy, so the hold is time based rather than frame-count based. */
+ * track, so the last good path is reused for a short, time based window.
+ * Keep it well below LINE_TURN_PENDING_MS: at a corner the disappearance of
+ * the old line *is* the turn trigger, and a hold longer than the pending
+ * window swallows that event (and drives blind on a real loss). */
 #define LINE_PARTIAL_MIN_POINTS 2
-#define LINE_PARTIAL_TRACK_HOLD_MS 2200U
+#define LINE_PARTIAL_TRACK_HOLD_MS 800U
 
 /* 误差门限。|error| 被 ROI 夹在 55 以内（center 只能落在 48..191），所以
  * 原来的 LINE_ERROR_LARGE=60 在 NORMAL 里永远不可达，CRAWL 那一档是死的。 */
@@ -147,6 +149,8 @@
 #define LINE_TURN_PENDING_MS 1200U
 /* 摄像头在底盘前方：旧线消失并确认要转弯后，先让底盘向前走一小段。 */
 #define LINE_CORNER_CENTER_DELAY_MS 200U
+/* 旧线必须连续消失这么久才算真的出画面；一帧解码失败不能触发转弯。 */
+#define LINE_CORNER_VANISH_CONFIRM_MS 150U
 /* 普通丢线时按最近转向方向低速扫线；每隔一小段时间换向，避免卡在
  * 台阶弯的内侧。避障完成后的 grace 期间仍使用直行重捕获。 */
 #define LINE_LOST_SEARCH_SWITCH_MS 600U
@@ -186,9 +190,12 @@
 #define LINE_CALIB_RUN_MS 3000U
 #define LINE_CALIB_SPIN_MS 10000U
 
-/* 当前摄像头 480x320 输入在控制解码器中缩放为 120x80。 */
-#define LINE_EXPECTED_WIDTH 120
-#define LINE_EXPECTED_HEIGHT 80
+/* 控制解码器上限 160x120：首选 320x240 档位得到 160x120，退回 480x320 档位
+ * 时得到 120x80。几何常量以百分比为主，两种尺寸都可用；其它尺寸才告警。 */
+#define LINE_EXPECTED_WIDTH 160
+#define LINE_EXPECTED_HEIGHT 120
+#define LINE_FALLBACK_WIDTH 120
+#define LINE_FALLBACK_HEIGHT 80
 
 /* Endpoint ball task: the route controller hands over here only after the
  * finish T has been confirmed. */
@@ -344,6 +351,8 @@ static const motor_t motor_d = {D_IN1, D_IN2, LEDC_CHANNEL_2, MOTOR_D_SIGN};
 
 static volatile bool s_started;
 static bool s_armed;
+/* Set once a line has been confirmed since start; survives a later disarm. */
+static bool s_mission_started;
 static bool s_finished;
 static bool s_stby_enabled;
 static volatile float s_ultrasonic_distance_cm = -1.0f;
@@ -429,6 +438,8 @@ static bool s_mix_dropped;
 static int s_turn_direction;
 static int s_lost_search_direction;
 static uint8_t s_turn_hint_frames;
+/* First frame at which the old line was missing while a turn was pending. */
+static int64_t s_corner_vanish_since_us;
 static int64_t s_turn_pending_until_us;
 static int64_t s_corner_center_delay_until_us;
 static bool s_post_corner_align;
@@ -1774,6 +1785,7 @@ static void reset_tracking(void)
     s_turn_hint_frames = 0;
     s_turn_pending_until_us = 0;
     s_corner_center_delay_until_us = 0;
+    s_corner_vanish_since_us = 0;
     s_post_corner_align = false;
     s_post_corner_align_frames = 0;
     s_post_corner_align_started_us = 0;
@@ -1867,7 +1879,11 @@ static void obstacle_begin(int64_t now)
 
 static void obstacle_record_sample(bool close, float distance)
 {
-    if (s_finished) {
+    /* Before the first line confirmation the car is still being placed by
+     * hand: a palm in front of the sensor must not start the fixed route
+     * (which would also unlock finish-T detection).  The flag survives a
+     * later disarm, so "obstacle while LOST/disarmed" keeps working. */
+    if (s_finished || !s_mission_started) {
         s_obstacle_close_samples = 0;
     } else if (close) {
         if (s_obstacle_close_samples < OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
@@ -2065,9 +2081,13 @@ static void drive_normal_limited(const line_observation_t *observation,
     } else {
         s_turn_output = requested_turn;
     }
+    /* Strafe only on fresh, straight-line geometry: a held (stale) frame or
+     * the re-centering phase right after a pivot must not push sideways. */
     const bool center_valid = observation->near_line_visible &&
                               observation->corner_direction == 0 &&
-                              !observation->finish_candidate;
+                              !observation->finish_candidate &&
+                              !s_last_observation_held &&
+                              !s_post_corner_align;
     int requested_lat = 0;
     if (center_valid) {
         /* Move the chassis toward the optical center.  The mixer convention
@@ -2345,13 +2365,17 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     }
     if (!s_logged_frame_size) {
         s_logged_frame_size = true;
-        if (width != LINE_EXPECTED_WIDTH || height != LINE_EXPECTED_HEIGHT) {
+        const bool tuned_size =
+            (width == LINE_EXPECTED_WIDTH && height == LINE_EXPECTED_HEIGHT) ||
+            (width == LINE_FALLBACK_WIDTH && height == LINE_FALLBACK_HEIGHT);
+        if (!tuned_size) {
             ESP_LOGW(TAG,
                      "decoded frame is %ux%u but the scan geometry was tuned for "
-                     "%dx%d; row step, minimum segment width and window limits "
-                     "are absolute pixels",
+                     "%dx%d (or %dx%d); row step, minimum segment width and "
+                     "window limits are absolute pixels",
                      (unsigned)width, (unsigned)height,
-                     LINE_EXPECTED_WIDTH, LINE_EXPECTED_HEIGHT);
+                     LINE_EXPECTED_WIDTH, LINE_EXPECTED_HEIGHT,
+                     LINE_FALLBACK_WIDTH, LINE_FALLBACK_HEIGHT);
         } else {
             ESP_LOGI(TAG, "decoded frame %ux%u matches the tuned scan geometry",
                      (unsigned)width, (unsigned)height);
@@ -2382,7 +2406,9 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         s_last_good_observation = observation;
         s_last_good_observation_us = now;
     }
-    const bool allow_last_good_hold = s_armed &&
+    /* Never hold stale geometry while a corner is pending: the old line
+     * vanishing is exactly the event the turn logic waits for. */
+    const bool allow_last_good_hold = s_armed && !turn_pending_active(now) &&
                                       (s_state == LINE_STATE_NORMAL ||
                                        (s_state == LINE_STATE_CORNER &&
                                         s_post_corner_align));
@@ -2403,7 +2429,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         observation.candidate = true;
         candidate = true;
         partial_candidate = true;
-    } else if (!detector_candidate && s_armed &&
+    } else if (!detector_candidate && s_armed && !turn_pending_active(now) &&
                s_state == LINE_STATE_NORMAL && s_seed_valid &&
                observation.point_count >= LINE_PARTIAL_MIN_POINTS &&
                observation.near_normal_rows >= LINE_PARTIAL_MIN_POINTS &&
@@ -2454,6 +2480,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             }
             if (s_arm_frames >= LINE_ARM_CONFIRM_FRAMES) {
                 s_armed = true;
+                s_mission_started = true;
                 s_state = LINE_STATE_NORMAL;
                 reset_control();
                 update_seed(&observation);
@@ -2807,6 +2834,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         s_obstacle_reacquire_until_us = 0;
         s_lost_frames = 0;
         s_reacquire_frames = 0;
+        s_corner_vanish_since_us = 0;
         if (!partial_candidate) {
             s_last_line_us = now;
             update_seed(&observation);
@@ -2845,7 +2873,18 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     }
 
     if (turn_pending_active(now)) {
-        /* pending + 旧线消失才锁定本次转弯，并从此刻开始完整的中心补偿。 */
+        /* pending + 旧线消失才锁定本次转弯，并从此刻开始完整的中心补偿。
+         * 单帧 MJPEG 损坏/解码失败在这里也表现为旧线消失，所以要求消失
+         * 持续一小段时间，而不是一帧。 */
+        if (s_corner_vanish_since_us == 0) {
+            s_corner_vanish_since_us = now;
+        }
+        if (now - s_corner_vanish_since_us <
+            (int64_t)LINE_CORNER_VANISH_CONFIRM_MS * 1000) {
+            drive_normal_output(LINE_FORWARD_CRAWL, 0, 0);
+            goto done;
+        }
+        s_corner_vanish_since_us = 0;
         s_corner_center_delay_until_us = now +
                                          (int64_t)LINE_CORNER_CENTER_DELAY_MS * 1000;
         s_turn_pending_until_us = 0;
@@ -3125,6 +3164,7 @@ esp_err_t camera_line_follow_start(void)
     s_obstacle_phase_start_us = 0;
     s_obstacle_reacquire_until_us = 0;
     s_obstacle_completed = false;
+    s_mission_started = false;
     s_arm_frames = 0;
     s_motor_start_us = 0;
     s_finish_frames = 0;
@@ -3165,6 +3205,7 @@ esp_err_t camera_line_follow_start(void)
      * until the first camera frame arrives (see process_frame above). */
     s_finished = true;
     s_armed = true;
+    s_mission_started = true;
     ESP_LOGW(TAG,
              "BALL_DIRECT_TEST_MODE=1: line following, finish T, and obstacle "
              "avoidance skipped; waiting for first frame at endpoint");
@@ -3221,6 +3262,7 @@ void camera_line_follow_stop(void)
     s_obstacle_phase_start_us = 0;
     s_obstacle_reacquire_until_us = 0;
     s_obstacle_completed = false;
+    s_mission_started = false;
     s_started = false;
     s_last_frame_us = 0;
     if (s_control_mutex != NULL) {

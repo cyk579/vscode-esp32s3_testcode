@@ -39,10 +39,13 @@ extern "C" {
 #define LINE_SEED_MISS_ROWS 6
 #define LINE_TRACK_MISS_ROWS 3
 
-/* 近场取样窗口全部用固定行数，避免"基线随跟踪长度变化"导致前馈增益漂移。 */
-#define LINE_NEAR_ROWS 3
-#define LINE_HEADING_ROWS 10
-#define LINE_FAR_ROWS 14
+/* 近场/航向/远场取样窗口按扫描高度的千分比折算成行数，而不是固定行数：
+ * 控制帧可能是 120x80（480x320 输入）或 160x120（320x240 输入），固定行数
+ * 会让同一物理姿态在两种尺寸下给出相差一倍的 heading。120x80 时分别得到
+ * 3/10/14 行，与此前的固定值完全一致。基线仍与跟踪长度无关。 */
+#define LINE_NEAR_ROWS_PERMILLE 75
+#define LINE_HEADING_ROWS_PERMILLE 250
+#define LINE_FAR_ROWS_PERMILLE 350
 
 /* 线段形状分类的相对门限，全部以近场线宽 w 为基准：
  *   宽黑区   run_width  > LINE_WIDE_RATIO * w

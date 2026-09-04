@@ -14,5 +14,13 @@ $CC -std=c11 -fsyntax-only -Wall -Wextra -Wno-unused-parameter \
 sed 's/^#define LINE_CALIB_MODE 0$/#define LINE_CALIB_MODE 1/'     ../main/camera_line_follow.c > .calib_variant.c
 $CC -std=c11 -fsyntax-only -Wall -Wextra -Wno-unused-parameter     -I../main -Iesp_stubs -Iesp_stubs/freertos .calib_variant.c
 rm -f .calib_variant.c
-echo "esp-side syntax check: ok (both LINE_CALIB_MODE branches)"
+$CC -std=c11 -fsyntax-only -Wall -Wextra -I../main -Iesp_stubs -Iesp_stubs/freertos ../main/ultrasonic.c
+echo "esp-side syntax check: ok (both LINE_CALIB_MODE branches, ultrasonic.c)"
+if [ "$#" -eq 0 ]; then
+    $CC $CFLAGS -Iesp_stubs -Iesp_stubs/freertos -ffunction-sections -fdata-sections \
+        -Wl,--gc-sections -o obstacle_priority_harness obstacle_priority_harness.c
+    $CC $CFLAGS -o lowres_corner_harness lowres_corner_harness.c ../main/line_geometry.c
+    ./obstacle_priority_harness
+    ./lowres_corner_harness
+fi
 ./harness "$@"

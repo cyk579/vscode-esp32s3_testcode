@@ -297,6 +297,13 @@ static bool scan_segment(const uint8_t *frame,
     return true;
 }
 
+/* 千分比 -> 扫描行数（每 LINE_ROW_STEP 像素一行），至少 1 行。 */
+static int rows_for_permille(int height, int permille)
+{
+    const int rows = height * permille / (1000 * LINE_ROW_STEP);
+    return rows < 1 ? 1 : rows;
+}
+
 static int average_points(const int16_t *xs, int first, int count)
 {
     if (xs == NULL || count <= 0) {
@@ -455,25 +462,28 @@ bool line_geometry_track(const uint8_t *frame,
         }
     }
 
-    const int near_count = point_count < LINE_NEAR_ROWS ? point_count : LINE_NEAR_ROWS;
+    const int near_rows = rows_for_permille(height, LINE_NEAR_ROWS_PERMILLE);
+    const int heading_rows = rows_for_permille(height, LINE_HEADING_ROWS_PERMILLE);
+    const int far_rows = rows_for_permille(height, LINE_FAR_ROWS_PERMILLE);
+    const int near_count = point_count < near_rows ? point_count : near_rows;
     const int near_center = average_points(observation->point_x, 0, near_count);
     const int near_error = line_geometry_error(near_center, width, cfg->mirror_x);
     /* heading 取固定行号并按实际基线归一化：同一个物理姿态必须给出同一个
      * 数值。原来 far 取 points[] 末端，基线随跟踪长度变化，前馈增益会漂移，
      * point_count==4 时甚至恒等于 0。 */
     int heading_index = point_count - 1;
-    if (heading_index > LINE_HEADING_ROWS) {
-        heading_index = LINE_HEADING_ROWS;
+    if (heading_index > heading_rows) {
+        heading_index = heading_rows;
     }
     int heading = 0;
     if (heading_index > 0) {
         const int local = line_geometry_error(observation->point_x[heading_index],
                                               width, cfg->mirror_x);
-        heading = (near_error - local) * LINE_HEADING_ROWS / heading_index;
+        heading = (near_error - local) * heading_rows / heading_index;
     }
     int far_index = point_count - 1;
-    if (far_index > LINE_FAR_ROWS) {
-        far_index = LINE_FAR_ROWS;
+    if (far_index > far_rows) {
+        far_index = far_rows;
     }
 
     observation->candidate = true;

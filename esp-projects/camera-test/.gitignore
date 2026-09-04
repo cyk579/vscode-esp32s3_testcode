@@ -1,2 +1,6 @@
 test/harness
 test/harness.exe
+test/obstacle_priority_harness.exe
+test/lowres_corner_harness.exe
+test/obstacle_priority_harness
+test/lowres_corner_harness

@@ -106,6 +106,22 @@ int main(void)
     s_obstacle_close_samples = 0;
     s_first_frame_us = s_fake_time_us;
 
+    /* Never-armed car (still being placed by hand): close samples must not
+     * accumulate and the fixed route must not start. */
+    s_mission_started = false;
+    for (unsigned i = 0; i < OBSTACLE_CLOSE_CONFIRM_SAMPLES; ++i) {
+        obstacle_record_sample(true, 12.0f);
+    }
+    assert(s_obstacle_close_samples == 0);
+    camera_line_follow_process_frame(frame, 1, 1, 0, false);
+    if (s_obstacle_state != OBSTACLE_IDLE || s_stby_enabled) {
+        fprintf(stderr, "FAIL: obstacle route started before any line was confirmed\n");
+        return 1;
+    }
+
+    /* Disarmed *after* a run (e.g. LOST timeout): the route must still take
+     * over even though s_armed is false. */
+    s_mission_started = true;
     for (unsigned i = 0; i < OBSTACLE_CLOSE_CONFIRM_SAMPLES; ++i) {
         obstacle_record_sample(true, 12.0f);
     }
@@ -132,6 +148,6 @@ int main(void)
     assert(s_command_b == -AVOID_LEFT_B_SPEED);
     assert(s_command_d == -AVOID_LEFT_D_SPEED);
 
-    puts("PASS: unarmed close obstacle owns BRAKE and LEFT with STBY enabled");
+    puts("PASS: never-armed car ignores obstacle; disarmed-after-run car owns BRAKE and LEFT with STBY enabled");
     return 0;
 }
