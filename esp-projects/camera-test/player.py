@@ -64,6 +64,7 @@ ball_phase = 'IDLE'
 max_frames = args.frames or (1 if args.headless else 0)
 max_stream_bytes = 2 * 1024 * 1024
 CONNECT_RETRIES = 20
+GUI_WAIT_MS = 10
 
 
 def connect_stream(host, port):
@@ -73,7 +74,9 @@ def connect_stream(host, port):
         sock.settimeout(5.0)
         try:
             sock.connect((host, port))
-            sock.settimeout(None)
+            # Keep a finite timeout so the GUI event loop can run even when
+            # the ESP32 pauses or sends an incomplete MJPEG frame.
+            sock.settimeout(1.0)
             return sock
         except OSError as error:
             last_error = error
@@ -88,9 +91,23 @@ print(f'Connecting to {args.host}:{args.port}...')
 try:
     with connect_stream(args.host, args.port) as sock:
         print('Receiving MJPEG data. Press Esc in the preview window to exit.')
+        if not args.headless:
+            cv2.namedWindow('ESP32 USB camera', cv2.WINDOW_AUTOSIZE)
 
         while not stop:
-            data = sock.recv(4096)
+            if not args.headless and cv2.waitKey(GUI_WAIT_MS) == 27:
+                stop = True
+                break
+            try:
+                data = sock.recv(4096)
+            except socket.timeout:
+                if not args.headless:
+                    # OpenCV only pumps the native window from waitKey().
+                    # Without this, a stalled camera stream makes Windows
+                    # label the preview window as "Not Responding".
+                    if cv2.waitKey(GUI_WAIT_MS) == 27:
+                        stop = True
+                continue
             if not data:
                 break
             stream += data
@@ -212,7 +229,7 @@ try:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2,
                                 cv2.LINE_AA)
                     cv2.imshow('ESP32 USB camera', image)
-                    if cv2.waitKey(1) == 27:
+                    if cv2.waitKey(GUI_WAIT_MS) == 27:
                         stop = True
                         break
                 if max_frames and frame_count >= max_frames:

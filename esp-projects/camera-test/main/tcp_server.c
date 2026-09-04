@@ -27,7 +27,7 @@
 #define CAMERA_AP_SSID "ESP32-CAMERA-TEST"
 #define CAMERA_AP_PASSWORD "camera123"
 #define STREAM_RING_BUFFER_BYTES (128 * 1024)
-#define STREAM_SEND_CHUNK_BYTES 20000
+#define STREAM_SEND_CHUNK_BYTES 65536
 
 typedef struct {
     int sock;
@@ -132,6 +132,17 @@ esp_err_t tcp_server_send(uint8_t *payload, size_t size)
     }
 
     if (xRingbufferSend(s_server->buffer, payload, size, pdMS_TO_TICKS(1)) != pdTRUE) {
+        /* Keep latency bounded: discard the oldest queued item and retry so
+         * a slow client sees recent camera frames instead of stale video. */
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            size_t stale_size = 0;
+            void *stale = xRingbufferReceive(s_server->buffer, &stale_size, 0);
+            if (stale == NULL) break;
+            vRingbufferReturnItem(s_server->buffer, stale);
+            if (xRingbufferSend(s_server->buffer, payload, size, 0) == pdTRUE) {
+                return ESP_OK;
+            }
+        }
         ESP_LOGW(TAG, "Frame dropped: TCP ring buffer is full");
         return ESP_FAIL;
     }

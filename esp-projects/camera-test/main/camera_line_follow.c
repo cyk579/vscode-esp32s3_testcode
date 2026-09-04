@@ -235,15 +235,17 @@
 #define BALL_RED_MIN_R 90
 #define BALL_RED_CHANNEL_GAP 35
 #define BALL_GREEN_MIN_G 70
-#define BALL_GREEN_CHANNEL_GAP 25
+#define BALL_GREEN_CHANNEL_GAP 8
 #define BALL_MIN_LUMA 35
-#define BALL_MIN_FILL_PERCENT 40
+#define BALL_MIN_FILL_PERCENT 50
 #define BALL_MIN_EDGE_PIXELS 6
+#define BALL_MIN_BORDER_MARGIN 4
+#define BALL_MAX_WIDTH_PERCENT 20
 #define BALL_ZONE_MIN_RUN_PIXELS 8
 #define BALL_ZONE_MIN_ROWS 3
 #define BALL_ZONE_THRESHOLD 55
-#define BALL_GRID_STEP 2
-#define BALL_GRID_MAX_CELLS 4800
+#define BALL_GRID_STEP 1
+#define BALL_GRID_MAX_CELLS 20000
 
 /* subject2-findball is a standalone endpoint test image.  The vehicle is
  * placed at the finish and must enter the ball state machine directly; the
@@ -1236,10 +1238,20 @@ static bool find_ball_blob(const uint8_t *frame, uint16_t width, uint16_t height
             const int sample_box_area = sample_box_w * sample_box_h;
             const int fill_percent = sample_box_area > 0 ?
                                      count * 100 / sample_box_area : 0;
+            /* Components clipped by the image boundary are commonly caused
+             * by red/green UI or cable artifacts. A real ball must have a
+             * small colour-free border around its blob before it can steer
+             * the vehicle. */
             if (count < BALL_MIN_PIXELS || box_w < 4 || box_h < 4 ||
+                left <= BALL_MIN_BORDER_MARGIN ||
+                top_y <= BALL_MIN_BORDER_MARGIN ||
+                right >= (int)width - 1 - BALL_MIN_BORDER_MARGIN ||
+                bottom_y >= (int)height - 1 - BALL_MIN_BORDER_MARGIN ||
                 fill_percent < BALL_MIN_FILL_PERCENT ||
+                box_w > (int)width * BALL_MAX_WIDTH_PERCENT / 100 ||
+                box_h > (int)height * BALL_MAX_WIDTH_PERCENT / 100 ||
                 box_w > (int)width * 3 / 4 || box_h > (int)height * 3 / 4 ||
-                box_w > box_h * 18 / 10 || box_h > box_w * 18 / 10) {
+                box_w > box_h * 22 / 10 || box_h > box_w * 22 / 10) {
                 continue;
             }
 
@@ -2030,6 +2042,8 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             ball_begin(now);
         }
 #endif
+        s_last_frame_width = width;
+        s_last_frame_height = height;
         ball_process_frame(rgb565_big_endian, width, height, now);
         goto done;
     }
