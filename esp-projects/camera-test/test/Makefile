@@ -5,11 +5,16 @@ harness: host_harness.c ../main/line_geometry.c ../main/line_mixer.c ../main/lin
 	$(CC) $(CFLAGS) -o harness host_harness.c ../main/line_geometry.c ../main/line_mixer.c ../main/line_control.c
 
 .PHONY: run clean
-run: harness
+run: harness obstacle_priority_harness
 	./harness
+	./obstacle_priority_harness
+
+obstacle_priority_harness: obstacle_priority_harness.c ../main/camera_line_follow.c
+	$(CC) $(CFLAGS) -Iesp_stubs -Iesp_stubs/freertos -ffunction-sections \
+	    -fdata-sections -Wl,--gc-sections -o $@ obstacle_priority_harness.c
 
 clean:
-	rm -f harness harness.exe
+	rm -f harness harness.exe obstacle_priority_harness obstacle_priority_harness.exe
 
 # ESP 侧源文件的语法/类型检查：用桩头文件让 host gcc 也能编译一遍。
 # 本机没有 idf.py，这是提交前唯一能做的 ESP 端编译验证。

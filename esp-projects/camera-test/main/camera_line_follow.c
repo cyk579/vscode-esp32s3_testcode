@@ -1177,6 +1177,26 @@ static void obstacle_begin(int64_t now)
              (double)s_ultrasonic_distance_cm);
 }
 
+static void obstacle_record_sample(bool close, float distance)
+{
+    if (s_finished) {
+        s_obstacle_close_samples = 0;
+    } else if (close) {
+        if (s_obstacle_close_samples < OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
+            ++s_obstacle_close_samples;
+            ESP_LOGI(TAG, "ultrasonic close sample %u/%u: %.1fcm",
+                     (unsigned)s_obstacle_close_samples,
+                     (unsigned)OBSTACLE_CLOSE_CONFIRM_SAMPLES,
+                     (double)distance);
+        }
+    } else if (s_obstacle_close_samples < OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
+        /* Before confirmation the samples must be consecutive.  Once the
+         * second close sample arrives, latch the request until the control
+         * mutex is available so one invalid echo cannot erase it. */
+        s_obstacle_close_samples = 0;
+    }
+}
+
 static void obstacle_finish(int64_t now, uint16_t width)
 {
     s_obstacle_state = OBSTACLE_IDLE;
@@ -1410,10 +1430,20 @@ bool camera_line_follow_status_callback(camera_display_status_t *status,
         return false;
     }
 
-    status->state = s_post_corner_align ? CAMERA_DISPLAY_STATUS_ALIGN :
-                    (s_state == LINE_STATE_CORNER ? CAMERA_DISPLAY_STATUS_CORNER :
-                     (s_state == LINE_STATE_LOST ? CAMERA_DISPLAY_STATUS_LOST :
-                      CAMERA_DISPLAY_STATUS_NORMAL));
+    if (s_obstacle_state == OBSTACLE_BRAKE) {
+        status->state = CAMERA_DISPLAY_STATUS_BRAKE;
+    } else if (s_obstacle_state == OBSTACLE_LEFT) {
+        status->state = CAMERA_DISPLAY_STATUS_AVOID_LEFT;
+    } else if (s_obstacle_state == OBSTACLE_FORWARD) {
+        status->state = CAMERA_DISPLAY_STATUS_AVOID_FORWARD;
+    } else if (s_obstacle_state == OBSTACLE_RIGHT) {
+        status->state = CAMERA_DISPLAY_STATUS_AVOID_RIGHT;
+    } else {
+        status->state = s_post_corner_align ? CAMERA_DISPLAY_STATUS_ALIGN :
+                        (s_state == LINE_STATE_CORNER ? CAMERA_DISPLAY_STATUS_CORNER :
+                         (s_state == LINE_STATE_LOST ? CAMERA_DISPLAY_STATUS_LOST :
+                          CAMERA_DISPLAY_STATUS_NORMAL));
+    }
     status->armed = s_armed;
     status->stby = s_stby_enabled;
     status->motor_a = s_command_a;
@@ -1573,6 +1603,12 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         }
         goto done;
     }
+    /* Ultrasonic avoidance has priority over all camera state, including an
+     * already disarmed LOST state.  Do not spend a frame on vision or let the
+     * unarmed path pull STBY low while the fixed route owns the motors. */
+    if (obstacle_step(now, width)) {
+        goto done;
+    }
     if (s_first_frame_us == 0) {
         s_first_frame_us = now;
     }
@@ -1669,12 +1705,6 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             goto done;
         }
         zero_motor_outputs();
-        goto done;
-    }
-
-    /* Keep obstacle control ahead of finish/corner/lost/NORMAL handling so a
-     * confirmed obstacle immediately owns the motors for the fixed route. */
-    if (obstacle_step(now, width)) {
         goto done;
     }
 
@@ -2186,21 +2216,7 @@ static void camera_ultrasonic_task(void *arg)
          * param6 implementation did this first; otherwise a camera callback
          * holding the mutex can discard exactly the samples needed for the
          * two-sample confirmation. */
-        if (s_finished) {
-            s_obstacle_close_samples = 0;
-        } else if (close) {
-            if (s_obstacle_close_samples < UINT32_MAX) {
-                ++s_obstacle_close_samples;
-            }
-            if (s_obstacle_close_samples <= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
-                ESP_LOGI(TAG, "ultrasonic close sample %u/%u: %.1fcm",
-                         (unsigned)s_obstacle_close_samples,
-                         (unsigned)OBSTACLE_CLOSE_CONFIRM_SAMPLES,
-                         (double)distance);
-            }
-        } else {
-            s_obstacle_close_samples = 0;
-        }
+        obstacle_record_sample(close, distance);
 
         if (s_control_mutex != NULL &&
             xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {

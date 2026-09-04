@@ -434,6 +434,14 @@ static const char *status_state_name(camera_display_status_state_t state)
         return "LOST";
     case CAMERA_DISPLAY_STATUS_ALIGN:
         return "ALIGN";
+    case CAMERA_DISPLAY_STATUS_BRAKE:
+        return "BRAKE";
+    case CAMERA_DISPLAY_STATUS_AVOID_LEFT:
+        return "AVOID_L";
+    case CAMERA_DISPLAY_STATUS_AVOID_FORWARD:
+        return "AVOID_F";
+    case CAMERA_DISPLAY_STATUS_AVOID_RIGHT:
+        return "AVOID_R";
     case CAMERA_DISPLAY_STATUS_NORMAL:
     default:
         return "NORMAL";
