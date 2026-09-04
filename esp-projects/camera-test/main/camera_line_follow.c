@@ -225,6 +225,9 @@
 #define BALL_SERVO_SETTLE_MS 700U
 #define BALL_SEARCH_TURN_SPEED 13
 #define BALL_ALIGN_TURN_SPEED 12
+#define BALL_CHARGE_A_SPEED 30
+#define BALL_CHARGE_D_SPEED 25
+#define BALL_CHARGE_MS 3000U
 #define BALL_SEARCH_TIMEOUT_MS 14000U
 #define BALL_ALIGN_TIMEOUT_MS 5000U
 #define BALL_ALIGN_TOLERANCE_PX 7
@@ -277,8 +280,12 @@ typedef enum {
     BALL_IDLE = 0,
     BALL_SEARCH_RED,
     BALL_ALIGN_RED,
+    BALL_FORWARD_RED,
+    BALL_BACK_RED,
     BALL_SEARCH_GREEN,
     BALL_ALIGN_GREEN,
+    BALL_FORWARD_GREEN,
+    BALL_BACK_GREEN,
     BALL_DONE,
 } ball_phase_t;
 
@@ -1094,6 +1101,13 @@ static void ball_drive_spin(int direction, int speed)
                       -direction * magnitude);
 }
 
+static void ball_drive_charge(bool reverse)
+{
+    const int sign = reverse ? -1 : 1;
+    ball_drive_direct(sign * BALL_CHARGE_A_SPEED, 0,
+                      sign * BALL_CHARGE_D_SPEED);
+}
+
 static void ball_drive_stop(void)
 {
     stop_motors();
@@ -1104,8 +1118,12 @@ static const char *ball_phase_name(void)
     switch (s_ball_phase) {
     case BALL_SEARCH_RED: return "SEARCH_R";
     case BALL_ALIGN_RED: return "ALIGN_R";
+    case BALL_FORWARD_RED: return "FWD_R";
+    case BALL_BACK_RED: return "BACK_R";
     case BALL_SEARCH_GREEN: return "SEARCH_G";
     case BALL_ALIGN_GREEN: return "ALIGN_G";
+    case BALL_FORWARD_GREEN: return "FWD_G";
+    case BALL_BACK_GREEN: return "BACK_G";
     case BALL_DONE: return "DONE";
     case BALL_IDLE:
     default: return "IDLE";
@@ -1366,7 +1384,8 @@ static bool ball_is_search_phase(void)
 
 static ball_colour_t ball_target_colour(void)
 {
-    return (s_ball_phase == BALL_SEARCH_RED || s_ball_phase == BALL_ALIGN_RED) ?
+    return (s_ball_phase == BALL_SEARCH_RED || s_ball_phase == BALL_ALIGN_RED ||
+            s_ball_phase == BALL_FORWARD_RED || s_ball_phase == BALL_BACK_RED) ?
            BALL_COLOUR_RED : BALL_COLOUR_GREEN;
 }
 
@@ -1408,6 +1427,26 @@ static void ball_next_search(int64_t now)
     ESP_LOGI(TAG, "red centered; searching GREEN");
 }
 
+static void ball_begin_charge(int64_t now, ball_colour_t colour)
+{
+    s_ball_phase = colour == BALL_COLOUR_RED ? BALL_FORWARD_RED : BALL_FORWARD_GREEN;
+    s_ball_phase_start_us = now;
+    s_ball_align_frames = 0;
+    s_ball_target_miss_frames = 0;
+    ball_drive_charge(false);
+    ESP_LOGI(TAG, "%s centered; charging forward for %ums",
+             ball_colour_name(colour), (unsigned)BALL_CHARGE_MS);
+}
+
+static void ball_finish_charge(int64_t now, ball_colour_t colour)
+{
+    s_ball_phase = colour == BALL_COLOUR_RED ? BALL_BACK_RED : BALL_BACK_GREEN;
+    s_ball_phase_start_us = now;
+    ball_drive_charge(true);
+    ESP_LOGI(TAG, "%s forward complete; reversing for %ums",
+             ball_colour_name(colour), (unsigned)BALL_CHARGE_MS);
+}
+
 static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
                                int64_t now)
 {
@@ -1417,6 +1456,28 @@ static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
     }
     const ball_colour_t colour = ball_target_colour();
     const bool red_target = colour == BALL_COLOUR_RED;
+
+    if (s_ball_phase == BALL_FORWARD_RED || s_ball_phase == BALL_FORWARD_GREEN) {
+        ball_drive_charge(false);
+        if (now - s_ball_phase_start_us >= (int64_t)BALL_CHARGE_MS * 1000) {
+            ball_finish_charge(now, colour);
+        }
+        return;
+    }
+    if (s_ball_phase == BALL_BACK_RED || s_ball_phase == BALL_BACK_GREEN) {
+        ball_drive_charge(true);
+        if (now - s_ball_phase_start_us >= (int64_t)BALL_CHARGE_MS * 1000) {
+            ball_drive_stop();
+            if (red_target) {
+                ball_next_search(now);
+            } else {
+                s_ball_phase = BALL_DONE;
+                ESP_LOGW(TAG, "red and green complete; vehicle stopped");
+            }
+        }
+        return;
+    }
+
     ball_blob_t blob = {0};
     const bool found_ball = find_ball_blob(frame, width, height, colour, &blob);
 
@@ -1493,14 +1554,9 @@ static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
             if (s_ball_align_frames >= BALL_ALIGN_CONFIRM_FRAMES) {
                 ball_drive_stop();
                 s_ball_align_frames = 0;
-                ESP_LOGI(TAG, "%s centered ball=(%d,%d); vehicle stopped",
+                ESP_LOGI(TAG, "%s centered ball=(%d,%d); preparing charge",
                          ball_colour_name(colour), s_ball_x, s_ball_y);
-                if (red_target) {
-                    ball_next_search(now);
-                } else {
-                    s_ball_phase = BALL_DONE;
-                    ESP_LOGW(TAG, "red and green centered; vehicle stopped");
-                }
+                ball_begin_charge(now, colour);
                 return;
             }
         }
