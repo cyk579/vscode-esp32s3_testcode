@@ -135,7 +135,7 @@
 #define LINE_TURN_D_SPEED 15
 #define LINE_TURN_PENDING_MS 500U
 /* 摄像头在底盘前方：旧线消失并确认要转弯后，先让底盘向前走一小段。 */
-#define LINE_CORNER_CENTER_DELAY_MS 100U
+#define LINE_CORNER_CENTER_DELAY_MS 200U
 /* 普通丢线时按最近转向方向低速扫线；每隔一小段时间换向，避免卡在
  * 台阶弯的内侧。避障完成后的 grace 期间仍使用直行重捕获。 */
 #define LINE_LOST_SEARCH_SWITCH_MS 450U
@@ -198,12 +198,12 @@
 #define ULTRASONIC_ECHO GPIO_NUM_11
 #define ULTRASONIC_MIN_CM 2.0f
 #define ULTRASONIC_MAX_CM 400.0f
-#define OBSTACLE_DETECT_CM 20.0f
+#define OBSTACLE_DETECT_CM 15.0f
 #define OBSTACLE_CLOSE_CONFIRM_SAMPLES 2U
 #define ULTRASONIC_PERIOD_MS 60U
 #define AVOID_BRAKE_MS 500U
 #define AVOID_LEFT_MS 1800U
-#define AVOID_FORWARD_MS 1500U
+#define AVOID_FORWARD_MS 2000U
 #define AVOID_RIGHT_MS 1500U
 #define AVOID_REACQUIRE_GRACE_MS 1000U
 #define AVOID_LEFT_A_SPEED 24
@@ -212,8 +212,8 @@
 #define AVOID_RIGHT_A_SPEED 18
 #define AVOID_RIGHT_B_SPEED 30
 #define AVOID_RIGHT_D_SPEED 24
-#define AVOID_FORWARD_A_SPEED 22
-#define AVOID_FORWARD_D_SPEED 25
+#define AVOID_FORWARD_A_SPEED 27
+#define AVOID_FORWARD_D_SPEED 30
 
 typedef struct {
     gpio_num_t in1;
