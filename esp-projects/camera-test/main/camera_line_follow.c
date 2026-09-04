@@ -112,8 +112,8 @@
 #define LINE_LAT_MIN_OUTPUT 11
 #define LINE_SEED_SLEW_PX 12
 
-/* 折角：事件行进入画面下方 90% 才动手；更远处只降速，避免提前转弯。 */
-#define LINE_TURN_TRIGGER_PERCENT 90
+/* 折角：事件行进入画面下方 85% 才动手；更远处只降速，避免提前转弯。 */
+#define LINE_TURN_TRIGGER_PERCENT 85
 #define LINE_TURN_HINT_FRAMES 1U
 #define LINE_TURN_EXIT_FRAMES 2U
 /* 旋转至少持续这么久才接受退出，否则第一帧还在看入弯前那条线就会假退出，
@@ -202,9 +202,9 @@
 #define OBSTACLE_CLOSE_CONFIRM_SAMPLES 2U
 #define ULTRASONIC_PERIOD_MS 60U
 #define AVOID_BRAKE_MS 500U
-#define AVOID_LEFT_MS 1600U
+#define AVOID_LEFT_MS 1500U
 #define AVOID_FORWARD_MS 1500U
-#define AVOID_RIGHT_MS 1400U
+#define AVOID_RIGHT_MS 1200U
 #define AVOID_REACQUIRE_GRACE_MS 1000U
 #define AVOID_LEFT_A_SPEED 24
 #define AVOID_LEFT_B_SPEED 35
