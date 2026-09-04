@@ -603,8 +603,10 @@ static void overlay_dot(uint8_t *frame,
                         int y,
                         uint16_t color)
 {
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
+    /* A 5x5 marker survives the preview's 2:1 downsample and remains a
+     * small point rather than a thick path. */
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
             overlay_pixel(frame, width, height, x + dx, y + dy, color);
         }
     }
@@ -617,7 +619,8 @@ static void overlay_cross(uint8_t *frame,
                           int y,
                           uint16_t color)
 {
-    for (int offset = -5; offset <= 5; ++offset) {
+    /* Keep the seed unmistakable after scaling to the 160x128 panel. */
+    for (int offset = -7; offset <= 7; ++offset) {
         overlay_pixel(frame, width, height, x + offset, y, color);
         overlay_pixel(frame, width, height, x, y + offset, color);
     }
@@ -2341,9 +2344,8 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         candidate = true;
         partial_candidate = true;
     }
-    /* Image preview is disabled; avoid copying overlay points on every
-     * control frame.  Keep the old path available if a future display client
-     * explicitly requests it. */
+    /* The low-rate preview consumes this snapshot; the control callback does
+     * not run a second detector or allocate another frame. */
     if (draw_overlay) {
         save_overlay_snapshot(width, height, &observation, 0);
     }
