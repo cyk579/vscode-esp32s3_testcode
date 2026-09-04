@@ -242,6 +242,26 @@ static void scenario_colour_blob(int w)
           "merged blob+line run means the guard did not fire");
 }
 
+/* A shadow/edge block can be darker than a grey tape under uneven lighting.
+ * It is still a distractor when it is farther from the predicted center. */
+static void scenario_dark_edge_distractor(int w)
+{
+    const char *name = "dark-edge-distractor";
+    line_observation_t obs;
+    fill_frame(240, 240, 240);
+    draw_segment(LINE_X, FRAME_H - 1, LINE_X, 36, w, 38, 38, 38);
+    draw_segment(LINE_X + 50, FRAME_H - 1, LINE_X + 50, 36, w, 0, 0, 0);
+    run_case(name, w, &obs, false);
+    check(name, "candidate", obs.candidate,
+          "dark edge block stole the line seed");
+    check(name, "seed follows tape", abs(obs.seed_x - LINE_X) <= 8,
+          "darkness overrode the predicted track position");
+    check(name, "rows>=18", obs.valid_rows >= 18,
+          "distractor caused an early track break");
+    check(name, "confidence=100", obs.confidence == 100,
+          "confidence overflowed before uint8 conversion");
+}
+
 /* 混控层单元测试：等比缩放必须保方向，反解必须能还原车体意图。 */
 static line_mixer_cfg_t mixer_cfg(void)
 {
@@ -554,6 +574,7 @@ int main(int argc, char **argv)
         scenario_corner(w, +1);
         scenario_finish_t(w);
         scenario_colour_blob(w);
+        scenario_dark_edge_distractor(w);
         scenario_signs(w);
         scenario_rotation(w);
     }

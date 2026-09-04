@@ -121,6 +121,18 @@ typedef struct {
 
 static const char *TAG = "camera_display";
 static camera_display_state_t s_display;
+static uint32_t s_mjpeg_drop_log_count;
+
+static void log_mjpeg_drop(const char *reason, size_t jpeg_len)
+{
+    const uint32_t count = ++s_mjpeg_drop_log_count;
+    /* A damaged stream can deliver hundreds of bad frames in a row.  Do not
+     * let warning output become another source of control latency. */
+    if (count == 1 || (count % 32U) == 0U) {
+        ESP_LOGW(TAG, "%s (len=%u dropped=%u)", reason,
+                 (unsigned)jpeg_len, (unsigned)count);
+    }
+}
 
 static uint8_t rgb565_luma(const uint8_t *pixel)
 {
@@ -240,6 +252,59 @@ static bool find_complete_jpeg(const uint8_t *data, size_t length,
     return true;
 }
 
+static void log_jpeg_diagnostic(const uint8_t *jpeg, size_t jpeg_len);
+
+/* esp_jpeg_get_image_info() expects a complete baseline header and walks
+ * marker lengths without a separate bounds contract.  Validate the header
+ * here so a truncated UVC payload is discarded before that parser runs. */
+static bool jpeg_has_baseline_header(const uint8_t *jpeg, size_t jpeg_len)
+{
+    if (jpeg == NULL || jpeg_len < 12 || jpeg[0] != 0xff || jpeg[1] != 0xd8 ||
+        jpeg[jpeg_len - 2] != 0xff || jpeg[jpeg_len - 1] != 0xd9) {
+        return false;
+    }
+
+    bool saw_sof0 = false;
+    size_t pos = 2;
+    while (pos + 1 < jpeg_len) {
+        if (jpeg[pos++] != 0xff) {
+            return false;
+        }
+        while (pos < jpeg_len && jpeg[pos] == 0xff) {
+            ++pos;
+        }
+        if (pos >= jpeg_len) {
+            return false;
+        }
+        const uint8_t marker = jpeg[pos++];
+        if (marker == 0xd9) {
+            return false;
+        }
+        if (marker == 0xd8 || (marker >= 0xd0 && marker <= 0xd7) ||
+            marker == 0x01) {
+            continue;
+        }
+        if (pos + 2 > jpeg_len) {
+            return false;
+        }
+        const size_t segment_len = ((size_t)jpeg[pos] << 8) | jpeg[pos + 1];
+        if (segment_len < 2 || pos + segment_len > jpeg_len) {
+            return false;
+        }
+        if (marker == 0xda) { /* SOS: entropy data follows the header. */
+            return saw_sof0;
+        }
+        if (marker == 0xc0) {
+            saw_sof0 = true;
+        } else if (marker == 0xc2) {
+            /* The bundled decoder intentionally supports baseline JPEG only. */
+            return false;
+        }
+        pos += segment_len;
+    }
+    return false;
+}
+
 static void log_jpeg_diagnostic(const uint8_t *jpeg, size_t jpeg_len)
 {
     static bool logged;
@@ -311,11 +376,16 @@ static bool decode_jpeg_to_buffer(const uint8_t *input, size_t input_len,
     size_t offset = 0;
     size_t jpeg_len = 0;
     if (!find_complete_jpeg(input, input_len, &offset, &jpeg_len)) {
-        ESP_LOGW(TAG, "MJPEG frame has no complete JPEG SOI/EOI pair (len=%u)",
-                 (unsigned)input_len);
+        log_mjpeg_drop("MJPEG frame has no complete JPEG SOI/EOI pair", input_len);
         return false;
     }
     const uint8_t *jpeg = input + offset;
+
+    if (!jpeg_has_baseline_header(jpeg, jpeg_len)) {
+        log_mjpeg_drop("Dropping malformed/non-baseline MJPEG frame", jpeg_len);
+        log_jpeg_diagnostic(jpeg, jpeg_len);
+        return false;
+    }
 
     esp_jpeg_image_cfg_t info_config = {
         .indata = jpeg,
@@ -326,7 +396,7 @@ static bool decode_jpeg_to_buffer(const uint8_t *input, size_t input_len,
     esp_jpeg_image_output_t source_info = {0};
     esp_err_t err = esp_jpeg_get_image_info(&info_config, &source_info);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "MJPEG header is not a baseline JPEG: %s", esp_err_to_name(err));
+        log_mjpeg_drop("MJPEG header is not a baseline JPEG", jpeg_len);
         log_jpeg_diagnostic(jpeg, jpeg_len);
         return false;
     }
@@ -786,6 +856,7 @@ esp_err_t camera_display_start(void)
     s_display.previous_preview_width = 0;
     s_display.previous_preview_height = 0;
     s_display.next_sequence = 0;
+    s_mjpeg_drop_log_count = 0;
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
     s_display.tft_ready = tft_st7735_init();
     if (!s_display.tft_ready) {
@@ -820,8 +891,15 @@ esp_err_t camera_display_start(void)
         }
     }
     for (uint8_t buffer = 0; buffer < CAMERA_CONTROL_BUFFER_COUNT; ++buffer) {
+        /* The detector reads this buffer immediately after decode.  Keeping
+         * it in internal RAM avoids a PSRAM/cache round trip on every pixel;
+         * retain a PSRAM fallback for boards with a smaller DRAM heap. */
         s_display.control_rgb565[buffer] = heap_caps_malloc(
-            CAMERA_CONTROL_RGB565_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            CAMERA_CONTROL_RGB565_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (s_display.control_rgb565[buffer] == NULL) {
+            s_display.control_rgb565[buffer] = heap_caps_malloc(
+                CAMERA_CONTROL_RGB565_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
         if (s_display.control_rgb565[buffer] == NULL ||
             xQueueSend(s_display.free_control_buffers, &buffer, 0) != pdTRUE) {
             ESP_LOGE(TAG, "Could not allocate control RGB565 buffer %u", buffer);

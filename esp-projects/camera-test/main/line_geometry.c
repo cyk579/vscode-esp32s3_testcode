@@ -252,12 +252,13 @@ static bool scan_segment(const uint8_t *frame,
             const int run_luma = (pixel_luma_at(frame, cfg, run_start, y) +
                                   pixel_luma_at(frame, cfg, run_mid, y) +
                                   pixel_luma_at(frame, cfg, run_end, y)) / 3;
-            /* Pure black tape is normally the darkest valid segment. Use
-             * darkness as the primary score and distance only as the tie
-             * breaker, so a dim shadow cannot win over the tape. */
+            /* Stay on the predicted track first.  A black edge/shadow can be
+             * darker than the tape, but it must not steal the seed merely
+             * because its luma is lower.  Darkness is only a tie breaker for
+             * segments at the same predicted position. */
             if (run_width >= min_width && run_width <= max_width &&
-                (run_luma < best_luma ||
-                 (run_luma == best_luma && distance < best_distance))) {
+                (distance < best_distance ||
+                 (distance == best_distance && run_luma < best_luma))) {
                 best_distance = distance;
                 best_luma = run_luma;
                 best_start = run_start;
@@ -478,10 +479,13 @@ bool line_geometry_track(const uint8_t *frame,
     observation->heading_error = clamp_int(heading, 100);
     observation->far_error = line_geometry_error(observation->point_x[far_index],
                                                 width, cfg->mirror_x);
-    observation->confidence = (uint8_t)((point_count * 100) /
-                                       (LINE_MIN_VALID_ROWS + 6));
-    if (observation->confidence > 100) {
-        observation->confidence = 100;
+    /* Clamp before narrowing to uint8_t.  Casting first makes 26 rows look
+     * like confidence=4 (260 modulo 256), which hides detector regressions in
+     * the serial diagnostics. */
+    int confidence = (point_count * 100) / (LINE_MIN_VALID_ROWS + 6);
+    if (confidence > 100) {
+        confidence = 100;
     }
+    observation->confidence = (uint8_t)confidence;
     return true;
 }

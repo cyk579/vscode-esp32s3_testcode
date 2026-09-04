@@ -81,7 +81,7 @@
 #define LINE_START_TRACTION_MS 350U
 #define LINE_LOST_HOLD_MS 600U
 #define LINE_LOST_STOP_MS 3000U
-#define LINE_FRAME_TIMEOUT_MS 1200U
+#define LINE_FRAME_TIMEOUT_MS 1800U
 #define LINE_FINISH_CONFIRM_FRAMES 3U
 /* 终点 T 停车；固定避障路线完成后才会启用。 */
 #define LINE_FINISH_ENABLE 1
@@ -93,11 +93,11 @@
 #define LINE_FORWARD_CRAWL 14
 #define LINE_FORWARD_SLEW 4
 
-/* A two-point partial scan is often a one-frame JPEG/lighting miss, not a
- * genuine loss of the track. Keep the previous steering briefly while the
- * detector catches up, but do not let partial noise extend the line age. */
+/* A short scan miss is often a JPEG/lighting miss, not a genuine loss of the
+ * track. The control callback can arrive below 5 Hz while the decoder is
+ * busy, so the hold is time based rather than frame-count based. */
 #define LINE_PARTIAL_MIN_POINTS 2
-#define LINE_PARTIAL_TRACK_HOLD_MS 450U
+#define LINE_PARTIAL_TRACK_HOLD_MS 900U
 
 /* 误差门限。|error| 被 ROI 夹在 55 以内（center 只能落在 48..191），所以
  * 原来的 LINE_ERROR_LARGE=60 在 NORMAL 里永远不可达，CRAWL 那一档是死的。 */
@@ -124,6 +124,7 @@
 /* 折角：事件行进入画面下方 85% 才动手；更远处只降速，避免提前转弯。 */
 #define LINE_TURN_TRIGGER_PERCENT 85
 #define LINE_TURN_HINT_FRAMES 1U
+#define LINE_WEAK_TURN_HINT_FRAMES 2U
 #define LINE_TURN_EXIT_FRAMES 2U
 /* 旋转至少持续这么久才接受退出，否则第一帧还在看入弯前那条线就会假退出，
  * 然后立刻又检测到同一个折角，来回抖。 */
@@ -389,6 +390,9 @@ static int s_last_far_error;
 static int s_last_corner_direction;
 static int s_last_corner_row_y;
 static bool s_last_near_line_visible;
+static bool s_last_observation_held;
+static line_observation_t s_last_good_observation;
+static int64_t s_last_good_observation_us;
 
 static int s_lat_accum;
 static int s_yaw_accum;
@@ -753,6 +757,12 @@ static int state_search_half_percent(void)
                             (int)s_turn_frames * LINE_CORNER_WINDOW_GROW_PERCENT;
         return percent > LINE_CORNER_WINDOW_MAX_PERCENT ?
                LINE_CORNER_WINDOW_MAX_PERCENT : percent;
+    }
+    if (s_state == LINE_STATE_CORNER && s_post_corner_align) {
+        /* After a pivot the tape can move a full camera half-width between
+         * frames.  Keep the broad corner window during the short re-centering
+         * phase so one weak row does not turn into a false LOST transition. */
+        return LINE_CORNER_WINDOW_MAX_PERCENT;
     }
     if (s_state == LINE_STATE_LOST) {
         const int percent = LINE_SEARCH_HALF_PERCENT +
@@ -1769,6 +1779,9 @@ static void reset_tracking(void)
     s_alert_until_us = 0;
     s_finish_frames = 0;
     s_state = LINE_STATE_NORMAL;
+    s_last_observation_held = false;
+    s_last_good_observation = (line_observation_t){0};
+    s_last_good_observation_us = 0;
 }
 
 static const char *obstacle_state_name(void)
@@ -2185,12 +2198,13 @@ static void maybe_log_summary(int64_t now)
              (unsigned)line_us_avg, (unsigned)s_line_us_max);
     ESP_LOGI(TAG,
              "vision state=%s armed=%d STBY=%d candidate=%d arm_frames=%u lost=%u "
-             "reacq=%u/%u seed_valid=%d threshold=%d seed_x=%d line_w=%d "
+             "held=%d reacq=%u/%u seed_valid=%d threshold=%d seed_x=%d line_w=%d "
              "scan_bottom=%d points=%d valid_rows=%u near_rows=%d confidence=%u "
              "near_line=%d far_error=%d corner=%d@%d pending=%d/%lldms "
              "line_age_ms=%lld avoid=%s dist_x10=%d dist_ok=%d phase_ms=%u ball=%s",
              state_name(), s_armed, s_stby_enabled, s_last_candidate,
              (unsigned)s_arm_frames, (unsigned)s_lost_frames,
+             s_last_observation_held,
              (unsigned)s_reacquire_frames, (unsigned)LINE_REACQUIRE_CONFIRM_FRAMES,
              s_seed_valid, s_last_threshold, s_last_seed_x, s_line_width,
              s_last_scan_bottom_y, s_last_point_count,
@@ -2327,20 +2341,54 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                                                  &observation);
     bool candidate = detector_candidate;
     bool partial_candidate = false;
-    if (!detector_candidate && s_armed && s_state == LINE_STATE_NORMAL &&
-               s_seed_valid &&
+    const bool good_observation = detector_candidate &&
+                                  observation.valid_rows >= LINE_MIN_VALID_ROWS &&
+                                  observation.near_normal_rows >= LINE_PARTIAL_MIN_POINTS &&
+                                  observation.corner_direction == 0 &&
+                                  !observation.finish_candidate;
+    if (good_observation) {
+        s_last_good_observation = observation;
+        s_last_good_observation_us = now;
+    }
+    const bool allow_last_good_hold = s_armed &&
+                                      (s_state == LINE_STATE_NORMAL ||
+                                       (s_state == LINE_STATE_CORNER &&
+                                        s_post_corner_align));
+    if (!detector_candidate && allow_last_good_hold &&
+        s_last_good_observation_us != 0 &&
+        now - s_last_good_observation_us <=
+            (int64_t)LINE_PARTIAL_TRACK_HOLD_MS * 1000) {
+        /* Reuse the complete last-good path when a frame is malformed or the
+         * scan only found a few rows.  Held data is steering-only: stale
+         * geometry must never create a corner or finish event. */
+        const uint8_t current_threshold = source_threshold;
+        observation = s_last_good_observation;
+        observation.threshold = current_threshold;
+        observation.corner_direction = 0;
+        observation.corner_row_y = -1;
+        observation.corner_x = -1;
+        observation.finish_candidate = false;
+        observation.candidate = true;
+        candidate = true;
+        partial_candidate = true;
+    } else if (!detector_candidate && s_armed &&
+               s_state == LINE_STATE_NORMAL && s_seed_valid &&
                observation.point_count >= LINE_PARTIAL_MIN_POINTS &&
                observation.near_normal_rows >= LINE_PARTIAL_MIN_POINTS &&
                s_last_line_us != 0 &&
                now - s_last_line_us <= (int64_t)LINE_PARTIAL_TRACK_HOLD_MS * 1000) {
-        /* Geometry remains strict for arming and corner/finish events. Only
-         * normal steering gets this one-frame grace period. */
+        /* No complete path is available yet. Keep the previous steering for
+         * this partial scan, but do not let its weak shape trigger a corner. */
         observation.candidate = true;
         observation.seed_x = s_seed_x;
         observation.lateral_error = s_last_lateral_error;
         observation.heading_error = s_last_heading_error;
         observation.far_error = s_last_far_error;
         observation.near_line_visible = true;
+        observation.corner_direction = 0;
+        observation.corner_row_y = -1;
+        observation.corner_x = -1;
+        observation.finish_candidate = false;
         candidate = true;
         partial_candidate = true;
     }
@@ -2356,6 +2404,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     s_last_corner_direction = observation.corner_direction;
     s_last_corner_row_y = observation.corner_row_y;
     s_last_near_line_visible = observation.near_line_visible;
+    s_last_observation_held = partial_candidate;
     s_last_threshold = observation.threshold;
     s_last_candidate = candidate;
     s_last_seed_x = observation.valid_rows > 0 ? observation.seed_x : -1;
@@ -2426,15 +2475,18 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                                      observation.corner_direction != 0 &&
                                      observation.corner_row_y >= trigger_y;
             if (next_corner) {
+                const uint8_t hint_required =
+                    observation.valid_rows < LINE_MIN_VALID_ROWS ?
+                    LINE_WEAK_TURN_HINT_FRAMES : LINE_TURN_HINT_FRAMES;
                 if (observation.corner_direction == s_turn_direction) {
-                    if (s_turn_hint_frames < LINE_TURN_HINT_FRAMES) {
+                    if (s_turn_hint_frames < hint_required) {
                         ++s_turn_hint_frames;
                     }
                 } else {
                     s_turn_direction = observation.corner_direction;
                     s_turn_hint_frames = 1;
                 }
-                if (s_turn_hint_frames >= LINE_TURN_HINT_FRAMES) {
+                if (s_turn_hint_frames >= hint_required) {
                     s_post_corner_align = false;
                     s_post_corner_align_frames = 0;
                     s_post_corner_align_started_us = 0;
@@ -2458,14 +2510,15 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 s_turn_direction = 0;
                 s_turn_hint_frames = 0;
             }
-            const bool align_sample = candidate && observation.near_line_visible &&
+            const bool align_sample = candidate && !partial_candidate &&
+                                      observation.near_line_visible &&
                                       observation.corner_direction == 0;
             const bool in_band = align_sample &&
                                  abs(observation.lateral_error) <=
                                      LINE_POST_CORNER_ALIGN_LATERAL_ERROR &&
                                  abs(observation.heading_error) <=
                                      LINE_POST_CORNER_ALIGN_HEADING_ERROR;
-            if (candidate) {
+            if (candidate && !partial_candidate) {
                 s_last_line_us = now;
                 update_seed(&observation);
             }
@@ -2485,7 +2538,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 s_post_corner_align_frames >= LINE_POST_CORNER_ALIGN_FRAMES ||
                 timed_out;
             if (leave_align) {
-                if (timed_out && !candidate) {
+                if (timed_out && (!candidate || partial_candidate)) {
                     /* 超时仍没有新线时交给现有 LOST 重捕获/停车保护，
                      * 不让回中阶段无限期保持电机输出。 */
                     s_post_corner_align = false;
@@ -2730,8 +2783,11 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         const int trigger_y = (int)height * LINE_TURN_TRIGGER_PERCENT / 100;
         if (observation.corner_direction != 0 &&
             observation.corner_row_y >= trigger_y) {
+            const uint8_t hint_required =
+                observation.valid_rows < LINE_MIN_VALID_ROWS ?
+                LINE_WEAK_TURN_HINT_FRAMES : LINE_TURN_HINT_FRAMES;
             if (observation.corner_direction == s_turn_direction) {
-                if (s_turn_hint_frames < LINE_TURN_HINT_FRAMES) {
+                if (s_turn_hint_frames < hint_required) {
                     ++s_turn_hint_frames;
                 }
             } else {
@@ -2740,7 +2796,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 s_turn_pending_until_us = 0;
                 s_corner_center_delay_until_us = 0;
             }
-            if (s_turn_hint_frames >= LINE_TURN_HINT_FRAMES) {
+            if (s_turn_hint_frames >= hint_required) {
                 s_turn_pending_until_us = now +
                                            (int64_t)LINE_TURN_PENDING_MS * 1000;
             }
@@ -3047,6 +3103,7 @@ esp_err_t camera_line_follow_start(void)
     s_last_confidence = 0;
     s_last_threshold = 0;
     s_last_candidate = false;
+    s_last_observation_held = false;
     s_last_seed_x = -1;
     s_last_direction[0] = 0;
     s_last_direction[1] = 0;
