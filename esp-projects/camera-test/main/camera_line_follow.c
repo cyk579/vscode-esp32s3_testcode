@@ -108,8 +108,8 @@
 #define LINE_LAT_MIN_OUTPUT 11
 #define LINE_SEED_SLEW_PX 12
 
-/* 折角：事件行进入画面下方 80% 才动手；更远处只降速，避免提前转弯。 */
-#define LINE_TURN_TRIGGER_PERCENT 80
+/* 折角：事件行进入画面下方 88% 才动手；更远处只降速，避免提前转弯。 */
+#define LINE_TURN_TRIGGER_PERCENT 88
 #define LINE_TURN_HINT_FRAMES 1U
 #define LINE_TURN_EXIT_FRAMES 2U
 /* 旋转至少持续这么久才接受退出，否则第一帧还在看入弯前那条线就会假退出，
@@ -140,8 +140,8 @@
 /* NORMAL 低速用时间脉冲而不是把 PWM 压到静摩擦死区。MIN 只抬 mixer
  * 输入的 forward，绝不逐轮改 A/B/D；esp_timer 只负责切换 duty。 */
 #define LINE_BURST_ENABLE 1
-#define LINE_BURST_PERIOD_MS 800U
-#define LINE_BURST_ON_MS 780U
+#define LINE_BURST_PERIOD_MS 500U
+#define LINE_BURST_ON_MS 480U
 #define LINE_BURST_MIN_OUTPUT 27
 #define LINE_BURST_TICK_MS 5U
 
@@ -191,21 +191,21 @@
 #define ULTRASONIC_ECHO GPIO_NUM_11
 #define ULTRASONIC_MIN_CM 2.0f
 #define ULTRASONIC_MAX_CM 400.0f
-#define OBSTACLE_DETECT_CM 10.0f
+#define OBSTACLE_DETECT_CM 15.0f
 #define OBSTACLE_CLOSE_CONFIRM_SAMPLES 2U
 #define ULTRASONIC_PERIOD_MS 60U
 #define AVOID_BRAKE_MS 500U
 #define AVOID_LEFT_MS 1500U
 #define AVOID_FORWARD_MS 1500U
-#define AVOID_RIGHT_MS 1500U
+#define AVOID_RIGHT_MS 1200U
 #define AVOID_REACQUIRE_GRACE_MS 1000U
-#define AVOID_LEFT_A_SPEED 24
+#define AVOID_LEFT_A_SPEED 26
 #define AVOID_LEFT_B_SPEED 30
 #define AVOID_LEFT_D_SPEED 18
 #define AVOID_RIGHT_A_SPEED 18
 #define AVOID_RIGHT_B_SPEED 30
 #define AVOID_RIGHT_D_SPEED 24
-#define AVOID_FORWARD_A_SPEED 20
+#define AVOID_FORWARD_A_SPEED 22
 #define AVOID_FORWARD_D_SPEED 25
 
 typedef struct {
