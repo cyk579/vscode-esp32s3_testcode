@@ -1104,7 +1104,9 @@ static void ball_drive_spin(int direction, int speed)
 static void ball_drive_charge(bool reverse)
 {
     const int sign = reverse ? -1 : 1;
-    ball_drive_direct(sign * BALL_CHARGE_A_SPEED, 0,
+    /* This chassis moves forward with a negative A command and a positive D
+     * command. Reverse both signs for the return leg. */
+    ball_drive_direct(-sign * BALL_CHARGE_A_SPEED, 0,
                       sign * BALL_CHARGE_D_SPEED);
 }
 
