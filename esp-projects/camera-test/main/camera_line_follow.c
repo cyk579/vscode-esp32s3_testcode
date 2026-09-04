@@ -67,6 +67,10 @@
 #define LINE_ARM_CONFIRM_FRAMES 3U
 #define LINE_MOTOR_START_RAMP_MS 700
 #define LINE_MOTOR_START_MIN_OUTPUT 14
+/* 只在首次 armed 后短暂提高 forward，先克服静摩擦；仍在 mixer 前
+ * 处理，因此不会逐轮改变 A/B/D 比例，也不会重复触发 startup kick。 */
+#define LINE_START_TRACTION_OUTPUT 34
+#define LINE_START_TRACTION_MS 350U
 #define LINE_LOST_HOLD_MS 600U
 #define LINE_LOST_STOP_MS 1800U
 #define LINE_FRAME_TIMEOUT_MS 1200U
@@ -422,6 +426,11 @@ static void remember_lost_search_direction(void)
     if (direction == 0) {
         /* heading_error 的符号与即将进入的弯向一致。 */
         direction = direction_of(s_last_heading_error);
+    }
+    if (direction == 0 && abs(s_last_lateral_error) > LINE_ERROR_DEADBAND) {
+        /* 近场线明显偏向一侧时，优先向线所在侧扫回去；这能避免
+         * yaw dither 恰好输出 0 时落入固定的左侧兜底。 */
+        direction = -direction_of(s_last_lateral_error);
     }
     if (direction == 0) {
         direction = -1;
@@ -947,14 +956,22 @@ static void drive_internal(int forward, int turn, int lat,
         MOTOR_TRIM_A, MOTOR_TRIM_D,
     };
     line_mixer_out_t out = {0, 0, 0, false, false};
+    const int64_t now = esp_timer_get_time();
     s_last_drive_forward = forward;
     s_last_drive_turn = turn;
     s_last_drive_lat = lat;
-    forward = clamp_int(forward, forward_ramp_cap(esp_timer_get_time()));
+    forward = clamp_int(forward, forward_ramp_cap(now));
 #if LINE_BURST_ENABLE
-    if (normal_burst && forward != 0 &&
-        abs(forward) < LINE_BURST_MIN_OUTPUT) {
-        forward = direction_of(forward) * LINE_BURST_MIN_OUTPUT;
+    if (normal_burst && forward != 0) {
+        int minimum = LINE_BURST_MIN_OUTPUT;
+        if (s_motor_start_us != 0 && now >= s_motor_start_us &&
+            now - s_motor_start_us < (int64_t)LINE_START_TRACTION_MS * 1000 &&
+            minimum < LINE_START_TRACTION_OUTPUT) {
+            minimum = LINE_START_TRACTION_OUTPUT;
+        }
+        if (abs(forward) < minimum) {
+            forward = direction_of(forward) * minimum;
+        }
     }
 #endif
     s_last_forward_ramped = forward;
