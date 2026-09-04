@@ -279,23 +279,14 @@ bool line_geometry_track(const uint8_t *frame,
         const bool seed_row = point_count == 0;
         const bool blind_seed = seed_row && !cfg->use_history;
         line_segment_t segment;
-        bool segment_found = scan_segment(frame, cfg, y,
-                                          blind_seed ? -1 : expected,
-                                          blind_seed ? width : half_window,
-                                          w_ref, &segment);
-        if (!segment_found && seed_row && cfg->use_history) {
-            /* 急弯会让上一帧 seed 瞬间失效；底部 seed 行回退整行搜索，
-             * 仍由同一个候选段选择器决定，不另建检测路径。 */
-            segment_found = scan_segment(frame, cfg, y, -1, width,
-                                         w_ref, &segment);
-        }
-        if (!segment_found) {
+        if (!scan_segment(frame, cfg, y, blind_seed ? -1 : expected,
+                          blind_seed ? width : half_window, w_ref, &segment)) {
             /* 底部若干行都允许没找到，之后每个空隙只容忍一行。 */
             if (seed_row && y > seed_floor) {
                 y -= LINE_ROW_STEP;
                 continue;
             }
-            if (!seed_row && misses < LINE_MAX_TRACK_MISSES) {
+            if (!seed_row && misses == 0) {
                 ++misses;
                 y -= LINE_ROW_STEP;
                 continue;
@@ -364,9 +355,9 @@ bool line_geometry_track(const uint8_t *frame,
         observation->seed_x = observation->point_x[0];
     }
     if (point_count < LINE_MIN_VALID_ROWS) {
-        /* 锐角的近场横向投影会吃掉若干扫描行；明确报告了靠近底部的
-         * 单侧支路时允许较少的中心点进入 CORNER，普通运行则由
-         * LINE_MIN_VALID_ROWS 控制最小点数。 */
+        /* 锐角的近场横向投影会吃掉若干扫描行；只要已经有两行
+         * 正常中心点，并且明确报告了靠近底部的单侧支路，就允许
+         * 状态机进入 CORNER/TURN。普通丢线仍严格要求四行。 */
         const int corner_near_y = height * LINE_NEAR_BOTTOM_PERCENT / 100;
         if (observation->corner_direction == 0 ||
             observation->corner_row_y < corner_near_y ||

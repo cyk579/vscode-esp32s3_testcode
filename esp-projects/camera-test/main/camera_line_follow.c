@@ -42,7 +42,7 @@
  * moves the accepted track reference left of the optical center, compensating
  * the measured chassis/camera placement without changing the mixer.
  */
-#define CAMERA_LINE_CENTER_BIAS_PX (-18)
+#define CAMERA_LINE_CENTER_BIAS_PX (-4)
 
 /* 摄像头相对车体的安装旋转。扫描坐标系永远是车体视角（sy 越大越靠近车），
  * 缓冲区按这个值反查，不做整帧旋转拷贝，所以改它不增加单帧耗时。
@@ -52,11 +52,11 @@
 
 /* ROI、行距、逐行搜索和线段判据全部在 line_geometry.h 里，ESP 端和 host
  * 回归测试共用同一组常量。这里只保留状态机自己的窗口策略和时序。 */
-#define LINE_LOST_WINDOW_GROW_PERCENT 4
-#define LINE_LOST_WINDOW_MAX_PERCENT 60
-#define LINE_CORNER_WINDOW_START_PERCENT 40
+#define LINE_LOST_WINDOW_GROW_PERCENT 5
+#define LINE_LOST_WINDOW_MAX_PERCENT 48
+#define LINE_CORNER_WINDOW_START_PERCENT 28
 #define LINE_CORNER_WINDOW_GROW_PERCENT 4
-#define LINE_CORNER_WINDOW_MAX_PERCENT 60
+#define LINE_CORNER_WINDOW_MAX_PERCENT 46
 #define LINE_REACQUIRE_CONFIRM_FRAMES 2U
 
 /* 彩色干扰守卫：赛道板上的深色红球亮度会落进黑线阈值区间，但通道差很大。
@@ -73,7 +73,6 @@
 /* 这些值保留原有的上电、限速、换向保护和超时停车行为。 */
 #define LINE_START_DELAY_MS 600U
 #define LINE_ARM_CONFIRM_FRAMES 3U
-#define LINE_ARM_MIN_VALID_ROWS 4U
 #define LINE_MOTOR_START_RAMP_MS 700
 #define LINE_MOTOR_START_MIN_OUTPUT 14
 /* 只在首次 armed 后短暂提高 forward，先克服静摩擦；仍在 mixer 前
@@ -84,19 +83,15 @@
 #define LINE_LOST_STOP_MS 3000U
 #define LINE_FRAME_TIMEOUT_MS 1200U
 #define LINE_FINISH_CONFIRM_FRAMES 3U
-#define LINE_FINISH_ALIGN_HEADING_ERROR 8
-#define LINE_FINISH_ALIGN_TIMEOUT_MS 1500U
-#define LINE_SOFT_LOST_FRAMES 3U
-#define LINE_OVERLAY_HOLD_FRAMES 4U
 /* 终点 T 停车；固定避障路线完成后才会启用。 */
 #define LINE_FINISH_ENABLE 1
 
-/* 持续巡航速度取 24% 版和 30% 版之间的折中值；起步另有短时增扭脉冲。 */
-#define LINE_FORWARD_FAST 27
-#define LINE_FORWARD_MEDIUM 25
-#define LINE_FORWARD_SLOW 22
-#define LINE_FORWARD_CRAWL 18
-#define LINE_FORWARD_SLEW 8
+/* 22% 是 car-spin 已验证的低速可持续区间；斜坡仍按控制周期平滑上升。 */
+#define LINE_FORWARD_FAST 22
+#define LINE_FORWARD_MEDIUM 20
+#define LINE_FORWARD_SLOW 18
+#define LINE_FORWARD_CRAWL 14
+#define LINE_FORWARD_SLEW 4
 
 /* A two-point partial scan is often a one-frame JPEG/lighting miss, not a
  * genuine loss of the track. Keep the previous steering briefly while the
@@ -106,7 +101,7 @@
 
 /* 误差门限。|error| 被 ROI 夹在 55 以内（center 只能落在 48..191），所以
  * 原来的 LINE_ERROR_LARGE=60 在 NORMAL 里永远不可达，CRAWL 那一档是死的。 */
-#define LINE_ERROR_DEADBAND 14
+#define LINE_ERROR_DEADBAND 12
 #define LINE_ERROR_MEDIUM 25
 #define LINE_ERROR_LARGE 45
 #define LINE_HEADING_DEADBAND 3
@@ -122,7 +117,7 @@
 #define LINE_PID_SCALE 100
 #define LINE_TURN_MAX 13
 #define LINE_YAW_MIN_OUTPUT 13
-#define LINE_LAT_MAX 12
+#define LINE_LAT_MAX 16
 #define LINE_LAT_MIN_OUTPUT 11
 #define LINE_SEED_SLEW_PX 12
 
@@ -368,7 +363,6 @@ static uint8_t s_ball_target_miss_frames;
 static uint8_t s_arm_frames;
 static int64_t s_motor_start_us;
 static uint8_t s_finish_frames;
-static int64_t s_finish_align_start_us;
 static int64_t s_first_frame_us;
 static int64_t s_last_line_us;
 static int64_t s_last_frame_us;
@@ -385,7 +379,6 @@ static uint8_t s_last_valid_rows;
 static uint8_t s_last_confidence;
 static int s_last_threshold;
 static bool s_last_candidate;
-static bool s_last_candidate_held;
 static int s_last_seed_x;
 static uint16_t s_last_frame_width;
 static uint16_t s_last_frame_height;
@@ -425,7 +418,6 @@ static int s_mix_post_b;
 static int s_mix_post_d;
 static bool s_mix_scaled;
 static bool s_mix_dropped;
-static bool s_mix_repaired;
 
 static int s_turn_direction;
 static int s_lost_search_direction;
@@ -446,10 +438,6 @@ static int s_command_b;
 static int s_command_d;
 static int s_last_direction[3];
 static uint8_t s_kick_cycles[3];
-static line_observation_t s_last_good_observation;
-static bool s_have_last_good_observation;
-static uint8_t s_candidate_miss_frames;
-static uint8_t s_overlay_miss_frames;
 
 #if LINE_BURST_ENABLE
 static esp_timer_handle_t s_burst_timer;
@@ -673,21 +661,13 @@ static void save_overlay_snapshot(uint16_t width, uint16_t height,
     if (xSemaphoreTake(s_overlay_mutex, 0) != pdTRUE) {
         return;
     }
-    if (observation->point_count <= 0) {
-        /* 保留最近一组真实点几个控制周期，避免一次阈值抖动就让 TFT
-         * 突然变成没有绿点；超过保持窗口后再明确清空。 */
-        if (s_overlay_snapshot.valid) {
-            if (s_overlay_miss_frames < UINT8_MAX) {
-                ++s_overlay_miss_frames;
-            }
-            if (s_overlay_miss_frames > LINE_OVERLAY_HOLD_FRAMES) {
-                s_overlay_snapshot.valid = false;
-            }
-        }
+    /* Keep the last usable overlay through a detector miss. Clearing it here
+     * made the TFT appear to stop updating exactly when the car lost the line,
+     * which hid the evidence needed to tune the controller. */
+    if (observation->point_count == 0) {
         (void)xSemaphoreGive(s_overlay_mutex);
         return;
     }
-    s_overlay_miss_frames = 0;
     s_overlay_snapshot.valid = true;
     s_overlay_snapshot.control_width = width;
     s_overlay_snapshot.control_height = height;
@@ -825,6 +805,8 @@ static bool observe_line(uint8_t *frame,
         const int signed_bias = CAMERA_LINE_MIRROR_X ? -bias : bias;
         observation->lateral_error = clamp_int(observation->lateral_error +
                                                signed_bias, 100);
+        observation->far_error = clamp_int(observation->far_error +
+                                           signed_bias, 100);
     }
     if (draw_overlay) {
         render_tracking_overlay(frame, &cfg, observation);
@@ -1110,7 +1092,6 @@ static void drive_internal(int forward, int turn, int lat,
     s_mix_pre_b = turn + 2 * lat;
     s_mix_pre_d = forward_d - turn + lat;
     line_mixer_solve(forward, turn, lat, &cfg, &out);
-    s_mix_repaired = false;
     s_command_a = out.a;
     s_command_b = out.b;
     s_command_d = out.d;
@@ -1173,7 +1154,6 @@ static void drive_slow_spin(int turn)
     s_mix_post_d = d;
     s_mix_scaled = false;
     s_mix_dropped = false;
-    s_mix_repaired = false;
     s_command_a = a;
     s_command_b = b;
     s_command_d = d;
@@ -1747,15 +1727,11 @@ static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
     }
 }
 
-static void reset_control(bool reset_forward)
+static void reset_control(void)
 {
     s_lat_accum = 0;
     s_yaw_accum = 0;
-    /* State transitions must not make a moving car restart its forward ramp.
-     * Only arm/disarm paths request a fresh starting value. */
-    if (reset_forward) {
-        s_forward_output = LINE_MOTOR_START_MIN_OUTPUT;
-    }
+    s_forward_output = 0;
     s_turn_output = 0;
     s_error_filter_initialized = false;
     s_lateral_control_error = 0;
@@ -1766,7 +1742,7 @@ static void reset_control(bool reset_forward)
 
 static void reset_tracking(void)
 {
-    reset_control(true);
+    reset_control();
     s_seed_valid = false;
     s_seed_x = 0;
     s_line_width = 0;
@@ -1786,11 +1762,6 @@ static void reset_tracking(void)
     s_turn_started_us = 0;
     s_alert_until_us = 0;
     s_finish_frames = 0;
-    s_finish_align_start_us = 0;
-    s_have_last_good_observation = false;
-    s_candidate_miss_frames = 0;
-    s_overlay_miss_frames = 0;
-    s_last_candidate_held = false;
     s_state = LINE_STATE_NORMAL;
 }
 
@@ -1861,7 +1832,7 @@ static void obstacle_begin(int64_t now)
      * timed route cannot remain stuck at the brake phase with STBY low. */
     gpio_set_level(STBY_GPIO, 1);
     s_stby_enabled = true;
-    reset_control(false);
+    reset_control();
     zero_motor_outputs();
     ESP_LOGW(TAG, "obstacle %.1fcm confirmed; fixed avoidance route started",
              (double)s_ultrasonic_distance_cm);
@@ -2207,13 +2178,12 @@ static void maybe_log_summary(int64_t now)
              (unsigned)pipeline.tft_us,
              (unsigned)line_us_avg, (unsigned)s_line_us_max);
     ESP_LOGI(TAG,
-             "vision state=%s armed=%d STBY=%d candidate=%d held=%d arm_frames=%u lost=%u "
+             "vision state=%s armed=%d STBY=%d candidate=%d arm_frames=%u lost=%u "
              "reacq=%u/%u seed_valid=%d threshold=%d seed_x=%d line_w=%d "
              "scan_bottom=%d points=%d valid_rows=%u near_rows=%d confidence=%u "
              "near_line=%d far_error=%d corner=%d@%d pending=%d/%lldms "
              "line_age_ms=%lld avoid=%s dist_x10=%d dist_ok=%d phase_ms=%u ball=%s",
              state_name(), s_armed, s_stby_enabled, s_last_candidate,
-             s_last_candidate_held,
              (unsigned)s_arm_frames, (unsigned)s_lost_frames,
              (unsigned)s_reacquire_frames, (unsigned)LINE_REACQUIRE_CONFIRM_FRAMES,
              s_seed_valid, s_last_threshold, s_last_seed_x, s_line_width,
@@ -2229,7 +2199,7 @@ static void maybe_log_summary(int64_t now)
              "lat[raw,filtered,delta,cmd]=[%d,%d,%d,%d] "
              "head[raw,filtered,delta,cmd]=[%d,%d,%d,%d] "
              "mix_pre[A,B,D]=[%d,%d,%d] mix_post[A,B,D]=[%d,%d,%d] "
-             "scaled=%d dropped=%d repaired=%d kick[A,B,D]=[%u,%u,%u] "
+             "scaled=%d dropped=%d kick[A,B,D]=[%u,%u,%u] "
              "dir[A,B,D]=[%d,%d,%d] motor[A,B,D]=[%d,%d,%d]",
              s_last_forward_target, s_last_forward_ramped,
              s_last_drive_forward, s_last_drive_turn, s_last_drive_lat,
@@ -2238,7 +2208,7 @@ static void maybe_log_summary(int64_t now)
              s_last_heading_delta, s_last_drive_turn,
              s_mix_pre_a, s_mix_pre_b, s_mix_pre_d,
              s_mix_post_a, s_mix_post_b, s_mix_post_d,
-             s_mix_scaled, s_mix_dropped, s_mix_repaired,
+             s_mix_scaled, s_mix_dropped,
              (unsigned)s_kick_cycles[0], (unsigned)s_kick_cycles[1],
              (unsigned)s_kick_cycles[2], s_last_direction[0],
              s_last_direction[1], s_last_direction[2],
@@ -2346,25 +2316,19 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     if (s_state == LINE_STATE_LOST && s_lost_frames < UINT32_MAX) {
         ++s_lost_frames;
     }
-    const bool detected_candidate = observe_line(rgb565_big_endian, width, height,
+    const bool detector_candidate = observe_line(rgb565_big_endian, width, height,
                                                  source_threshold, draw_overlay,
                                                  &observation);
-    bool candidate = detected_candidate;
-    bool held_candidate = false;
-    if (detected_candidate) {
-        s_last_good_observation = observation;
-        s_have_last_good_observation = true;
-        s_candidate_miss_frames = 0;
-    } else if (s_armed && s_state == LINE_STATE_NORMAL &&
-               !turn_pending_active(now) && s_seed_valid &&
+    bool candidate = detector_candidate;
+    bool partial_candidate = false;
+    if (!detector_candidate && s_armed && s_state == LINE_STATE_NORMAL &&
+               s_seed_valid &&
                observation.point_count >= LINE_PARTIAL_MIN_POINTS &&
                observation.near_normal_rows >= LINE_PARTIAL_MIN_POINTS &&
                s_last_line_us != 0 &&
-               now - s_last_line_us <= (int64_t)LINE_PARTIAL_TRACK_HOLD_MS * 1000 &&
-               s_candidate_miss_frames < LINE_SOFT_LOST_FRAMES) {
-        /* A partial scan is usually a one-frame JPEG/lighting miss. Keep the
-         * previous control error while showing the real points that were found. */
-        ++s_candidate_miss_frames;
+               now - s_last_line_us <= (int64_t)LINE_PARTIAL_TRACK_HOLD_MS * 1000) {
+        /* Geometry remains strict for arming and corner/finish events. Only
+         * normal steering gets this one-frame grace period. */
         observation.candidate = true;
         observation.seed_x = s_seed_x;
         observation.lateral_error = s_last_lateral_error;
@@ -2372,25 +2336,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         observation.far_error = s_last_far_error;
         observation.near_line_visible = true;
         candidate = true;
-        held_candidate = true;
-    } else if (s_armed && s_state == LINE_STATE_NORMAL &&
-               !turn_pending_active(now) && s_have_last_good_observation &&
-               s_candidate_miss_frames < LINE_SOFT_LOST_FRAMES) {
-        /* A single threshold/aliasing miss must not immediately remove the
-         * line from control or the TFT. Reuse only the last real observation
-         * for a few frames, with corner events disabled so it cannot retrigger
-         * a turn from stale data. */
-        ++s_candidate_miss_frames;
-        observation = s_last_good_observation;
-        observation.corner_direction = 0;
-        observation.corner_row_y = -1;
-        observation.corner_x = -1;
-        observation.finish_candidate = false;
-        observation.candidate = true;
-        candidate = true;
-        held_candidate = true;
-    } else if (!detected_candidate && s_candidate_miss_frames < UINT8_MAX) {
-        ++s_candidate_miss_frames;
+        partial_candidate = true;
     }
     /* Image preview is disabled; avoid copying overlay points on every
      * control frame.  Keep the old path available if a future display client
@@ -2406,8 +2352,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     s_last_corner_row_y = observation.corner_row_y;
     s_last_near_line_visible = observation.near_line_visible;
     s_last_threshold = observation.threshold;
-    s_last_candidate = detected_candidate;
-    s_last_candidate_held = held_candidate;
+    s_last_candidate = candidate;
     s_last_seed_x = observation.valid_rows > 0 ? observation.seed_x : -1;
     s_last_valid_rows = observation.valid_rows;
     s_last_confidence = observation.confidence;
@@ -2417,16 +2362,14 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     }
 
     if (!s_armed) {
-        if (detected_candidate &&
-            observation.valid_rows >= LINE_ARM_MIN_VALID_ROWS &&
-            now - s_first_frame_us >= (int64_t)LINE_START_DELAY_MS * 1000) {
+        if (candidate && now - s_first_frame_us >= (int64_t)LINE_START_DELAY_MS * 1000) {
             if (s_arm_frames < LINE_ARM_CONFIRM_FRAMES) {
                 ++s_arm_frames;
             }
             if (s_arm_frames >= LINE_ARM_CONFIRM_FRAMES) {
                 s_armed = true;
                 s_state = LINE_STATE_NORMAL;
-                reset_control(true);
+                reset_control();
                 update_seed(&observation);
                 s_last_line_us = now;
                 s_motor_start_us = now;
@@ -2434,8 +2377,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 s_stby_enabled = true;
                 ESP_LOGI(TAG, "line confirmed; camera steering enabled");
             }
-        } else if (!detected_candidate ||
-                   observation.valid_rows < LINE_ARM_MIN_VALID_ROWS) {
+        } else if (!candidate) {
             s_arm_frames = 0;
         }
         if (!s_armed) {
@@ -2446,53 +2388,26 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         goto done;
     }
 
-    /* Obstacle motion owns the motors until the fixed right shift is complete.
-     * The current frame is still scanned above for the TFT overlay, but its
-     * candidate cannot alter the line state or interrupt the manoeuvre. */
     /* ---- 终点 T：双侧敞开的横杆 + 下方仍有立柱 ---- */
     if (!observation.finish_candidate) {
         s_finish_frames = 0;
-    } else if (LINE_FINISH_ENABLE && candidate &&
+    } else if (LINE_FINISH_ENABLE && s_obstacle_completed && candidate &&
                s_state == LINE_STATE_NORMAL) {
-        if (s_finish_align_start_us == 0) {
-            s_finish_align_start_us = now;
+        if (s_finish_frames < LINE_FINISH_CONFIRM_FRAMES) {
+            ++s_finish_frames;
         }
-        const bool heading_aligned = observation.near_line_visible &&
-                                     abs(observation.heading_error) <=
-                                         LINE_FINISH_ALIGN_HEADING_ERROR;
-        if (heading_aligned) {
-            if (s_finish_frames < LINE_FINISH_CONFIRM_FRAMES) {
-                ++s_finish_frames;
-            }
-        } else {
-            s_finish_frames = 0;
-        }
-
-        const int64_t align_us = now - s_finish_align_start_us;
-        if (s_finish_frames >= LINE_FINISH_CONFIRM_FRAMES ||
-            align_us >= (int64_t)LINE_FINISH_ALIGN_TIMEOUT_MS * 1000) {
+        if (s_finish_frames >= LINE_FINISH_CONFIRM_FRAMES) {
             s_finished = true;
             s_state = LINE_STATE_NORMAL;
             stop_motors();
             ball_begin(now);
-            ESP_LOGW(TAG, "finish T stopped at row %d; heading=%d aligned=%d",
-                     observation.corner_row_y, observation.heading_error,
-                     heading_aligned);
+            ESP_LOGW(TAG, "finish T confirmed at row %d; ball task started",
+                     observation.corner_row_y);
             goto done;
         }
-        /* Keep the T stem as the forward reference.  Ignore the lateral
-         * offset used for normal tracking so the nose, rather than the
-         * camera's optical center, is aligned before stopping. */
-        line_observation_t finish_control = observation;
-        finish_control.lateral_error = 0;
-        finish_control.far_error = 0;
-        finish_control.corner_direction = 0;
-        finish_control.finish_candidate = true;
-        drive_normal(&finish_control, now);
+        /* 确认期间继续爬行，让车停在横杆上而不是提前刹住。 */
+        drive(LINE_FORWARD_CRAWL, 0, 0);
         goto done;
-    } else {
-        s_finish_frames = 0;
-        s_finish_align_start_us = 0;
     }
 
     /* ---- 折角：绕摄像头原地旋转，用近场闭环退出 ---- */
@@ -2527,7 +2442,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                     s_lost_frames = 0;
                     s_reacquire_frames = 0;
                     s_last_line_us = now;
-                    reset_control(false);
+                    reset_control();
                     ESP_LOGI(TAG,
                              "next corner %s detected during align; pivoting",
                              s_turn_direction < 0 ? "left" : "right");
@@ -2582,7 +2497,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                     s_turn_started_us = 0;
                     s_corner_center_delay_until_us = 0;
                     s_turn_pending_until_us = 0;
-                    reset_control(false);
+                    reset_control();
                     zero_motor_outputs();
                     ESP_LOGW(TAG,
                              "post-corner align timeout without line; "
@@ -2602,7 +2517,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 s_lost_frames = 0;
                 s_reacquire_frames = 0;
                 s_last_line_us = now;
-                reset_control(false);
+                reset_control();
                 if (timed_out && !in_band) {
                     ESP_LOGW(TAG,
                              "post-corner align timeout; resuming NORMAL "
@@ -2673,7 +2588,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
             s_reacquire_frames = 0;
             s_last_line_us = now;
             update_seed(&observation);
-            reset_control(false);
+            reset_control();
             ESP_LOGI(TAG, "turn complete; post-corner align start at ey=%d",
                      observation.lateral_error);
             /* CORNER 的轮向与回中前进不同。只屏蔽这一次切换产生的 kick，
@@ -2741,7 +2656,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 update_seed(&observation);
                 s_last_line_us = now;
                 s_obstacle_reacquire_until_us = 0;
-                reset_control(false);
+                reset_control();
                 drive_normal(&observation, now);
                 goto done;
             }
@@ -2789,7 +2704,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         s_turn_started_us = now;
         s_turn_pending_until_us = 0;
         s_corner_center_delay_until_us = 0;
-        reset_control(false);
+        reset_control();
         ESP_LOGI(TAG, "corner %s center delay complete; pivoting",
                  s_turn_direction < 0 ? "left" : "right");
         drive_slow_spin(-s_turn_direction * LINE_PIVOT_TURN);
@@ -2801,7 +2716,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         s_obstacle_reacquire_until_us = 0;
         s_lost_frames = 0;
         s_reacquire_frames = 0;
-        if (!held_candidate) {
+        if (!partial_candidate) {
             s_last_line_us = now;
             update_seed(&observation);
         }
@@ -2849,7 +2764,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     s_lost_frames = 1;
     s_reacquire_frames = 0;
     s_reacquire_x = s_seed_x;
-    reset_control(false);
+    reset_control();
     {
         const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
         const bool obstacle_grace = s_obstacle_reacquire_until_us != 0 &&
@@ -3134,7 +3049,6 @@ esp_err_t camera_line_follow_start(void)
     s_kick_cycles[0] = 0;
     s_kick_cycles[1] = 0;
     s_kick_cycles[2] = 0;
-    s_mix_repaired = false;
     s_summary_start_us = 0;
     s_summary_camera_frames = 0;
     s_summary_processed_frames = 0;
