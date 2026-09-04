@@ -72,7 +72,7 @@
 #define LINE_START_TRACTION_OUTPUT 34
 #define LINE_START_TRACTION_MS 350U
 #define LINE_LOST_HOLD_MS 600U
-#define LINE_LOST_STOP_MS 1800U
+#define LINE_LOST_STOP_MS 3000U
 #define LINE_FRAME_TIMEOUT_MS 1200U
 #define LINE_FINISH_CONFIRM_FRAMES 3U
 /* 终点 T 停车；固定避障路线完成后才会启用。 */
@@ -138,7 +138,11 @@
 #define LINE_CORNER_CENTER_DELAY_MS 200U
 /* 普通丢线时按最近转向方向低速扫线；每隔一小段时间换向，避免卡在
  * 台阶弯的内侧。避障完成后的 grace 期间仍使用直行重捕获。 */
-#define LINE_LOST_SEARCH_SWITCH_MS 450U
+#define LINE_LOST_SEARCH_SWITCH_MS 600U
+#define LINE_LOST_SEARCH_GROW_MS 180U
+#define LINE_LOST_SEARCH_MAX_MS 1000U
+/* +1 is converted to turn=-LINE_PIVOT_TURN below, i.e. physical right. */
+#define LINE_LOST_DEFAULT_DIRECTION 1
 /* 低速调试时优先保证三轮都超过各自起转阈值；此前叠加 40% 横移后，
  * 在较低总上限下 A/D 被缩放掉，锐角阶段实际只剩 B 轮。 */
 #define LINE_CAM_PIVOT_PERCENT 0
@@ -200,7 +204,7 @@
 #define ULTRASONIC_MAX_CM 400.0f
 #define OBSTACLE_DETECT_CM 20.0f
 #define OBSTACLE_CLOSE_CONFIRM_SAMPLES 2U
-#define ULTRASONIC_PERIOD_MS 60U
+#define ULTRASONIC_PERIOD_MS 50U
 #define AVOID_BRAKE_MS 500U
 #define AVOID_LEFT_MS 1500U
 #define AVOID_FORWARD_MS 1500U
@@ -247,11 +251,9 @@ static bool s_finished;
 static bool s_stby_enabled;
 static volatile float s_ultrasonic_distance_cm = -1.0f;
 static volatile bool s_ultrasonic_valid;
-static volatile uint32_t s_ultrasonic_sequence;
 static bool s_ultrasonic_task_created;
 static obstacle_state_t s_obstacle_state;
-static uint32_t s_obstacle_close_samples;
-static uint32_t s_obstacle_last_sequence;
+static volatile uint32_t s_obstacle_close_samples;
 static int64_t s_obstacle_phase_start_us;
 static int64_t s_obstacle_reacquire_until_us;
 static bool s_obstacle_completed;
@@ -383,6 +385,7 @@ static SemaphoreHandle_t s_overlay_mutex;
 
 static void camera_line_follow_watchdog_task(void *arg);
 static void camera_ultrasonic_task(void *arg);
+static void obstacle_begin(int64_t now);
 #if LINE_CALIB_MODE
 static void camera_line_calibration_task(void *arg);
 #endif
@@ -414,28 +417,13 @@ static int direction_of(int value)
     return (value > 0) - (value < 0);
 }
 
-/* 在进入 LOST 前记住应该先扫向哪一侧。corner detector 已给出方向时优先
- * 使用它；否则由上一帧的 yaw 命令反推（turn 命令与 corner 方向相反），
- * 再没有信息时从左侧开始。 */
+/* LOST 不沿用可能过期的 yaw/lateral 符号，默认先向右扫，随后按时间
+ * 交替扩大左右搜索范围。 */
 static void remember_lost_search_direction(void)
 {
-    int direction = s_turn_direction;
-    if (direction == 0) {
-        direction = -direction_of(s_last_drive_turn);
-    }
-    if (direction == 0) {
-        /* heading_error 的符号与即将进入的弯向一致。 */
-        direction = direction_of(s_last_heading_error);
-    }
-    if (direction == 0 && abs(s_last_lateral_error) > LINE_ERROR_DEADBAND) {
-        /* 近场线明显偏向一侧时，优先向线所在侧扫回去；这能避免
-         * yaw dither 恰好输出 0 时落入固定的左侧兜底。 */
-        direction = -direction_of(s_last_lateral_error);
-    }
-    if (direction == 0) {
-        direction = -1;
-    }
-    s_lost_search_direction = direction;
+    /* LOST 的第一扫固定向右；即使上一帧残留了旧的 corner/yaw 方向，
+     * 也不让它把首个搜索方向锁死在左侧。 */
+    s_lost_search_direction = LINE_LOST_DEFAULT_DIRECTION;
 }
 
 static int lost_search_turn_command(int64_t lost_us)
@@ -446,12 +434,31 @@ static int lost_search_turn_command(int64_t lost_us)
         direction = s_lost_search_direction;
     }
 
-    const uint64_t switch_us = (uint64_t)(LINE_LOST_SEARCH_SWITCH_MS == 0 ?
-                                          1U : LINE_LOST_SEARCH_SWITCH_MS) * 1000U;
     const uint64_t hold_us = (uint64_t)LINE_LOST_HOLD_MS * 1000U;
-    const uint64_t search_age_us = lost_us > (int64_t)hold_us ?
-                                   (uint64_t)lost_us - hold_us : 0U;
-    if (lost_us >= 0 && (search_age_us / switch_us) & 1U) {
+    uint64_t search_age_us = lost_us > (int64_t)hold_us ?
+                             (uint64_t)lost_us - hold_us : 0U;
+    const uint64_t search_limit_us = (uint64_t)LINE_LOST_STOP_MS * 1000U;
+    if (search_age_us > search_limit_us) {
+        search_age_us = search_limit_us;
+    }
+
+    /* 每个方向的扫线时间逐次增加，避免锐角弯只扫到很小的角度就停车。 */
+    uint32_t sweep_ms = LINE_LOST_SEARCH_SWITCH_MS == 0 ? 1U :
+                        LINE_LOST_SEARCH_SWITCH_MS;
+    const uint32_t sweep_grow_ms = LINE_LOST_SEARCH_GROW_MS;
+    const uint32_t sweep_max_ms = LINE_LOST_SEARCH_MAX_MS < sweep_ms ?
+                                  sweep_ms : LINE_LOST_SEARCH_MAX_MS;
+    unsigned sweep = 0;
+    while (search_age_us >= (uint64_t)sweep_ms * 1000U && sweep < 16U) {
+        search_age_us -= (uint64_t)sweep_ms * 1000U;
+        ++sweep;
+        if (sweep_ms < sweep_max_ms) {
+            const uint32_t next = sweep_ms + sweep_grow_ms;
+            sweep_ms = next < sweep_ms || next > sweep_max_ms ?
+                       sweep_max_ms : next;
+        }
+    }
+    if (sweep & 1U) {
         direction = -direction;
     }
     /* drive_slow_spin 使用已校准的低速三轮输出，这里只需要传递方向。 */
@@ -1149,26 +1156,6 @@ static void obstacle_drive_direct(int a, int b, int d)
     motor_set(&motor_d, d);
 }
 
-static void obstacle_update_sensor(void)
-{
-    const uint32_t sequence = s_ultrasonic_sequence;
-    if (sequence == s_obstacle_last_sequence) {
-        return;
-    }
-    s_obstacle_last_sequence = sequence;
-    const float distance = s_ultrasonic_distance_cm;
-    const bool close = s_ultrasonic_valid &&
-                       distance >= ULTRASONIC_MIN_CM &&
-                       distance <= OBSTACLE_DETECT_CM;
-    if (close) {
-        if (s_obstacle_close_samples < UINT32_MAX) {
-            ++s_obstacle_close_samples;
-        }
-    } else {
-        s_obstacle_close_samples = 0;
-    }
-}
-
 static void obstacle_begin(int64_t now)
 {
     s_obstacle_state = OBSTACLE_BRAKE;
@@ -1201,8 +1188,6 @@ static void obstacle_finish(int64_t now, uint16_t width)
 /* Return true while the fixed obstacle route owns the motors. */
 static bool obstacle_step(int64_t now, uint16_t width)
 {
-    obstacle_update_sensor();
-
     if (s_obstacle_state == OBSTACLE_IDLE) {
         if (s_obstacle_close_samples >= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
             obstacle_begin(now);
@@ -2124,7 +2109,29 @@ static void camera_ultrasonic_task(void *arg)
                            distance <= ULTRASONIC_MAX_CM;
         s_ultrasonic_distance_cm = valid ? distance : -1.0f;
         s_ultrasonic_valid = valid;
-        ++s_ultrasonic_sequence;
+        const bool close = valid && distance <= OBSTACLE_DETECT_CM;
+        if (!s_armed || s_finished) {
+            s_obstacle_close_samples = 0;
+        } else if (close) {
+            if (s_obstacle_close_samples < UINT32_MAX) {
+                ++s_obstacle_close_samples;
+            }
+        } else {
+            s_obstacle_close_samples = 0;
+        }
+
+        /* The sensor task can stop the car as soon as the second close sample
+         * arrives.  The camera callback remains a fallback when it owns the
+         * control mutex. */
+        if (s_obstacle_close_samples >= OBSTACLE_CLOSE_CONFIRM_SAMPLES &&
+            s_control_mutex != NULL &&
+            xSemaphoreTake(s_control_mutex, 0) == pdTRUE) {
+            if (s_started && s_armed && s_stby_enabled &&
+                s_obstacle_state == OBSTACLE_IDLE && !s_finished) {
+                obstacle_begin(esp_timer_get_time());
+            }
+            (void)xSemaphoreGive(s_control_mutex);
+        }
         vTaskDelay(pdMS_TO_TICKS(ULTRASONIC_PERIOD_MS));
     }
 }
@@ -2224,10 +2231,8 @@ esp_err_t camera_line_follow_start(void)
     s_stby_enabled = false;
     s_ultrasonic_distance_cm = -1.0f;
     s_ultrasonic_valid = false;
-    s_ultrasonic_sequence = 0;
     s_obstacle_state = OBSTACLE_IDLE;
     s_obstacle_close_samples = 0;
-    s_obstacle_last_sequence = 0;
     s_obstacle_phase_start_us = 0;
     s_obstacle_reacquire_until_us = 0;
     s_obstacle_completed = false;
