@@ -132,6 +132,9 @@
 #define LINE_TURN_PENDING_MS 500U
 /* 摄像头在底盘前方：旧线消失并确认要转弯后，先让底盘向前走一小段。 */
 #define LINE_CORNER_CENTER_DELAY_MS 200U
+/* 普通丢线时按最近转向方向低速扫线；每隔一小段时间换向，避免卡在
+ * 台阶弯的内侧。避障完成后的 grace 期间仍使用直行重捕获。 */
+#define LINE_LOST_SEARCH_SWITCH_MS 450U
 /* 低速调试时优先保证三轮都超过各自起转阈值；此前叠加 40% 横移后，
  * 在较低总上限下 A/D 被缩放掉，锐角阶段实际只剩 B 轮。 */
 #define LINE_CAM_PIVOT_PERCENT 0
@@ -308,6 +311,7 @@ static bool s_mix_scaled;
 static bool s_mix_dropped;
 
 static int s_turn_direction;
+static int s_lost_search_direction;
 static uint8_t s_turn_hint_frames;
 static int64_t s_turn_pending_until_us;
 static int64_t s_corner_center_delay_until_us;
@@ -404,6 +408,45 @@ static int clamp_range(int value, int low, int high)
 static int direction_of(int value)
 {
     return (value > 0) - (value < 0);
+}
+
+/* 在进入 LOST 前记住应该先扫向哪一侧。corner detector 已给出方向时优先
+ * 使用它；否则由上一帧的 yaw 命令反推（turn 命令与 corner 方向相反），
+ * 再没有信息时从左侧开始。 */
+static void remember_lost_search_direction(void)
+{
+    int direction = s_turn_direction;
+    if (direction == 0) {
+        direction = -direction_of(s_last_drive_turn);
+    }
+    if (direction == 0) {
+        /* heading_error 的符号与即将进入的弯向一致。 */
+        direction = direction_of(s_last_heading_error);
+    }
+    if (direction == 0) {
+        direction = -1;
+    }
+    s_lost_search_direction = direction;
+}
+
+static int lost_search_turn_command(int64_t lost_us)
+{
+    int direction = s_lost_search_direction;
+    if (direction == 0) {
+        remember_lost_search_direction();
+        direction = s_lost_search_direction;
+    }
+
+    const uint64_t switch_us = (uint64_t)(LINE_LOST_SEARCH_SWITCH_MS == 0 ?
+                                          1U : LINE_LOST_SEARCH_SWITCH_MS) * 1000U;
+    const uint64_t hold_us = (uint64_t)LINE_LOST_HOLD_MS * 1000U;
+    const uint64_t search_age_us = lost_us > (int64_t)hold_us ?
+                                   (uint64_t)lost_us - hold_us : 0U;
+    if (lost_us >= 0 && (search_age_us / switch_us) & 1U) {
+        direction = -direction;
+    }
+    /* drive_slow_spin 使用已校准的低速三轮输出，这里只需要传递方向。 */
+    return -direction * LINE_PIVOT_TURN;
 }
 
 static bool turn_pending_active(int64_t now)
@@ -1020,6 +1063,7 @@ static void reset_tracking(void)
     s_lost_frames = 0;
     s_reacquire_frames = 0;
     s_reacquire_x = 0;
+    s_lost_search_direction = 0;
     s_turn_direction = 0;
     s_turn_hint_frames = 0;
     s_turn_pending_until_us = 0;
@@ -1138,13 +1182,12 @@ static void obstacle_finish(int64_t now, uint16_t width)
 }
 
 /* Return true while the fixed obstacle route owns the motors. */
-static bool obstacle_step(int64_t now, uint16_t width, bool line_available)
+static bool obstacle_step(int64_t now, uint16_t width)
 {
     obstacle_update_sensor();
 
     if (s_obstacle_state == OBSTACLE_IDLE) {
-        if (!s_obstacle_completed && s_armed && !s_finished && line_available &&
-            s_obstacle_close_samples >= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
+        if (s_obstacle_close_samples >= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
             obstacle_begin(now);
             return true;
         }
@@ -1596,12 +1639,8 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         goto done;
     }
 
-    /* A visible/pending corner has priority over starting obstacle avoidance. */
-    const bool obstacle_line_ready = candidate &&
-                                     s_state == LINE_STATE_NORMAL &&
-                                     observation.corner_direction == 0 &&
-                                     !turn_pending_active(now);
-    if (obstacle_step(now, width, obstacle_line_ready)) {
+    /* Two consecutive close ultrasonic samples are sufficient to take over. */
+    if (obstacle_step(now, width)) {
         goto done;
     }
 
@@ -1662,6 +1701,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                     s_post_corner_align = false;
                     s_post_corner_align_frames = 0;
                     s_post_corner_align_started_us = 0;
+                    remember_lost_search_direction();
                     s_state = LINE_STATE_LOST;
                     s_lost_frames = 1;
                     s_reacquire_frames = 0;
@@ -1779,6 +1819,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         }
         if (s_turn_started_us != 0 &&
             now - s_turn_started_us > (int64_t)LINE_TURN_TIMEOUT_MS * 1000) {
+            remember_lost_search_direction();
             s_state = LINE_STATE_LOST;
             s_lost_frames = 1;
             s_turn_direction = 0;
@@ -1841,14 +1882,20 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                     mirror * direction_of(observation.seed_x - s_seed_x);
                 drive(LINE_FORWARD_CRAWL,
                       -correction * LINE_YAW_MIN_OUTPUT, 0);
-            } else {
+            } else if (obstacle_grace) {
                 drive(LINE_FORWARD_CRAWL, 0, 0);
+            } else {
+                drive_slow_spin(lost_search_turn_command(lost_us));
             }
         } else {
             s_reacquire_frames = 0;
             s_reacquire_x = s_seed_x;
-            if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000 || obstacle_grace) {
+            if (obstacle_grace) {
                 drive(LINE_FORWARD_CRAWL, 0, 0);
+            } else if (lost_us < (int64_t)LINE_LOST_STOP_MS * 1000) {
+                /* 弯中丢线不能继续盲目前进；用已校准的低速原地扫线，
+                 * 直到重捕获或原有停车超时。 */
+                drive_slow_spin(lost_search_turn_command(lost_us));
             } else {
                 zero_motor_outputs();
             }
@@ -1927,6 +1974,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         goto done;
     }
 
+    remember_lost_search_direction();
     s_state = LINE_STATE_LOST;
     s_lost_frames = 1;
     s_reacquire_frames = 0;
@@ -1936,8 +1984,10 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
         const bool obstacle_grace = s_obstacle_reacquire_until_us != 0 &&
                                     now < s_obstacle_reacquire_until_us;
-        if (lost_us <= (int64_t)LINE_LOST_HOLD_MS * 1000 || obstacle_grace) {
+        if (obstacle_grace) {
             drive(LINE_FORWARD_CRAWL, 0, 0);
+        } else if (lost_us < (int64_t)LINE_LOST_STOP_MS * 1000) {
+            drive_slow_spin(lost_search_turn_command(lost_us));
         } else {
             zero_motor_outputs();
             if (lost_us >= (int64_t)LINE_LOST_STOP_MS * 1000) {
