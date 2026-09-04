@@ -6,6 +6,10 @@
 
 #include "../main/camera_line_follow.c"
 
+/* camera_line_follow emits optional endpoint detection messages.  The host
+ * harness does not open a TCP socket, so provide the smallest link-time stub. */
+esp_err_t tcp_server_send(uint8_t *payload, size_t size);
+
 static int64_t s_fake_time_us = 1000000;
 
 int64_t esp_timer_get_time(void) { return s_fake_time_us; }
@@ -58,6 +62,9 @@ void ultrasonic_init(gpio_num_t trig, gpio_num_t echo) { (void)trig; (void)echo;
 float ultrasonic_read_cm(void) { return -1.0f; }
 void camera_display_get_pipeline_stats(camera_display_pipeline_stats_t *stats)
 { memset(stats, 0, sizeof(*stats)); }
+
+esp_err_t tcp_server_send(uint8_t *payload, size_t size)
+{ (void)payload; (void)size; return ESP_OK; }
 
 bool line_geometry_track(const uint8_t *frame, const line_scan_cfg_t *cfg,
                          line_observation_t *observation)
