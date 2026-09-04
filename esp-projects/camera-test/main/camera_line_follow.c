@@ -57,10 +57,10 @@
 #define LINE_SATURATION_MAX 60
 #define LINE_WIDTH_FILTER_OLD 3
 #define LINE_WIDTH_FILTER_NEW 1
-#define LINE_ERROR_FILTER_OLD 4
-#define LINE_ERROR_FILTER_NEW 2
+#define LINE_ERROR_FILTER_OLD 6
+#define LINE_ERROR_FILTER_NEW 1
 #define LINE_PD_KD_LAT 20
-#define LINE_PD_KD_HEADING 25
+#define LINE_PD_KD_HEADING 12
 
 /* 这些值保留原有的上电、限速、换向保护和超时停车行为。 */
 #define LINE_START_DELAY_MS 600U
@@ -103,8 +103,8 @@
 /* 偏航只做粗对正，横移做精修。两个增益都要等实测速度标定。
  * TODO(实测): KP_LAT 按"1 单位 lat 对应多少 cm/s 侧移"标定；
  * TODO(实测): KH 按"1 单位 heading 对应多少度"标定。 */
-#define LINE_PID_KP_LAT 28
-#define LINE_PID_KH 130
+#define LINE_PID_KP_LAT 18
+#define LINE_PID_KH 95
 #define LINE_PID_SCALE 100
 #define LINE_TURN_MAX 13
 #define LINE_YAW_MIN_OUTPUT 13
@@ -158,10 +158,10 @@
 #define LINE_BURST_TICK_MS 5U
 
 /* 直线回中只补一个很小的 yaw，8 个误差单位以内保持死区，避免来回抖动。 */
-#define LINE_CENTER_YAW_DEADBAND 8
-#define LINE_CENTER_YAW_GAIN 10
-#define LINE_CENTER_YAW_MAX 3
-#define LINE_NORMAL_TURN_SLEW 5
+#define LINE_CENTER_YAW_DEADBAND 12
+#define LINE_CENTER_YAW_GAIN 6
+#define LINE_CENTER_YAW_MAX 2
+#define LINE_NORMAL_TURN_SLEW 3
 
 /* 校准模式：置 1 后不跑视觉，直接按脚本输出电机命令并打日志。
  * 把车放在赛道板上（不要架空，静摩擦要真实），看串口 + 卷尺就能得到
@@ -204,21 +204,21 @@
 #define ULTRASONIC_ECHO GPIO_NUM_11
 #define ULTRASONIC_MIN_CM 2.0f
 #define ULTRASONIC_MAX_CM 400.0f
-#define OBSTACLE_DETECT_CM 18.0f
+#define OBSTACLE_DETECT_CM 25.0f
 #define OBSTACLE_CLOSE_CONFIRM_SAMPLES 2U
 /* HC-SR04 practical lower bound; the read routine still performs its own
  * echo timeout, so a missing echo can make the effective period longer. */
 #define ULTRASONIC_PERIOD_MS 20U
 #define AVOID_BRAKE_MS 500U
 #define AVOID_LEFT_MS 1500U
-#define AVOID_FORWARD_MS 1600U
-#define AVOID_RIGHT_MS 1200U
+#define AVOID_FORWARD_MS 2000U
+#define AVOID_RIGHT_MS 1300U
 #define AVOID_REACQUIRE_GRACE_MS 1000U
 #define AVOID_LEFT_A_SPEED 24
 #define AVOID_LEFT_B_SPEED 35
 #define AVOID_LEFT_D_SPEED 18
 #define AVOID_RIGHT_A_SPEED 18
-#define AVOID_RIGHT_B_SPEED 35
+#define AVOID_RIGHT_B_SPEED 38
 #define AVOID_RIGHT_D_SPEED 24
 #define AVOID_FORWARD_A_SPEED 22
 #define AVOID_FORWARD_D_SPEED 27
@@ -1198,8 +1198,7 @@ static void obstacle_finish(int64_t now, uint16_t width)
 static bool obstacle_step(int64_t now, uint16_t width)
 {
     if (s_obstacle_state == OBSTACLE_IDLE) {
-        if (!s_obstacle_completed &&
-            s_obstacle_close_samples >= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
+        if (s_obstacle_close_samples >= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
             obstacle_begin(now);
             return true;
         }
@@ -2182,30 +2181,30 @@ static void camera_ultrasonic_task(void *arg)
         s_ultrasonic_distance_cm = valid ? distance : -1.0f;
         s_ultrasonic_valid = valid;
         const bool close = valid && distance < OBSTACLE_DETECT_CM;
-        if (s_control_mutex != NULL &&
-            xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            /* Ultrasonic confirmation is independent of camera arming.  A
-             * lost/paused camera must not prevent the safety route from
-             * taking ownership of the motors. */
-            if (s_finished) {
-                s_obstacle_close_samples = 0;
-            } else if (close) {
-                if (s_obstacle_close_samples < UINT32_MAX) {
-                    ++s_obstacle_close_samples;
-                }
-                if (s_obstacle_close_samples <= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
-                    ESP_LOGI(TAG, "ultrasonic close sample %u/%u: %.1fcm",
-                             (unsigned)s_obstacle_close_samples,
-                             (unsigned)OBSTACLE_CLOSE_CONFIRM_SAMPLES,
-                             (double)distance);
-                }
-            } else {
-                s_obstacle_close_samples = 0;
+        /* Keep sampling independent from the camera control mutex.  The
+         * param6 implementation did this first; otherwise a camera callback
+         * holding the mutex can discard exactly the samples needed for the
+         * two-sample confirmation. */
+        if (s_finished) {
+            s_obstacle_close_samples = 0;
+        } else if (close) {
+            if (s_obstacle_close_samples < UINT32_MAX) {
+                ++s_obstacle_close_samples;
             }
+            if (s_obstacle_close_samples <= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
+                ESP_LOGI(TAG, "ultrasonic close sample %u/%u: %.1fcm",
+                         (unsigned)s_obstacle_close_samples,
+                         (unsigned)OBSTACLE_CLOSE_CONFIRM_SAMPLES,
+                         (double)distance);
+            }
+        } else {
+            s_obstacle_close_samples = 0;
+        }
 
+        if (s_control_mutex != NULL &&
+            xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
             if (s_started && !s_finished) {
-                if (!s_obstacle_completed &&
-                    s_obstacle_state == OBSTACLE_IDLE &&
+                if (s_obstacle_state == OBSTACLE_IDLE &&
                     s_obstacle_close_samples >= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
                     obstacle_begin(esp_timer_get_time());
                 }
