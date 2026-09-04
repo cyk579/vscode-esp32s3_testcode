@@ -57,10 +57,10 @@
 #define LINE_SATURATION_MAX 60
 #define LINE_WIDTH_FILTER_OLD 3
 #define LINE_WIDTH_FILTER_NEW 1
-#define LINE_ERROR_FILTER_OLD 2
-#define LINE_ERROR_FILTER_NEW 4
+#define LINE_ERROR_FILTER_OLD 6
+#define LINE_ERROR_FILTER_NEW 1
 #define LINE_PD_KD_LAT 20
-#define LINE_PD_KD_HEADING 50
+#define LINE_PD_KD_HEADING 12
 
 /* 这些值保留原有的上电、限速、换向保护和超时停车行为。 */
 #define LINE_START_DELAY_MS 600U
@@ -103,8 +103,8 @@
 /* 偏航只做粗对正，横移做精修。两个增益都要等实测速度标定。
  * TODO(实测): KP_LAT 按"1 单位 lat 对应多少 cm/s 侧移"标定；
  * TODO(实测): KH 按"1 单位 heading 对应多少度"标定。 */
-#define LINE_PID_KP_LAT 45
-#define LINE_PID_KH 130
+#define LINE_PID_KP_LAT 18
+#define LINE_PID_KH 95
 #define LINE_PID_SCALE 100
 #define LINE_TURN_MAX 13
 #define LINE_YAW_MIN_OUTPUT 13
@@ -124,6 +124,7 @@
 /* 出弯后先低速回中，连续稳定若干帧再恢复 NORMAL；超时只作为兜底。 */
 #define LINE_POST_CORNER_ALIGN_LATERAL_ERROR 18
 #define LINE_POST_CORNER_ALIGN_HEADING_ERROR 8
+#define LINE_POST_CORNER_HEADING_PERCENT 25
 #define LINE_POST_CORNER_ALIGN_FRAMES 4U
 #define LINE_POST_CORNER_ALIGN_TIMEOUT_MS 1200U
 /* 绕摄像头旋转：lat = turn * a/(2L)。偏航量必须够大，否则 a/d = lat - turn
@@ -152,14 +153,15 @@
  * 输入的 forward，绝不逐轮改 A/B/D；esp_timer 只负责切换 duty。 */
 #define LINE_BURST_ENABLE 1
 #define LINE_BURST_PERIOD_MS 600U
-#define LINE_BURST_ON_MS 580U
+#define LINE_BURST_ON_MS 540U
 #define LINE_BURST_MIN_OUTPUT 27
 #define LINE_BURST_TICK_MS 5U
 
 /* 直线回中只补一个很小的 yaw，8 个误差单位以内保持死区，避免来回抖动。 */
-#define LINE_CENTER_YAW_DEADBAND 8
-#define LINE_CENTER_YAW_GAIN 18
-#define LINE_CENTER_YAW_MAX 5
+#define LINE_CENTER_YAW_DEADBAND 12
+#define LINE_CENTER_YAW_GAIN 6
+#define LINE_CENTER_YAW_MAX 2
+#define LINE_NORMAL_TURN_SLEW 3
 
 /* 校准模式：置 1 后不跑视觉，直接按脚本输出电机命令并打日志。
  * 把车放在赛道板上（不要架空，静摩擦要真实），看串口 + 卷尺就能得到
@@ -202,19 +204,21 @@
 #define ULTRASONIC_ECHO GPIO_NUM_11
 #define ULTRASONIC_MIN_CM 2.0f
 #define ULTRASONIC_MAX_CM 400.0f
-#define OBSTACLE_DETECT_CM 15.0f
+#define OBSTACLE_DETECT_CM 25.0f
 #define OBSTACLE_CLOSE_CONFIRM_SAMPLES 2U
-#define ULTRASONIC_PERIOD_MS 50U
+/* HC-SR04 practical lower bound; the read routine still performs its own
+ * echo timeout, so a missing echo can make the effective period longer. */
+#define ULTRASONIC_PERIOD_MS 20U
 #define AVOID_BRAKE_MS 500U
 #define AVOID_LEFT_MS 1500U
-#define AVOID_FORWARD_MS 1500U
-#define AVOID_RIGHT_MS 1200U
+#define AVOID_FORWARD_MS 2000U
+#define AVOID_RIGHT_MS 1300U
 #define AVOID_REACQUIRE_GRACE_MS 1000U
 #define AVOID_LEFT_A_SPEED 24
 #define AVOID_LEFT_B_SPEED 35
 #define AVOID_LEFT_D_SPEED 18
 #define AVOID_RIGHT_A_SPEED 18
-#define AVOID_RIGHT_B_SPEED 35
+#define AVOID_RIGHT_B_SPEED 38
 #define AVOID_RIGHT_D_SPEED 24
 #define AVOID_FORWARD_A_SPEED 22
 #define AVOID_FORWARD_D_SPEED 27
@@ -1162,6 +1166,11 @@ static void obstacle_begin(int64_t now)
     s_obstacle_phase_start_us = now;
     s_obstacle_close_samples = 0;
     s_obstacle_reacquire_until_us = 0;
+    /* Obstacle avoidance is allowed to start even when the camera has
+     * disarmed after a frame timeout.  Re-enable TB6612 explicitly so the
+     * timed route cannot remain stuck at the brake phase with STBY low. */
+    gpio_set_level(STBY_GPIO, 1);
+    s_stby_enabled = true;
     reset_control();
     zero_motor_outputs();
     ESP_LOGW(TAG, "obstacle %.1fcm confirmed; fixed avoidance route started",
@@ -1303,6 +1312,16 @@ static void drive_normal_limited(const line_observation_t *observation,
     s_last_heading_filtered = heading_error;
     s_last_heading_delta = s_heading_error_rate;
     s_error_filter_initialized = true;
+    /* Immediately after a pivot, the line can still be visually sloped even
+     * when the near-field track is centered.  Let lateral error dominate the
+     * short alignment phase so the completed turn is not undone. */
+    const int heading_for_steer = s_post_corner_align ?
+                                  heading_error * LINE_POST_CORNER_HEADING_PERCENT / 100 :
+                                  heading_error;
+    const int heading_rate_for_steer = s_post_corner_align ?
+                                       s_heading_error_rate *
+                                           LINE_POST_CORNER_HEADING_PERCENT / 100 :
+                                       s_heading_error_rate;
     /* 正常巡线只用车体转向校正，不用横移硬拉回数学中心线。
      * lateral 正值表示线在左侧，因此折算成负 heading，yaw PD 输出左转。
      * 死区内保留有宽度的中心区域，避免小车左右来回校正。 */
@@ -1315,14 +1334,25 @@ static void drive_normal_limited(const line_observation_t *observation,
                            0 :
                            clamp_int((LINE_CENTER_YAW_GAIN * lateral_error) / 100,
                                      LINE_CENTER_YAW_MAX);
-    const int steer_error = heading_error -
+    const int steer_error = heading_for_steer -
                             (LINE_PID_KP_LAT * lateral_for_steer) /
                             (LINE_PID_KH > 0 ? LINE_PID_KH : 1) - center_yaw;
-    const int steer_rate = s_heading_error_rate -
+    const int steer_rate = heading_rate_for_steer -
                            (LINE_PID_KP_LAT * s_lateral_error_rate) /
                            (LINE_PID_KH > 0 ? LINE_PID_KH : 1);
-    s_turn_output = line_control_yaw_pd(&cfg, steer_error, steer_rate,
-                                        LINE_PD_KD_HEADING, &s_yaw_accum);
+    const int requested_turn = line_control_yaw_pd(&cfg, steer_error, steer_rate,
+                                                    LINE_PD_KD_HEADING,
+                                                    &s_yaw_accum);
+    /* Limit reversals so a noisy frame cannot command an immediate full
+     * steering change.  The motor mixer still applies its calibrated floors. */
+    const int turn_delta = requested_turn - s_turn_output;
+    if (turn_delta > LINE_NORMAL_TURN_SLEW) {
+        s_turn_output += LINE_NORMAL_TURN_SLEW;
+    } else if (turn_delta < -LINE_NORMAL_TURN_SLEW) {
+        s_turn_output -= LINE_NORMAL_TURN_SLEW;
+    } else {
+        s_turn_output = requested_turn;
+    }
     s_lat_accum = 0;
     int forward = s_forward_output;
     if (forward_cap > 0 && forward > forward_cap) {
@@ -1642,7 +1672,8 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         goto done;
     }
 
-    /* Two consecutive close ultrasonic samples are sufficient to take over. */
+    /* Keep obstacle control ahead of finish/corner/lost/NORMAL handling so a
+     * confirmed obstacle immediately owns the motors for the fixed route. */
     if (obstacle_step(now, width)) {
         goto done;
     }
@@ -1671,6 +1702,46 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     /* ---- 折角：绕摄像头原地旋转，用近场闭环退出 ---- */
     if (s_state == LINE_STATE_CORNER) {
         if (s_post_corner_align) {
+            /* The two stair-step left turns are only about 10 cm apart.  A
+             * second near-field corner must be allowed to take over before
+             * the normal four-frame alignment window completes. */
+            const int trigger_y = (int)height * LINE_TURN_TRIGGER_PERCENT / 100;
+            const bool next_corner = candidate &&
+                                     observation.corner_direction != 0 &&
+                                     observation.corner_row_y >= trigger_y;
+            if (next_corner) {
+                if (observation.corner_direction == s_turn_direction) {
+                    if (s_turn_hint_frames < LINE_TURN_HINT_FRAMES) {
+                        ++s_turn_hint_frames;
+                    }
+                } else {
+                    s_turn_direction = observation.corner_direction;
+                    s_turn_hint_frames = 1;
+                }
+                if (s_turn_hint_frames >= LINE_TURN_HINT_FRAMES) {
+                    s_post_corner_align = false;
+                    s_post_corner_align_frames = 0;
+                    s_post_corner_align_started_us = 0;
+                    s_state = LINE_STATE_CORNER;
+                    s_turn_frames = 0;
+                    s_turn_exit_frames = 0;
+                    s_turn_started_us = now;
+                    s_corner_center_delay_until_us = 0;
+                    s_turn_pending_until_us = 0;
+                    s_lost_frames = 0;
+                    s_reacquire_frames = 0;
+                    s_last_line_us = now;
+                    reset_control();
+                    ESP_LOGI(TAG,
+                             "next corner %s detected during align; pivoting",
+                             s_turn_direction < 0 ? "left" : "right");
+                    drive_slow_spin(-s_turn_direction * LINE_PIVOT_TURN);
+                    goto done;
+                }
+            } else {
+                s_turn_direction = 0;
+                s_turn_hint_frames = 0;
+            }
             const bool align_sample = candidate && observation.near_line_visible &&
                                       observation.corner_direction == 0;
             const bool in_band = align_sample &&
@@ -2110,12 +2181,22 @@ static void camera_ultrasonic_task(void *arg)
                            distance <= ULTRASONIC_MAX_CM;
         s_ultrasonic_distance_cm = valid ? distance : -1.0f;
         s_ultrasonic_valid = valid;
-        const bool close = valid && distance <= OBSTACLE_DETECT_CM;
-        if (!s_armed || s_finished) {
+        const bool close = valid && distance < OBSTACLE_DETECT_CM;
+        /* Keep sampling independent from the camera control mutex.  The
+         * param6 implementation did this first; otherwise a camera callback
+         * holding the mutex can discard exactly the samples needed for the
+         * two-sample confirmation. */
+        if (s_finished) {
             s_obstacle_close_samples = 0;
         } else if (close) {
             if (s_obstacle_close_samples < UINT32_MAX) {
                 ++s_obstacle_close_samples;
+            }
+            if (s_obstacle_close_samples <= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
+                ESP_LOGI(TAG, "ultrasonic close sample %u/%u: %.1fcm",
+                         (unsigned)s_obstacle_close_samples,
+                         (unsigned)OBSTACLE_CLOSE_CONFIRM_SAMPLES,
+                         (double)distance);
             }
         } else {
             s_obstacle_close_samples = 0;
@@ -2128,8 +2209,7 @@ static void camera_ultrasonic_task(void *arg)
             s_control_mutex != NULL &&
             xSemaphoreTake(s_control_mutex, 0) == pdTRUE) {
             if (s_started && s_armed && s_stby_enabled &&
-                s_obstacle_state == OBSTACLE_IDLE &&
-                !s_obstacle_completed && !s_finished) {
+                s_obstacle_state == OBSTACLE_IDLE && !s_finished) {
                 obstacle_begin(esp_timer_get_time());
             }
             (void)xSemaphoreGive(s_control_mutex);
@@ -2154,7 +2234,8 @@ static void camera_line_follow_watchdog_task(void *arg)
         if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
             continue;
         }
-        if (s_started && s_last_frame_us != 0 &&
+        if (s_started && s_obstacle_state == OBSTACLE_IDLE &&
+            s_last_frame_us != 0 &&
             now - s_last_frame_us > (int64_t)LINE_FRAME_TIMEOUT_MS * 1000) {
             disarm_tracking();
             s_last_frame_us = 0;
