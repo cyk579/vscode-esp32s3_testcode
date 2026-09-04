@@ -225,8 +225,9 @@
 #define BALL_SERVO_SETTLE_MS 700U
 #define BALL_SEARCH_TURN_SPEED 13
 #define BALL_ALIGN_TURN_SPEED 12
-#define BALL_CHARGE_A_SPEED 30
-#define BALL_CHARGE_D_SPEED 25
+/* Match the validated forward vector from subject2-burst-b0ef2192. */
+#define BALL_CHARGE_A_SPEED 22
+#define BALL_CHARGE_D_SPEED 27
 #define BALL_CHARGE_MS 3000U
 #define BALL_SEARCH_TIMEOUT_MS 14000U
 #define BALL_ALIGN_TIMEOUT_MS 5000U
