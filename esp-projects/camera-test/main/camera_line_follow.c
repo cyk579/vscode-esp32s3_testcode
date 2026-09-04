@@ -108,8 +108,8 @@
 #define LINE_LAT_MIN_OUTPUT 11
 #define LINE_SEED_SLEW_PX 12
 
-/* 折角：事件行进入画面下方 85% 才动手；更远处只降速，避免提前转弯。 */
-#define LINE_TURN_TRIGGER_PERCENT 85
+/* 折角：事件行进入画面下方 80% 才动手；更远处只降速，避免提前转弯。 */
+#define LINE_TURN_TRIGGER_PERCENT 80
 #define LINE_TURN_HINT_FRAMES 1U
 #define LINE_TURN_EXIT_FRAMES 2U
 /* 旋转至少持续这么久才接受退出，否则第一帧还在看入弯前那条线就会假退出，
@@ -131,7 +131,7 @@
 #define LINE_TURN_D_SPEED 15
 #define LINE_TURN_PENDING_MS 500U
 /* 摄像头在底盘前方：旧线消失并确认要转弯后，先让底盘向前走一小段。 */
-#define LINE_CORNER_CENTER_DELAY_MS 300U
+#define LINE_CORNER_CENTER_DELAY_MS 200U
 /* 低速调试时优先保证三轮都超过各自起转阈值；此前叠加 40% 横移后，
  * 在较低总上限下 A/D 被缩放掉，锐角阶段实际只剩 B 轮。 */
 #define LINE_CAM_PIVOT_PERCENT 0
@@ -1171,7 +1171,7 @@ static bool obstacle_step(int64_t now, uint16_t width, bool line_available)
         }
         break;
     case OBSTACLE_FORWARD:
-        obstacle_drive_direct(AVOID_FORWARD_A_SPEED, 0, AVOID_FORWARD_D_SPEED);
+        obstacle_drive_direct(-AVOID_FORWARD_A_SPEED, 0, AVOID_FORWARD_D_SPEED);
         if (elapsed >= AVOID_FORWARD_MS) {
             s_obstacle_state = OBSTACLE_RIGHT;
             s_obstacle_phase_start_us = now;
