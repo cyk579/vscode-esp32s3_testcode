@@ -335,7 +335,7 @@ void app_main(void)
     // Start the AP when streaming is enabled; this call is a no-op otherwise.
     tcp_server_start_ap();
 #if CONFIG_EXAMPLE_ENABLE_STREAMING
-    ESP_LOGI(TAG, "Wi-Fi AP initialization complete");
+    ESP_LOGI(TAG, "Wi-Fi initialization complete");
 #else
     ESP_LOGI(TAG, "Wi-Fi streaming disabled; continuing without an AP");
 #endif
@@ -404,23 +404,37 @@ void app_main(void)
         // UVC Device open
         UVC_CHECK(uvc_open(dev, &devh));
 
-        // VID/PID and descriptors prove that D+/D- are wired correctly.
-        libuvc_adapter_print_descriptors(devh);
+        // Descriptor dumps are intentionally disabled in the normal streaming path.
+        // Printing the composite camera descriptor at 115200 baud takes long enough
+        // for marginal USB links to time out before the video endpoint is claimed.
 
         uvc_set_button_callback(devh, button_callback, NULL);
 
-        // Print known device information
-        uvc_print_diag(devh, stderr);
         // Negotiate stream profile
         if (UVC_SUCCESS == uvc_negotiate_stream_profile(devh, &ctrl)) {
             // This camera exposes a 64-byte bulk endpoint. Keep each USB
             // transfer to one payload packet; larger transfers concatenate
             // several UVC headers and corrupt the JPEG byte stream.
             ctrl.dwMaxPayloadTransferSize = 64;
+            // A few UVC cameras return a malformed max-frame-size value in
+            // GET_CUR. Keep allocations bounded to the selected 480x320 MJPEG
+            // profile instead of trusting an implausibly large device value.
+            if (ctrl.dwMaxVideoFrameSize == 0 ||
+                ctrl.dwMaxVideoFrameSize > (2U * 1024U * 1024U)) {
+                ctrl.dwMaxVideoFrameSize = 480U * 320U;
+            }
 
-            uvc_print_stream_ctrl(&ctrl, stderr);
-
-            UVC_CHECK(uvc_start_streaming(devh, &ctrl, frame_callback, NULL, 0));
+            const uvc_error_t stream_err =
+                uvc_start_streaming(devh, &ctrl, frame_callback, NULL, 0);
+            if (stream_err != UVC_SUCCESS) {
+                ESP_LOGE(TAG, "UVC streaming start failed: %s; releasing device and retrying",
+                         uvc_error_string(stream_err));
+                static const uint8_t failed[] = "STATUS:STREAM_START_FAILED\n";
+                tcp_server_send((uint8_t *)failed, sizeof(failed) - 1);
+                uvc_close(devh);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
             ESP_LOGI(TAG, "Streaming...");
             static const uint8_t streaming[] = "STATUS:STREAMING\n";
             tcp_server_send((uint8_t *)streaming, sizeof(streaming) - 1);

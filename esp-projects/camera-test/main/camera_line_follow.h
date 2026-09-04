@@ -37,6 +37,28 @@ void camera_line_follow_preview_callback(uint8_t *rgb565_big_endian,
                                          int64_t capture_us,
                                          void *user_ctx);
 
+typedef struct {
+    const char *state;
+    bool armed;
+    bool stby;
+    bool candidate;
+    const char *ball_phase;
+    int motor_a;
+    int motor_b;
+    int motor_d;
+    int ultrasonic_distance_x10;
+    int threshold;
+    int seed_x;
+    uint8_t valid_rows;
+    uint8_t confidence;
+} camera_line_follow_debug_snapshot_t;
+
+/* Read the last control values for low-rate diagnostics (no motor changes). */
+void camera_line_follow_get_debug_snapshot(camera_line_follow_debug_snapshot_t *snapshot);
+
+/* Called after a preview image is sent, so the status text is not overwritten. */
+void camera_line_follow_tft_status_callback(void *user_ctx);
+
 #ifdef __cplusplus
 }
 #endif
