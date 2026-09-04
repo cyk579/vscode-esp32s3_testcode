@@ -2202,15 +2202,20 @@ static void camera_ultrasonic_task(void *arg)
             s_obstacle_close_samples = 0;
         }
 
-        /* The sensor task can stop the car as soon as the second close sample
-         * arrives.  The camera callback remains a fallback when it owns the
-         * control mutex. */
-        if (s_obstacle_close_samples >= OBSTACLE_CLOSE_CONFIRM_SAMPLES &&
-            s_control_mutex != NULL &&
-            xSemaphoreTake(s_control_mutex, 0) == pdTRUE) {
-            if (s_started && s_armed && s_stby_enabled &&
-                s_obstacle_state == OBSTACLE_IDLE && !s_finished) {
-                obstacle_begin(esp_timer_get_time());
+        if (s_control_mutex != NULL &&
+            xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (s_started && !s_finished) {
+                if (s_obstacle_state == OBSTACLE_IDLE &&
+                    s_obstacle_close_samples >= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
+                    obstacle_begin(esp_timer_get_time());
+                }
+                if (s_obstacle_state != OBSTACLE_IDLE) {
+                    const uint16_t route_width = s_last_frame_width > 0 ?
+                                                 s_last_frame_width :
+                                                 LINE_EXPECTED_WIDTH;
+                    /* Keep the fixed route moving even if camera frames pause. */
+                    (void)obstacle_step(esp_timer_get_time(), route_width);
+                }
             }
             (void)xSemaphoreGive(s_control_mutex);
         }
