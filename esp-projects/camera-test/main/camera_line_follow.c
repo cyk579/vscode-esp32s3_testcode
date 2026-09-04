@@ -143,9 +143,9 @@
 /* NORMAL 低速用时间脉冲而不是把 PWM 压到静摩擦死区。MIN 只抬 mixer
  * 输入的 forward，绝不逐轮改 A/B/D；esp_timer 只负责切换 duty。 */
 #define LINE_BURST_ENABLE 1
-#define LINE_BURST_PERIOD_MS 500U
-#define LINE_BURST_ON_MS 450U
-#define LINE_BURST_MIN_OUTPUT 27
+#define LINE_BURST_PERIOD_MS 600U
+#define LINE_BURST_ON_MS 580U
+#define LINE_BURST_MIN_OUTPUT 29
 #define LINE_BURST_TICK_MS 5U
 
 /* 直线回中只补一个很小的 yaw，8 个误差单位以内保持死区，避免来回抖动。 */
@@ -194,7 +194,7 @@
 #define ULTRASONIC_ECHO GPIO_NUM_11
 #define ULTRASONIC_MIN_CM 2.0f
 #define ULTRASONIC_MAX_CM 400.0f
-#define OBSTACLE_DETECT_CM 15.0f
+#define OBSTACLE_DETECT_CM 18.0f
 #define OBSTACLE_CLOSE_CONFIRM_SAMPLES 2U
 #define ULTRASONIC_PERIOD_MS 60U
 #define AVOID_BRAKE_MS 500U
