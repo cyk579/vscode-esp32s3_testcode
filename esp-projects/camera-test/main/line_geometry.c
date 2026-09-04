@@ -98,8 +98,49 @@ void line_geometry_map(const line_scan_cfg_t *cfg, int sx, int sy,
     }
 }
 
+/* Estimate the local floor brightness for one scan row.  The brightest few
+ * samples are used so the black tape itself cannot pull the estimate down;
+ * broad lamp shadows therefore move the threshold with the floor instead of
+ * turning the whole row into a false black segment. */
+static int row_background_luma(const uint8_t *frame,
+                               const line_scan_cfg_t *cfg,
+                               int sy)
+{
+    const int width = line_geometry_scan_width(cfg);
+    const int roi_left = width * LINE_ROI_LEFT_PERCENT / 100;
+    const int roi_right = (width * LINE_ROI_RIGHT_PERCENT / 100) - 1;
+    if (roi_right <= roi_left) {
+        return 0;
+    }
+
+    int brightest[4] = {0, 0, 0, 0};
+    const int sample_count = 12;
+    for (int i = 0; i < sample_count; ++i) {
+        const int sx = roi_left + (roi_right - roi_left) * i /
+                       (sample_count - 1);
+        int bx = 0;
+        int by = 0;
+        line_geometry_map(cfg, sx, sy, &bx, &by);
+        if (bx < 0 || by < 0 || bx >= (int)cfg->width || by >= (int)cfg->height) {
+            continue;
+        }
+        const uint8_t *pixel = frame + (((size_t)by * cfg->width + (size_t)bx) * 2);
+        const int value = line_geometry_luma(pixel);
+        for (int j = 0; j < 4; ++j) {
+            if (value > brightest[j]) {
+                for (int k = 3; k > j; --k) {
+                    brightest[k] = brightest[k - 1];
+                }
+                brightest[j] = value;
+                break;
+            }
+        }
+    }
+    return (brightest[0] + brightest[1] + brightest[2] + brightest[3]) / 4;
+}
+
 static bool pixel_is_dark(const uint8_t *frame, const line_scan_cfg_t *cfg,
-                          int sx, int sy)
+                          int sx, int sy, int row_threshold)
 {
     int bx = 0;
     int by = 0;
@@ -108,7 +149,7 @@ static bool pixel_is_dark(const uint8_t *frame, const line_scan_cfg_t *cfg,
         return false;
     }
     const uint8_t *pixel = frame + (((size_t)by * cfg->width + (size_t)bx) * 2);
-    if (line_geometry_luma(pixel) > cfg->threshold) {
+    if (line_geometry_luma(pixel) > row_threshold) {
         return false;
     }
     if (cfg->saturation_guard && rgb565_saturation(pixel) > cfg->saturation_max) {
@@ -161,9 +202,28 @@ static bool scan_segment(const uint8_t *frame,
     int best_end = 0;
     bool in_run = false;
     int run_start = 0;
+    int row_threshold = cfg->threshold;
+    const int background = row_background_luma(frame, cfg, y);
+    if (background > LINE_LOCAL_CONTRAST_MIN) {
+        const int local_threshold = background - LINE_LOCAL_CONTRAST_MIN;
+        if (local_threshold < row_threshold) {
+            row_threshold = local_threshold;
+        }
+    }
+    if (row_threshold < 1) {
+        row_threshold = 1;
+    }
 
     for (int x = left; x <= right + 1; ++x) {
-        const bool dark = x <= right && pixel_is_dark(frame, cfg, x, y);
+        bool dark = x <= right &&
+                    pixel_is_dark(frame, cfg, x, y, row_threshold);
+        /* A one-pixel JPEG/compression hole inside black tape must not split
+         * the segment.  Only bridge a hole surrounded by dark pixels, never
+         * an isolated dark sample. */
+        if (!dark && x > left && x < right && LINE_BRIDGE_GAP_PIXELS == 1) {
+            dark = pixel_is_dark(frame, cfg, x - 1, y, row_threshold) &&
+                   pixel_is_dark(frame, cfg, x + 1, y, row_threshold);
+        }
         if (dark && !in_run) {
             in_run = true;
             run_start = x;

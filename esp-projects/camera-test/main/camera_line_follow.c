@@ -679,8 +679,11 @@ static void save_overlay_snapshot(uint16_t width, uint16_t height,
     s_overlay_snapshot.corner_x = -1;
     s_overlay_snapshot.corner_y = -1;
     s_overlay_snapshot.sequence = sequence;
+    /* Keep every valid scan point in the low-rate preview.  With the widened
+     * ROI this gives a visibly continuous planned path into distant turns,
+     * while the preview itself is still only refreshed a few times per second. */
     for (int i = 0; i < observation->point_count &&
-                    s_overlay_snapshot.point_count < LINE_OVERLAY_MAX_POINTS; i += 2) {
+                    s_overlay_snapshot.point_count < LINE_OVERLAY_MAX_POINTS; ++i) {
         const uint8_t index = s_overlay_snapshot.point_count++;
         s_overlay_snapshot.point_x[index] = observation->point_x[i];
         s_overlay_snapshot.point_y[index] = observation->point_y[i];

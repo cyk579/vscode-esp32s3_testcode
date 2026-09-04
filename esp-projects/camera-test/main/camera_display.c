@@ -23,13 +23,17 @@
 #define CAMERA_CONTROL_MAX_HEIGHT 120
 #define CAMERA_CONTROL_RGB565_BYTES \
     ((size_t)CAMERA_CONTROL_MAX_WIDTH * CAMERA_CONTROL_MAX_HEIGHT * 2)
+#define CAMERA_PREVIEW_MAX_WIDTH 320
+#define CAMERA_PREVIEW_MAX_HEIGHT 240
+#define CAMERA_PREVIEW_RGB565_BYTES \
+    ((size_t)CAMERA_PREVIEW_MAX_WIDTH * CAMERA_PREVIEW_MAX_HEIGHT * 2)
 #define CAMERA_DISPLAY_JPEG_WORK_BYTES (16 * 1024)
 #define CAMERA_DECODE_IDLE_YIELD_FRAMES 4U
 
-#define CAMERA_BINARY_ROI_TOP_PERCENT 30
+#define CAMERA_BINARY_ROI_TOP_PERCENT 15
 #define CAMERA_BINARY_ROI_BOTTOM_PERCENT 100
-#define CAMERA_BINARY_ROI_LEFT_PERCENT 20
-#define CAMERA_BINARY_ROI_RIGHT_PERCENT 80
+#define CAMERA_BINARY_ROI_LEFT_PERCENT 10
+#define CAMERA_BINARY_ROI_RIGHT_PERCENT 90
 #define CAMERA_BINARY_ROW_STEP 2
 #define CAMERA_BINARY_DARK_PERCENTILE 2
 #define CAMERA_BINARY_LIGHT_PERCENTILE 90
@@ -41,7 +45,14 @@
 #define CAMERA_BINARY_THRESHOLD_FILTER_OLD 3
 #define CAMERA_BINARY_THRESHOLD_FILTER_NEW 1
 
-#define CAMERA_TFT_STATUS_REFRESH_MS 500U
+#define CAMERA_TFT_REFRESH_US 400000LL
+/* Keep most of the camera view on the TFT; the detector itself uses the same
+ * wider ROI so distant turns remain visible while the outside area is blank. */
+#define CAMERA_TFT_CROP_LEFT_PERCENT 10
+#define CAMERA_TFT_CROP_RIGHT_PERCENT 90
+#define CAMERA_TFT_CROP_TOP_PERCENT 15
+#define CAMERA_TFT_CROP_BOTTOM_PERCENT 100
+#define CAMERA_TFT_BLANK_COLOR 0x001f /* vivid blue: clearly outside ROI */
 
 typedef struct {
     uint8_t slot;
@@ -60,11 +71,22 @@ typedef struct {
 } control_frame_ref_t;
 
 typedef struct {
+    uint8_t slot;
+    size_t jpeg_len;
+    uint32_t sequence;
+    int64_t capture_us;
+    uint8_t threshold;
+} preview_frame_ref_t;
+
+typedef struct {
     uint8_t *jpeg_slots[CAMERA_DISPLAY_SLOT_COUNT];
     uint8_t *control_rgb565[CAMERA_CONTROL_BUFFER_COUNT];
+    uint8_t *preview_rgb565;
     uint8_t *control_jpeg_work;
+    uint8_t *preview_jpeg_work;
     QueueHandle_t free_slots;
     QueueHandle_t ready_slots;
+    QueueHandle_t preview_slots;
     QueueHandle_t free_control_buffers;
     QueueHandle_t ready_control_frames;
     bool started;
@@ -75,6 +97,9 @@ typedef struct {
     void *status_callback_ctx;
     camera_display_preview_callback_t preview_callback;
     void *preview_callback_ctx;
+    uint16_t previous_preview_width;
+    uint16_t previous_preview_height;
+    int64_t last_preview_us;
     uint8_t binary_threshold;
     bool threshold_initialized;
     uint8_t threshold_filtered;
@@ -358,6 +383,26 @@ static void release_jpeg_slot(uint8_t slot)
     }
 }
 
+static bool enqueue_latest_preview(const preview_frame_ref_t *frame)
+{
+    if (xQueueSend(s_display.preview_slots, frame, 0) == pdTRUE) {
+        return true;
+    }
+
+    preview_frame_ref_t stale;
+    if (xQueueReceive(s_display.preview_slots, &stale, 0) == pdTRUE) {
+        release_jpeg_slot(stale.slot);
+        ++s_display.preview_dropped_frames;
+        ++s_display.frames_dropped;
+    }
+    if (xQueueSend(s_display.preview_slots, frame, 0) == pdTRUE) {
+        return true;
+    }
+    ++s_display.preview_dropped_frames;
+    ++s_display.frames_dropped;
+    return false;
+}
+
 static bool acquire_control_buffer(uint8_t *buffer)
 {
     if (xQueueReceive(s_display.free_control_buffers, buffer, 0) == pdTRUE) {
@@ -416,7 +461,8 @@ static void camera_control_task(void *arg)
             ++s_display.control_frames;
             s_display.frame_callback(s_display.control_rgb565[frame.buffer],
                                      frame.width, frame.height, frame.threshold,
-                                     false, s_display.frame_callback_ctx);
+                                     s_display.tft_ready,
+                                     s_display.frame_callback_ctx);
         }
         if (xQueueSend(s_display.free_control_buffers, &frame.buffer, 0) != pdTRUE) {
             ESP_LOGE(TAG, "Control frame pool corruption after callback");
@@ -425,6 +471,67 @@ static void camera_control_task(void *arg)
 }
 
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+static void camera_preview_task(void *arg)
+{
+    (void)arg;
+    preview_frame_ref_t frame;
+    while (true) {
+        if (xQueueReceive(s_display.preview_slots, &frame, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        uint16_t width = 0;
+        uint16_t height = 0;
+        uint32_t decode_us = 0;
+        const bool decoded = decode_jpeg_to_buffer(
+            s_display.jpeg_slots[frame.slot], frame.jpeg_len,
+            s_display.preview_rgb565, CAMERA_PREVIEW_RGB565_BYTES,
+            CAMERA_PREVIEW_MAX_WIDTH, CAMERA_PREVIEW_MAX_HEIGHT,
+            s_display.preview_jpeg_work, &width, &height, &decode_us);
+        s_display.last_preview_decode_us = decode_us;
+        if (decoded) {
+            ++s_display.preview_frames;
+            if (s_display.preview_callback != NULL) {
+                s_display.preview_callback(s_display.preview_rgb565, width, height,
+                                            frame.threshold, frame.sequence,
+                                            frame.capture_us,
+                                            s_display.preview_callback_ctx);
+            }
+            if (s_display.tft_ready) {
+                if (width != s_display.previous_preview_width ||
+                    height != s_display.previous_preview_height) {
+                    (void)tft_st7735_fill(CAMERA_TFT_BLANK_COLOR);
+                    s_display.previous_preview_width = width;
+                    s_display.previous_preview_height = height;
+                }
+                uint16_t crop_right = (uint16_t)((width *
+                                                  CAMERA_TFT_CROP_RIGHT_PERCENT / 100) - 1);
+                uint16_t crop_bottom = (uint16_t)((height *
+                                                   CAMERA_TFT_CROP_BOTTOM_PERCENT / 100) - 1);
+                const uint16_t crop_left = (uint16_t)(width *
+                                                       CAMERA_TFT_CROP_LEFT_PERCENT / 100);
+                const uint16_t crop_top = (uint16_t)(height *
+                                                      CAMERA_TFT_CROP_TOP_PERCENT / 100);
+                if (crop_right >= width) crop_right = width - 1;
+                if (crop_bottom >= height) crop_bottom = height - 1;
+                const int64_t tft_start_us = esp_timer_get_time();
+                if (!tft_st7735_draw_rgb565_2x_crop(
+                        s_display.preview_rgb565, width, height,
+                        crop_left, crop_top, crop_right, crop_bottom,
+                        CAMERA_TFT_BLANK_COLOR)) {
+                    ESP_LOGW(TAG, "TFT preview draw failed");
+                } else {
+                    s_display.last_tft_us =
+                        (uint32_t)(esp_timer_get_time() - tft_start_us);
+                }
+            }
+        }
+        release_jpeg_slot(frame.slot);
+    }
+}
+#endif
+
+#if 0 /* Image preview is the debug page; do not let a status task overwrite it. */
 static const char *status_state_name(camera_display_status_state_t state)
 {
     switch (state) {
@@ -580,9 +687,32 @@ static void camera_decode_task(void *arg)
             }
         }
 
-        /* The control decoder is the sole consumer of each JPEG slot now;
-         * the old preview decode path is intentionally disabled. */
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+        const int64_t now = esp_timer_get_time();
+        const bool preview_due = s_display.tft_ready &&
+                                 (s_display.last_preview_us == 0 ||
+                                  now - s_display.last_preview_us >= CAMERA_TFT_REFRESH_US);
+        if (preview_due) {
+            preview_frame_ref_t preview = {
+                .slot = frame.slot,
+                .jpeg_len = frame.jpeg_len,
+                .sequence = frame.sequence,
+                .capture_us = frame.capture_us,
+                .threshold = s_display.binary_threshold,
+            };
+            if (enqueue_latest_preview(&preview)) {
+                /* Reserve the next preview period when queued; preview is
+                 * latest-only and never blocks the control decoder. */
+                s_display.last_preview_us = now;
+            } else {
+                release_jpeg_slot(frame.slot);
+            }
+        } else {
+            release_jpeg_slot(frame.slot);
+        }
+#else
         release_jpeg_slot(frame.slot);
+#endif
 
         /* One tick is 10 ms in this build. Yield periodically so CPU0 idle can
          * feed the watchdog without adding that delay to every decoded frame. */
@@ -605,6 +735,10 @@ static void release_allocations(void)
     }
     heap_caps_free(s_display.control_jpeg_work);
     s_display.control_jpeg_work = NULL;
+    heap_caps_free(s_display.preview_rgb565);
+    s_display.preview_rgb565 = NULL;
+    heap_caps_free(s_display.preview_jpeg_work);
+    s_display.preview_jpeg_work = NULL;
     if (s_display.free_slots != NULL) {
         vQueueDelete(s_display.free_slots);
         s_display.free_slots = NULL;
@@ -612,6 +746,10 @@ static void release_allocations(void)
     if (s_display.ready_slots != NULL) {
         vQueueDelete(s_display.ready_slots);
         s_display.ready_slots = NULL;
+    }
+    if (s_display.preview_slots != NULL) {
+        vQueueDelete(s_display.preview_slots);
+        s_display.preview_slots = NULL;
     }
     if (s_display.free_control_buffers != NULL) {
         vQueueDelete(s_display.free_control_buffers);
@@ -644,6 +782,9 @@ esp_err_t camera_display_start(void)
     s_display.last_tft_us = 0;
     s_display.last_control_age_us = 0;
     s_display.last_control_sequence = 0;
+    s_display.last_preview_us = 0;
+    s_display.previous_preview_width = 0;
+    s_display.previous_preview_height = 0;
     s_display.next_sequence = 0;
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
     s_display.tft_ready = tft_st7735_init();
@@ -656,11 +797,13 @@ esp_err_t camera_display_start(void)
 
     s_display.free_slots = xQueueCreate(CAMERA_DISPLAY_SLOT_COUNT, sizeof(uint8_t));
     s_display.ready_slots = xQueueCreate(1, sizeof(jpeg_frame_ref_t));
+    s_display.preview_slots = xQueueCreate(1, sizeof(preview_frame_ref_t));
     s_display.free_control_buffers =
         xQueueCreate(CAMERA_CONTROL_BUFFER_COUNT, sizeof(uint8_t));
     s_display.ready_control_frames = xQueueCreate(1, sizeof(control_frame_ref_t));
     if (s_display.free_slots == NULL || s_display.ready_slots == NULL ||
-        s_display.free_control_buffers == NULL || s_display.ready_control_frames == NULL) {
+        s_display.preview_slots == NULL || s_display.free_control_buffers == NULL ||
+        s_display.ready_control_frames == NULL) {
         ESP_LOGE(TAG, "Could not allocate camera pipeline queues");
         release_allocations();
         return ESP_ERR_NO_MEM;
@@ -693,6 +836,17 @@ esp_err_t camera_display_start(void)
         release_allocations();
         return ESP_ERR_NO_MEM;
     }
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+    s_display.preview_rgb565 = heap_caps_malloc(
+        CAMERA_PREVIEW_RGB565_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_display.preview_jpeg_work = heap_caps_malloc(
+        CAMERA_DISPLAY_JPEG_WORK_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (s_display.preview_rgb565 == NULL || s_display.preview_jpeg_work == NULL) {
+        ESP_LOGE(TAG, "Could not allocate TFT preview buffers");
+        release_allocations();
+        return ESP_ERR_NO_MEM;
+    }
+#endif
     if (xTaskCreatePinnedToCore(camera_decode_task, "camera_decode", 6144,
                                 NULL, 5, NULL, 0) != pdPASS ||
         xTaskCreatePinnedToCore(camera_control_task, "camera_control", 4096,
@@ -701,19 +855,21 @@ esp_err_t camera_display_start(void)
         return ESP_ERR_NO_MEM;
     }
     s_display.started = true;
-    ESP_LOGI(TAG, "Camera pipeline started: control <=%ux%u, TFT status=%s",
+    ESP_LOGI(TAG, "Camera pipeline started: control <=%ux%u, preview <=%ux%u, TFT=%s",
              CAMERA_CONTROL_MAX_WIDTH, CAMERA_CONTROL_MAX_HEIGHT,
+             CAMERA_PREVIEW_MAX_WIDTH, CAMERA_PREVIEW_MAX_HEIGHT,
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
-             s_display.tft_ready ? "2Hz" : "unavailable"
+             s_display.tft_ready ? "2.5fps" : "unavailable"
 #else
              "disabled"
 #endif
              );
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
     if (s_display.tft_ready &&
-        xTaskCreatePinnedToCore(camera_tft_status_task, "tft_status", 3072,
-                                NULL, 1, NULL, 1) != pdPASS) {
-        ESP_LOGW(TAG, "Could not create TFT status task; control remains active");
+        xTaskCreatePinnedToCore(camera_preview_task, "camera_preview", 6144,
+                                NULL, 2, NULL, 1) != pdPASS) {
+        ESP_LOGW(TAG, "Could not create TFT preview task; control remains active");
+        s_display.tft_ready = false;
     }
 #endif
     return ESP_OK;
@@ -736,12 +892,8 @@ void camera_display_set_status_callback(camera_display_status_callback_t callbac
 void camera_display_set_preview_callback(camera_display_preview_callback_t callback,
                                          void *user_ctx)
 {
-    /* Image preview is intentionally disabled.  Keep the setter so older
-     * application code still links without allocating or decoding a preview. */
-    (void)callback;
-    (void)user_ctx;
-    s_display.preview_callback = NULL;
-    s_display.preview_callback_ctx = NULL;
+    s_display.preview_callback = callback;
+    s_display.preview_callback_ctx = user_ctx;
 }
 
 bool camera_display_submit(const uint8_t *jpeg, size_t jpeg_len)

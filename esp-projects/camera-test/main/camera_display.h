@@ -77,9 +77,9 @@ esp_err_t camera_display_start(void);
  * decoder. The callback receives the writable decoded RGB565 frame without
  * any display-only conversion. source_threshold is the adaptive grayscale
  * threshold, or zero when the source frame did not have enough contrast.
- * draw_overlay is retained for source compatibility and is always false for
- * the control-only callback. The callback runs in the control task and must
- * not block for long.
+ * draw_overlay is true when the low-frequency TFT preview is enabled, allowing
+ * the callback to update a small overlay snapshot on the writable frame.
+ * The callback runs in the control task and must not block for long.
  */
 void camera_display_set_frame_callback(camera_display_frame_callback_t callback,
                                        void *user_ctx);
@@ -87,7 +87,8 @@ void camera_display_set_frame_callback(camera_display_frame_callback_t callback,
 void camera_display_set_status_callback(camera_display_status_callback_t callback,
                                          void *user_ctx);
 
-/* Kept for source compatibility; the image-preview callback is no longer run. */
+/* Register the low-frequency preview callback. The preview task owns its
+ * independent RGB565 buffer and never blocks the control queue. */
 void camera_display_set_preview_callback(camera_display_preview_callback_t callback,
                                          void *user_ctx);
 

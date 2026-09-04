@@ -16,10 +16,11 @@ extern "C" {
 #endif
 
 /* ---- ROI 与扫描几何（ESP 端和 host 测试共用同一组常量） ---- */
-#define LINE_ROI_LEFT_PERCENT 20
-#define LINE_ROI_RIGHT_PERCENT 80
-#define LINE_ROI_TOP_PERCENT 30
+#define LINE_ROI_LEFT_PERCENT 10
+#define LINE_ROI_RIGHT_PERCENT 90
+#define LINE_ROI_TOP_PERCENT 15
 #define LINE_ROI_BOTTOM_PERCENT 100
+#define LINE_LOCAL_CONTRAST_MIN 18
 #define LINE_NEAR_TOP_PERCENT 65
 #define LINE_NEAR_BOTTOM_PERCENT 92
 #define LINE_ROW_STEP 2
@@ -31,6 +32,7 @@ extern "C" {
 /* 逐行搜索用上一行的斜率做预测，所以跳变门限可以比原来紧。 */
 #define LINE_MAX_CENTER_JUMP_PERCENT 18
 #define LINE_MIN_SEGMENT_WIDTH 2
+#define LINE_BRIDGE_GAP_PIXELS 1
 #define LINE_MAX_SEGMENT_WIDTH_PERCENT 55
 #define LINE_MIN_VALID_ROWS 4
 #define LINE_CORNER_MIN_VALID_ROWS 2
