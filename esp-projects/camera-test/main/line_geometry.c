@@ -139,6 +139,21 @@ static int row_background_luma(const uint8_t *frame,
     return (brightest[0] + brightest[1] + brightest[2] + brightest[3]) / 4;
 }
 
+static int pixel_luma_at(const uint8_t *frame,
+                         const line_scan_cfg_t *cfg,
+                         int sx,
+                         int sy)
+{
+    int bx = 0;
+    int by = 0;
+    line_geometry_map(cfg, sx, sy, &bx, &by);
+    if (bx < 0 || by < 0 || bx >= (int)cfg->width || by >= (int)cfg->height) {
+        return 255;
+    }
+    const uint8_t *pixel = frame + (((size_t)by * cfg->width + (size_t)bx) * 2);
+    return line_geometry_luma(pixel);
+}
+
 static bool pixel_is_dark(const uint8_t *frame, const line_scan_cfg_t *cfg,
                           int sx, int sy, int row_threshold)
 {
@@ -198,6 +213,7 @@ static bool scan_segment(const uint8_t *frame,
                                                          LINE_MAX_SEGMENT_WIDTH_PERCENT,
                                                          min_width + 2);
     int best_distance = INT_MAX;
+    int best_luma = INT_MAX;
     int best_start = 0;
     int best_end = 0;
     bool in_run = false;
@@ -232,9 +248,18 @@ static bool scan_segment(const uint8_t *frame,
             const int run_end = x - 1;
             const int run_width = run_end - run_start + 1;
             const int distance = abs((run_start + run_end) / 2 - reference);
+            const int run_mid = (run_start + run_end) / 2;
+            const int run_luma = (pixel_luma_at(frame, cfg, run_start, y) +
+                                  pixel_luma_at(frame, cfg, run_mid, y) +
+                                  pixel_luma_at(frame, cfg, run_end, y)) / 3;
+            /* Pure black tape is normally the darkest valid segment. Use
+             * darkness as the primary score and distance only as the tie
+             * breaker, so a dim shadow cannot win over the tape. */
             if (run_width >= min_width && run_width <= max_width &&
-                distance < best_distance) {
+                (run_luma < best_luma ||
+                 (run_luma == best_luma && distance < best_distance))) {
                 best_distance = distance;
+                best_luma = run_luma;
                 best_start = run_start;
                 best_end = run_end;
             }
@@ -346,7 +371,7 @@ bool line_geometry_track(const uint8_t *frame,
                 y -= LINE_ROW_STEP;
                 continue;
             }
-            if (!seed_row && misses == 0) {
+            if (!seed_row && misses < LINE_TRACK_MISS_ROWS) {
                 ++misses;
                 y -= LINE_ROW_STEP;
                 continue;
