@@ -40,12 +40,10 @@
 /* 解码器输出大端字节序 RGB565；画面左右相反时改为 1。 */
 #define CAMERA_LINE_MIRROR_X 0
 /*
- * The chassis center is about 5 cm left of the tape in the real vehicle.
- * The negative reference offset is intentional for this installation: it
- * moves the accepted track reference left of the optical center, compensating
- * the measured chassis/camera placement without changing the mixer.
+ * Keep the small reference offset from the validated line-follow branch;
+ * it does not change the motor mixer or the ball-test geometry.
  */
-#define CAMERA_LINE_CENTER_BIAS_PX (-18)
+#define CAMERA_LINE_CENTER_BIAS_PX (-4)
 
 /* 摄像头相对车体的安装旋转。扫描坐标系永远是车体视角（sy 越大越靠近车），
  * 缓冲区按这个值反查，不做整帧旋转拷贝，所以改它不增加单帧耗时。
@@ -55,11 +53,11 @@
 
 /* ROI、行距、逐行搜索和线段判据全部在 line_geometry.h 里，ESP 端和 host
  * 回归测试共用同一组常量。这里只保留状态机自己的窗口策略和时序。 */
-#define LINE_LOST_WINDOW_GROW_PERCENT 4
-#define LINE_LOST_WINDOW_MAX_PERCENT 60
-#define LINE_CORNER_WINDOW_START_PERCENT 40
+#define LINE_LOST_WINDOW_GROW_PERCENT 5
+#define LINE_LOST_WINDOW_MAX_PERCENT 48
+#define LINE_CORNER_WINDOW_START_PERCENT 28
 #define LINE_CORNER_WINDOW_GROW_PERCENT 4
-#define LINE_CORNER_WINDOW_MAX_PERCENT 60
+#define LINE_CORNER_WINDOW_MAX_PERCENT 46
 #define LINE_REACQUIRE_CONFIRM_FRAMES 2U
 
 /* 彩色干扰守卫：赛道板上的深色红球亮度会落进黑线阈值区间，但通道差很大。
@@ -80,9 +78,9 @@
 #define LINE_MOTOR_START_RAMP_MS 700
 #define LINE_MOTOR_START_MIN_OUTPUT 14
 #define LINE_LOST_HOLD_MS 600U
-#define LINE_LOST_STOP_MS 1800U
+#define LINE_LOST_STOP_MS 3000U
 #define LINE_FRAME_TIMEOUT_MS 1200U
-#define LINE_FINISH_CONFIRM_FRAMES 5U
+#define LINE_FINISH_CONFIRM_FRAMES 3U
 /* At a T finish, keep crawling and use heading only to leave the nose
  * pointing forward before the confirmation stop. */
 #define LINE_FINISH_ALIGN_HEADING_ERROR 8
@@ -90,12 +88,12 @@
 /* 终点 T 停车。调巡线时可以临时置 0，避免把"误停"当成"丢线"。 */
 #define LINE_FINISH_ENABLE 1
 
-/* 持续巡航速度取 24% 版和 30% 版之间的折中值；起步另有短时增扭脉冲。 */
-#define LINE_FORWARD_FAST 27
-#define LINE_FORWARD_MEDIUM 25
-#define LINE_FORWARD_SLOW 22
-#define LINE_FORWARD_CRAWL 18
-#define LINE_FORWARD_SLEW 8
+/* Match the validated subject2-burst-b0ef2192 line-follow speed steps. */
+#define LINE_FORWARD_FAST 22
+#define LINE_FORWARD_MEDIUM 20
+#define LINE_FORWARD_SLOW 18
+#define LINE_FORWARD_CRAWL 14
+#define LINE_FORWARD_SLEW 4
 
 /* A two-point partial scan is often a one-frame JPEG/lighting miss, not a
  * genuine loss of the track. Keep the previous steering briefly while the
@@ -105,7 +103,7 @@
 
 /* 误差门限。|error| 被 ROI 夹在 55 以内（center 只能落在 48..191），所以
  * 原来的 LINE_ERROR_LARGE=60 在 NORMAL 里永远不可达，CRAWL 那一档是死的。 */
-#define LINE_ERROR_DEADBAND 14
+#define LINE_ERROR_DEADBAND 12
 #define LINE_ERROR_MEDIUM 25
 #define LINE_ERROR_LARGE 45
 #define LINE_HEADING_DEADBAND 3
@@ -119,14 +117,14 @@
 #define LINE_PID_KP_LAT 45
 #define LINE_PID_KH 130
 #define LINE_PID_SCALE 100
-#define LINE_TURN_MAX 16
+#define LINE_TURN_MAX 13
 #define LINE_YAW_MIN_OUTPUT 13
-#define LINE_LAT_MAX 12
+#define LINE_LAT_MAX 16
 #define LINE_LAT_MIN_OUTPUT 11
 #define LINE_SEED_SLEW_PX 12
 
-/* 折角：事件行进入画面下方 88% 才动手；更远处只降速，避免提前转弯。 */
-#define LINE_TURN_TRIGGER_PERCENT 80
+/* 折角：事件行进入画面下方 85% 才动手；更远处只降速，避免提前转弯。 */
+#define LINE_TURN_TRIGGER_PERCENT 85
 #define LINE_TURN_HINT_FRAMES 1U
 #define LINE_TURN_EXIT_FRAMES 2U
 /* 旋转至少持续这么久才接受退出，否则第一帧还在看入弯前那条线就会假退出，
@@ -137,11 +135,11 @@
 /* 绕摄像头旋转：lat = turn * a/(2L)。偏航量必须够大，否则 a/d = lat - turn
  * 落在起转值以下会被混控丢掉，只剩后轮在推。
  * TODO(实测): LINE_CAM_PIVOT_PERCENT 用尺子量 a 和 L 后填 a*100/(2L)。 */
-#define LINE_PIVOT_TURN 17
-#define LINE_TURN_A_SPEED 15
-#define LINE_TURN_B_SPEED 15
-#define LINE_TURN_D_SPEED 16
-#define LINE_TURN_PENDING_MS 900U
+#define LINE_PIVOT_TURN 15
+#define LINE_TURN_A_SPEED 14
+#define LINE_TURN_B_SPEED 13
+#define LINE_TURN_D_SPEED 15
+#define LINE_TURN_PENDING_MS 500U
 #define LINE_SOFT_LOST_FRAMES 3U
 #define LINE_OVERLAY_HOLD_FRAMES 4U
 /* 低速调试时优先保证三轮都超过各自起转阈值；此前叠加 40% 横移后，
@@ -171,11 +169,11 @@
 #define PWM_MAX 1023U
 #define MOTOR_MIN_RUN_OUTPUT 11
 #define MOTOR_B_MIN_RUN_OUTPUT 13
-#define START_KICK_OUTPUT 30
-#define START_KICK_CYCLES 6U
-/* 持续巡航上限为 27%；30% 只作为起步/换向脉冲和混控余量。 */
-#define MOTOR_PWM_CEILING 30
-#define LINE_SPEED_CAP 27
+#define START_KICK_OUTPUT 27
+#define START_KICK_CYCLES 3U
+/* Keep the validated 44% mixer ceiling; normal speed is set separately above. */
+#define MOTOR_PWM_CEILING 44
+#define LINE_SPEED_CAP 30
 #define MOTOR_TRIM_A 90
 #define MOTOR_TRIM_D 100
 
@@ -184,15 +182,16 @@
 #define MOTOR_B_SIGN 1
 #define MOTOR_D_SIGN -1
 
-/* HC-SR04 is the only obstacle sensor in the camera vehicle. */
+/* HC-SR04 is the only obstacle sensor in the camera vehicle.  The findball
+ * branch keeps its endpoint-specific fixed route timings below. */
 #define ULTRASONIC_TRIG GPIO_NUM_18
 #define ULTRASONIC_ECHO GPIO_NUM_11
 #define ULTRASONIC_MIN_CM 2.0f
 #define ULTRASONIC_MAX_CM 400.0f
-#define OBSTACLE_DETECT_CM 10.0f
+#define OBSTACLE_DETECT_CM 15.0f
 #define OBSTACLE_CLEAR_CM 80.0f
 #define OBSTACLE_CLOSE_CONFIRM_SAMPLES 2U
-#define ULTRASONIC_PERIOD_MS 60U
+#define ULTRASONIC_PERIOD_MS 50U
 #define AVOID_BRAKE_MS 500U
 #define AVOID_LEFT_SIDE_SPEED 18
 #define AVOID_LEFT_B_SPEED 25
