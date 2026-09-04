@@ -106,8 +106,9 @@ int main(void)
     s_obstacle_close_samples = 0;
     s_first_frame_us = s_fake_time_us;
 
-    obstacle_record_sample(true, 12.0f);
-    obstacle_record_sample(true, 12.0f);
+    for (unsigned i = 0; i < OBSTACLE_CLOSE_CONFIRM_SAMPLES; ++i) {
+        obstacle_record_sample(true, 12.0f);
+    }
     obstacle_record_sample(false, -1.0f);
     assert(s_obstacle_close_samples == OBSTACLE_CLOSE_CONFIRM_SAMPLES);
 

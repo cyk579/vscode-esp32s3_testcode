@@ -44,7 +44,7 @@ typedef struct {
 typedef bool (*camera_display_status_callback_t)(camera_display_status_t *status,
                                                  void *user_ctx);
 
-/* Called by the low-priority preview task with an independent RGB565 frame. */
+/* Called at the TFT refresh rate with the decoded control RGB565 frame. */
 typedef void (*camera_display_preview_callback_t)(uint8_t *rgb565_big_endian,
                                                    uint16_t width,
                                                    uint16_t height,
@@ -69,7 +69,7 @@ typedef struct {
     uint32_t last_control_sequence;
 } camera_display_pipeline_stats_t;
 
-/** Initialise the asynchronous JPEG decoder and the optional TFT status page. */
+/** Initialise the asynchronous JPEG decoder and optional direct TFT preview. */
 esp_err_t camera_display_start(void);
 
 /**
@@ -87,8 +87,8 @@ void camera_display_set_frame_callback(camera_display_frame_callback_t callback,
 void camera_display_set_status_callback(camera_display_status_callback_t callback,
                                          void *user_ctx);
 
-/* Register the low-frequency preview callback. The preview task owns its
- * independent RGB565 buffer and never blocks the control queue. */
+/* Register the low-frequency preview callback. It receives the decoded
+ * control frame while that buffer is still owned by the control task. */
 void camera_display_set_preview_callback(camera_display_preview_callback_t callback,
                                          void *user_ctx);
 

@@ -222,7 +222,10 @@ static bool scan_segment(const uint8_t *frame,
     const int background = row_background_luma(frame, cfg, y);
     if (background > LINE_LOCAL_CONTRAST_MIN) {
         const int local_threshold = background - LINE_LOCAL_CONTRAST_MIN;
-        if (local_threshold < row_threshold) {
+        /* Compensate small lighting changes without letting a broad shadow
+         * lower the threshold enough to turn black tape white. */
+        const int local_floor = row_threshold > 6 ? row_threshold - 6 : 1;
+        if (local_threshold < row_threshold && local_threshold >= local_floor) {
             row_threshold = local_threshold;
         }
     }

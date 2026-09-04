@@ -58,8 +58,8 @@ menu "Example Configuration"
             help
                 When protocol mode is Auto, the example tries five profiles in
                 this order (each profile is retried as configured below):
-                1 Attempt: 480x320, 25 FPS, MJPEG
-                2 Attempt: 320x240, 30 FPS, MJPEG
+                1 Attempt: 320x240, 30 FPS, MJPEG
+                2 Attempt: 480x320, 25 FPS, MJPEG
                 3 Attempt: 480x320, first available FPS, MJPEG
                 4 Attempt: 640x480, 15 FPS, MJPEG
                 5 Attempt: 1280x720, first available FPS, MJPEG

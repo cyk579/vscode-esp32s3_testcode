@@ -37,12 +37,10 @@
 /* 解码器输出大端字节序 RGB565；画面左右相反时改为 1。 */
 #define CAMERA_LINE_MIRROR_X 0
 /*
- * The chassis center is about 5 cm left of the tape in the real vehicle.
- * The negative reference offset is intentional for this installation: it
- * moves the accepted track reference left of the optical center, compensating
- * the measured chassis/camera placement without changing the mixer.
+ * Keep the track reference at the optical center.  The normal controller adds
+ * a bounded strafe command when the observed tape is off-center.
  */
-#define CAMERA_LINE_CENTER_BIAS_PX (-4)
+#define CAMERA_LINE_CENTER_BIAS_PX 0
 
 /* 摄像头相对车体的安装旋转。扫描坐标系永远是车体视角（sy 越大越靠近车），
  * 缓冲区按这个值反查，不做整帧旋转拷贝，所以改它不增加单帧耗时。
@@ -97,7 +95,7 @@
  * track. The control callback can arrive below 5 Hz while the decoder is
  * busy, so the hold is time based rather than frame-count based. */
 #define LINE_PARTIAL_MIN_POINTS 2
-#define LINE_PARTIAL_TRACK_HOLD_MS 900U
+#define LINE_PARTIAL_TRACK_HOLD_MS 2200U
 
 /* 误差门限。|error| 被 ROI 夹在 55 以内（center 只能落在 48..191），所以
  * 原来的 LINE_ERROR_LARGE=60 在 NORMAL 里永远不可达，CRAWL 那一档是死的。 */
@@ -121,8 +119,10 @@
 #define LINE_LAT_MIN_OUTPUT 11
 #define LINE_SEED_SLEW_PX 12
 
-/* 折角：事件行进入画面下方 85% 才动手；更远处只降速，避免提前转弯。 */
-#define LINE_TURN_TRIGGER_PERCENT 85
+/* 折角提示：近场事件立即进入待转，较远事件先连续确认，避免在低帧率
+ * 输入下等到旧线完全出画面才发现弯道。真正的旋转仍等待旧线消失。 */
+#define LINE_TURN_TRIGGER_PERCENT 45
+#define LINE_TURN_HINT_MIN_PERCENT 16
 #define LINE_TURN_HINT_FRAMES 1U
 #define LINE_WEAK_TURN_HINT_FRAMES 2U
 #define LINE_TURN_EXIT_FRAMES 2U
@@ -144,7 +144,7 @@
 #define LINE_TURN_A_SPEED 14
 #define LINE_TURN_B_SPEED 13
 #define LINE_TURN_D_SPEED 15
-#define LINE_TURN_PENDING_MS 500U
+#define LINE_TURN_PENDING_MS 1200U
 /* 摄像头在底盘前方：旧线消失并确认要转弯后，先让底盘向前走一小段。 */
 #define LINE_CORNER_CENTER_DELAY_MS 200U
 /* 普通丢线时按最近转向方向低速扫线；每隔一小段时间换向，避免卡在
@@ -172,6 +172,8 @@
 #define LINE_CENTER_YAW_GAIN 6
 #define LINE_CENTER_YAW_MAX 2
 #define LINE_NORMAL_TURN_SLEW 3
+#define LINE_CENTER_LAT_MAX_OUTPUT 10
+#define LINE_NORMAL_LAT_SLEW 3
 
 /* 校准模式：置 1 后不跑视觉，直接按脚本输出电机命令并打日志。
  * 把车放在赛道板上（不要架空，静摩擦要真实），看串口 + 卷尺就能得到
@@ -184,7 +186,7 @@
 #define LINE_CALIB_RUN_MS 3000U
 #define LINE_CALIB_SPIN_MS 10000U
 
-/* 扫描几何按这个解码尺寸调过；协商到别的分辨率时绝对像素量的含义会变。 */
+/* 当前摄像头 480x320 输入在控制解码器中缩放为 120x80。 */
 #define LINE_EXPECTED_WIDTH 120
 #define LINE_EXPECTED_HEIGHT 80
 
@@ -259,10 +261,10 @@
 #define ULTRASONIC_MIN_CM 2.0f
 #define ULTRASONIC_MAX_CM 400.0f
 #define OBSTACLE_DETECT_CM 25.0f
-#define OBSTACLE_CLOSE_CONFIRM_SAMPLES 2U
+#define OBSTACLE_CLOSE_CONFIRM_SAMPLES 3U
 /* HC-SR04 practical lower bound; the read routine still performs its own
  * echo timeout, so a missing echo can make the effective period longer. */
-#define ULTRASONIC_PERIOD_MS 20U
+#define ULTRASONIC_PERIOD_MS 70U
 #define AVOID_BRAKE_MS 500U
 #define AVOID_LEFT_MS 1500U
 #define AVOID_FORWARD_MS 2000U
@@ -395,6 +397,7 @@ static line_observation_t s_last_good_observation;
 static int64_t s_last_good_observation_us;
 
 static int s_lat_accum;
+static int s_lateral_output;
 static int s_yaw_accum;
 static int s_forward_output;
 static int s_turn_output;
@@ -1746,6 +1749,7 @@ static void ball_process_frame(uint8_t *frame, uint16_t width, uint16_t height,
 static void reset_control(void)
 {
     s_lat_accum = 0;
+    s_lateral_output = 0;
     s_yaw_accum = 0;
     s_forward_output = 0;
     s_turn_output = 0;
@@ -1842,6 +1846,9 @@ static void obstacle_drive_direct(int a, int b, int d, bool suppress_kick)
 
 static void obstacle_begin(int64_t now)
 {
+    if (s_obstacle_completed) {
+        return;
+    }
     s_obstacle_state = OBSTACLE_BRAKE;
     s_obstacle_phase_start_us = now;
     s_obstacle_close_samples = 0;
@@ -1853,8 +1860,9 @@ static void obstacle_begin(int64_t now)
     s_stby_enabled = true;
     reset_control();
     zero_motor_outputs();
-    ESP_LOGW(TAG, "obstacle %.1fcm confirmed; fixed avoidance route started",
-             (double)s_ultrasonic_distance_cm);
+    const int distance_x10 = (int)(s_ultrasonic_distance_cm * 10.0f + 0.5f);
+    ESP_LOGW(TAG, "obstacle %d.%dcm confirmed; fixed avoidance route started",
+             distance_x10 / 10, distance_x10 % 10);
 }
 
 static void obstacle_record_sample(bool close, float distance)
@@ -1864,10 +1872,11 @@ static void obstacle_record_sample(bool close, float distance)
     } else if (close) {
         if (s_obstacle_close_samples < OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
             ++s_obstacle_close_samples;
-            ESP_LOGI(TAG, "ultrasonic close sample %u/%u: %.1fcm",
+            const int distance_x10 = (int)(distance * 10.0f + 0.5f);
+            ESP_LOGI(TAG, "ultrasonic close sample %u/%u: %d.%dcm",
                      (unsigned)s_obstacle_close_samples,
                      (unsigned)OBSTACLE_CLOSE_CONFIRM_SAMPLES,
-                     (double)distance);
+                     distance_x10 / 10, distance_x10 % 10);
         }
     } else if (s_obstacle_close_samples < OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
         /* Before confirmation the samples must be consecutive.  Once the
@@ -2026,8 +2035,10 @@ static void drive_normal_limited(const line_observation_t *observation,
     /* 正常巡线只用车体转向校正，不用横移硬拉回数学中心线。
      * lateral 正值表示线在左侧，因此折算成负 heading，yaw PD 输出左转。
      * 死区内保留有宽度的中心区域，避免小车左右来回校正。 */
+    /* The legacy lateral term still contributes a small yaw correction.  The
+     * bounded strafe below is the primary optical-centering correction. */
     const int lateral_for_steer = abs(lateral_error) <= LINE_ERROR_DEADBAND ?
-                                   0 : lateral_error;
+                                  0 : lateral_error;
     /* 摄像头在底盘前方时，单靠远端 heading 容易留下一个长期横向偏差。
      * 在现有误差上叠加很小的连续 yaw；小误差保持独立 deadband，避免把
      * 摄像头量化噪声变成左右抖动。 */
@@ -2054,12 +2065,33 @@ static void drive_normal_limited(const line_observation_t *observation,
     } else {
         s_turn_output = requested_turn;
     }
-    s_lat_accum = 0;
+    const bool center_valid = observation->near_line_visible &&
+                              observation->corner_direction == 0 &&
+                              !observation->finish_candidate;
+    int requested_lat = 0;
+    if (center_valid) {
+        /* Move the chassis toward the optical center.  The mixer convention
+         * is lat < 0 when the tape is left of the image center. */
+        requested_lat = line_control_strafe_pd(
+            &cfg, lateral_error, s_lateral_error_rate, LINE_PD_KD_LAT,
+            &s_lat_accum);
+        requested_lat = clamp_int(requested_lat, LINE_CENTER_LAT_MAX_OUTPUT);
+    } else {
+        s_lat_accum = 0;
+    }
+    const int lat_delta = requested_lat - s_lateral_output;
+    if (lat_delta > LINE_NORMAL_LAT_SLEW) {
+        s_lateral_output += LINE_NORMAL_LAT_SLEW;
+    } else if (lat_delta < -LINE_NORMAL_LAT_SLEW) {
+        s_lateral_output -= LINE_NORMAL_LAT_SLEW;
+    } else {
+        s_lateral_output = requested_lat;
+    }
     int forward = s_forward_output;
     if (forward_cap > 0 && forward > forward_cap) {
         forward = forward_cap;
     }
-    drive_normal_output(forward, s_turn_output, 0);
+    drive_normal_output(forward, s_turn_output, s_lateral_output);
 }
 
 static void drive_normal(const line_observation_t *observation, int64_t now)
@@ -2471,12 +2503,13 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
              * second near-field corner must be allowed to take over before
              * the normal four-frame alignment window completes. */
             const int trigger_y = (int)height * LINE_TURN_TRIGGER_PERCENT / 100;
+            const int hint_y = (int)height * LINE_TURN_HINT_MIN_PERCENT / 100;
             const bool next_corner = candidate &&
                                      observation.corner_direction != 0 &&
-                                     observation.corner_row_y >= trigger_y;
+                                     observation.corner_row_y >= hint_y;
             if (next_corner) {
                 const uint8_t hint_required =
-                    observation.valid_rows < LINE_MIN_VALID_ROWS ?
+                    observation.corner_row_y < trigger_y ?
                     LINE_WEAK_TURN_HINT_FRAMES : LINE_TURN_HINT_FRAMES;
                 if (observation.corner_direction == s_turn_direction) {
                     if (s_turn_hint_frames < hint_required) {
@@ -2781,10 +2814,11 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
 
         /* 近场折角这里只记录 pending；旧线消失后才开始车体中心补偿。 */
         const int trigger_y = (int)height * LINE_TURN_TRIGGER_PERCENT / 100;
+        const int hint_y = (int)height * LINE_TURN_HINT_MIN_PERCENT / 100;
         if (observation.corner_direction != 0 &&
-            observation.corner_row_y >= trigger_y) {
+            observation.corner_row_y >= hint_y) {
             const uint8_t hint_required =
-                observation.valid_rows < LINE_MIN_VALID_ROWS ?
+                observation.corner_row_y < trigger_y ?
                 LINE_WEAK_TURN_HINT_FRAMES : LINE_TURN_HINT_FRAMES;
             if (observation.corner_direction == s_turn_direction) {
                 if (s_turn_hint_frames < hint_required) {
@@ -2957,13 +2991,14 @@ static void camera_ultrasonic_task(void *arg)
         /* Keep sampling independent from the camera control mutex.  The
          * param6 implementation did this first; otherwise a camera callback
          * holding the mutex can discard exactly the samples needed for the
-         * two-sample confirmation. */
+         * consecutive-sample confirmation. */
         obstacle_record_sample(close, distance);
 
         if (s_control_mutex != NULL &&
             xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
             if (s_started && !s_finished) {
                 if (s_obstacle_state == OBSTACLE_IDLE &&
+                    !s_obstacle_completed &&
                     s_obstacle_close_samples >= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
                     obstacle_begin(esp_timer_get_time());
                 }
@@ -3138,7 +3173,7 @@ esp_err_t camera_line_follow_start(void)
     stop_motors();
 
     if (!s_ultrasonic_task_created) {
-        if (xTaskCreate(camera_ultrasonic_task, "camera_ultrasonic", 2048,
+        if (xTaskCreate(camera_ultrasonic_task, "camera_ultrasonic", 4096,
                         NULL, 6, NULL) != pdPASS) {
             s_started = false;
             ESP_LOGE(TAG, "Could not create ultrasonic task");
