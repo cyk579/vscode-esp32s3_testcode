@@ -202,7 +202,7 @@
 #define ULTRASONIC_ECHO GPIO_NUM_11
 #define ULTRASONIC_MIN_CM 2.0f
 #define ULTRASONIC_MAX_CM 400.0f
-#define OBSTACLE_DETECT_CM 20.0f
+#define OBSTACLE_DETECT_CM 15.0f
 #define OBSTACLE_CLOSE_CONFIRM_SAMPLES 2U
 #define ULTRASONIC_PERIOD_MS 50U
 #define AVOID_BRAKE_MS 500U
@@ -1189,7 +1189,8 @@ static void obstacle_finish(int64_t now, uint16_t width)
 static bool obstacle_step(int64_t now, uint16_t width)
 {
     if (s_obstacle_state == OBSTACLE_IDLE) {
-        if (s_obstacle_close_samples >= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
+        if (!s_obstacle_completed &&
+            s_obstacle_close_samples >= OBSTACLE_CLOSE_CONFIRM_SAMPLES) {
             obstacle_begin(now);
             return true;
         }
@@ -2127,7 +2128,8 @@ static void camera_ultrasonic_task(void *arg)
             s_control_mutex != NULL &&
             xSemaphoreTake(s_control_mutex, 0) == pdTRUE) {
             if (s_started && s_armed && s_stby_enabled &&
-                s_obstacle_state == OBSTACLE_IDLE && !s_finished) {
+                s_obstacle_state == OBSTACLE_IDLE &&
+                !s_obstacle_completed && !s_finished) {
                 obstacle_begin(esp_timer_get_time());
             }
             (void)xSemaphoreGive(s_control_mutex);
@@ -2274,7 +2276,7 @@ esp_err_t camera_line_follow_start(void)
 
     if (!s_ultrasonic_task_created) {
         if (xTaskCreate(camera_ultrasonic_task, "camera_ultrasonic", 2048,
-                        NULL, 1, NULL) != pdPASS) {
+                        NULL, 6, NULL) != pdPASS) {
             s_started = false;
             ESP_LOGE(TAG, "Could not create ultrasonic task");
             return ESP_ERR_NO_MEM;
