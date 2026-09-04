@@ -104,7 +104,7 @@
  * TODO(实测): KP_LAT 按"1 单位 lat 对应多少 cm/s 侧移"标定；
  * TODO(实测): KH 按"1 单位 heading 对应多少度"标定。 */
 #define LINE_PID_KP_LAT 18
-#define LINE_PID_KH 95
+#define LINE_PID_KH 65
 #define LINE_PID_SCALE 100
 #define LINE_TURN_MAX 13
 #define LINE_YAW_MIN_OUTPUT 13
