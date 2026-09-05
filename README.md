@@ -7,7 +7,8 @@
 | 工程 | 功能 |
 | --- | --- |
 | `esp-projects/car-spin` | 三轮小车电机控制、四路红外检测与巡线 |
-| `esp-projects/camera-test` | USB 摄像头枚举、Wi-Fi 热点和 MJPEG 图像传输测试 |
+| `esp-projects/camera-test` | USB 摄像头枚举、RGB565 黑线识别、三轮车巡线、ST7735 本地预览与可选 Wi-Fi 图像传输 |
+| `esp-projects/camera-claude` | 从 camera-test 的 `db8fc2d` 重构而来的巡线逻辑，两个比例项替代弯道预测，附 host 端回归测试 |
 
 每个工程的接线、参数和运行方法请查看对应目录中的 `README.md`。
 

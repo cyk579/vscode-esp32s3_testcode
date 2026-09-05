@@ -1,0 +1,152 @@
+menu "Example Configuration"
+    config EXAMPLE_ENABLE_STREAMING
+        bool "Enable streaming"
+        default n
+        help
+            Enables streaming of captured video.
+
+    config EXAMPLE_WIFI_USE_STA
+        bool "Join an existing Wi-Fi network for streaming"
+        default n
+        depends on EXAMPLE_ENABLE_STREAMING
+        help
+            Use station mode instead of creating an ESP32 access point. This
+            keeps the PC on its normal network, so internet access is not
+            interrupted while the camera stream is viewed.
+
+    config EXAMPLE_WIFI_STA_SSID
+        string "Existing Wi-Fi SSID"
+        default ""
+        depends on EXAMPLE_ENABLE_STREAMING && EXAMPLE_WIFI_USE_STA
+
+    config EXAMPLE_WIFI_STA_PASSWORD
+        string "Existing Wi-Fi password"
+        default ""
+        depends on EXAMPLE_ENABLE_STREAMING && EXAMPLE_WIFI_USE_STA
+
+    config EXAMPLE_ENABLE_TFT_PREVIEW
+        bool "Enable TFT status page"
+        default y
+        help
+            Enables a low-rate ST7735 color camera preview with black status
+            text overlay. The preview reuses the decoded control frame and does
+            not add a display-only JPEG decode or framebuffer.
+
+    config EXAMPLE_ENABLE_CAMERA_LINE_FOLLOW
+        bool "Enable camera black-line following"
+        default y
+        depends on !EXAMPLE_ENABLE_SERVO_TEST
+        help
+            Decodes each UVC MJPEG frame and drives the three-wheel TB6612
+            vehicle from the black-line position.  The motors remain in
+            standby until a line is confirmed for several frames.
+
+    config EXAMPLE_ENABLE_SERVO_TEST
+        bool "Run servo test at startup"
+        default n
+        help
+            Runs the short pan/tilt servo movement test before USB Host starts.
+            Keep this disabled when the servos are not powered from a separate
+            stable 5 V supply.
+
+    choice EXAMPLE_UVC_PROTOCOL_MODE
+        prompt "UVC Protocol mode"
+        default EXAMPLE_UVC_PROTOCOL_MODE_AUTO
+
+        config EXAMPLE_UVC_PROTOCOL_MODE_AUTO
+            bool "Auto"
+            help
+                When protocol mode is Auto, the example tries five profiles in
+                this order (each profile is retried as configured below):
+                1 Attempt: 320x240, 30 FPS, MJPEG
+                2 Attempt: 480x320, 25 FPS, MJPEG
+                3 Attempt: 480x320, first available FPS, MJPEG
+                4 Attempt: 640x480, 15 FPS, MJPEG
+                5 Attempt: 1280x720, first available FPS, MJPEG
+                If all five attempts result in an error, the example displays the error message and
+                suggests to try another USB UVC Device.
+
+        config EXAMPLE_UVC_PROTOCOL_MODE_CUSTOM
+            bool "Custom"
+            help
+                When protocol mode set to Custom, the example tries to negotiate protocol with
+                configured parameters: Attempts, Width, Height, FPS, Frame Coding format.
+                After all attempts result in an error, the example displays the error message and
+                suggests to try another USB UVC Device.
+
+    endchoice
+
+    config EXAMPLE_NEGOTIATION_ATTEMPTS
+        int "Negotiation attempts"
+        default 3
+        help
+            Number of attempts to negotiate custom protocol parameters.
+
+    menu "UVC Protocol parameters"
+        depends on EXAMPLE_UVC_PROTOCOL_MODE_CUSTOM
+
+        config EXAMPLE_WIDTH_PARAM
+            int "Width resolution in pixels"
+            default 320
+            help
+                Configure the negotiation width parameter during UVC device stream getting.
+        config EXAMPLE_HEIGHT_PARAM
+            int "Height resolution in pixels"
+            default 240
+            help
+                Configure the negotiation height parameter during UVC device stream getting.
+        config EXAMPLE_FPS_PARAM
+            int "FPS"
+            default 30
+            help
+                Configure the negotiation FPS parameter during UVC device stream getting.
+                Can be any value, available from the Frame Descriptor of the UVC device.
+                When 0 - negotiation accept the first rate available.
+
+        choice EXAMPLE_NEGOTIATION_FORMAT
+            prompt "Frame coding format of the stream, transport-independent"
+            default UVC_FRAME_FORMAT_MJPEG
+            help
+                Configure the negotiation frame coding of stream.
+
+            config UVC_FRAME_FORMAT_UNKNOWN
+                bool "Unknown"
+            config UVC_FRAME_FORMAT_UNCOMPRESSED
+                bool "Uncompressed"
+            config UVC_FRAME_FORMAT_COMPRESSED
+                bool "Compressed"
+            config UVC_FRAME_FORMAT_YUYV
+                bool "YUYV"
+            config UVC_FRAME_FORMAT_UYVY
+                bool "UYVY"
+            config UVC_FRAME_FORMAT_RGB
+                bool "RGB"
+            config UVC_FRAME_FORMAT_BGR
+                bool "BGR"
+            config UVC_FRAME_FORMAT_MJPEG
+                bool "MJPEG"
+            config UVC_FRAME_FORMAT_GRAY8
+                bool "GRAY8"
+            config UVC_FRAME_FORMAT_GRAY16
+                bool "GRAY16"
+            config UVC_FRAME_FORMAT_NV12
+                bool "NV12"
+
+        endchoice
+
+        config EXAMPLE_FORMAT_PARAM
+            int
+            default 0  if UVC_FRAME_FORMAT_UNKNOWN
+            default 1  if UVC_FRAME_FORMAT_UNCOMPRESSED
+            default 2  if UVC_FRAME_FORMAT_COMPRESSED
+            default 3  if UVC_FRAME_FORMAT_YUYV
+            default 4  if UVC_FRAME_FORMAT_UYVY
+            default 5  if UVC_FRAME_FORMAT_RGB
+            default 6  if UVC_FRAME_FORMAT_BGR
+            default 7  if UVC_FRAME_FORMAT_MJPEG
+            default 9  if UVC_FRAME_FORMAT_GRAY8
+            default 10 if UVC_FRAME_FORMAT_GRAY16
+            default 17 if UVC_FRAME_FORMAT_NV12
+    endmenu
+
+endmenu
