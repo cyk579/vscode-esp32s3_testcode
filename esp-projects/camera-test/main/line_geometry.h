@@ -16,9 +16,9 @@ extern "C" {
 #endif
 
 /* ---- ROI 与扫描几何（ESP 端和 host 测试共用同一组常量） ---- */
-#define LINE_ROI_LEFT_PERCENT 10
-#define LINE_ROI_RIGHT_PERCENT 90
-#define LINE_ROI_TOP_PERCENT 15
+#define LINE_ROI_LEFT_PERCENT 15
+#define LINE_ROI_RIGHT_PERCENT 85
+#define LINE_ROI_TOP_PERCENT 25
 #define LINE_ROI_BOTTOM_PERCENT 100
 #define LINE_LOCAL_CONTRAST_MIN 18
 #define LINE_NEAR_TOP_PERCENT 65

@@ -2152,6 +2152,12 @@ static void update_seed(const line_observation_t *observation)
 
 static const char *state_name(void)
 {
+    if (s_finished) {
+        return "FINDBALL";
+    }
+    if (s_finish_frames > 0) {
+        return "T_FINISH";
+    }
     switch (s_state) {
     case LINE_STATE_CORNER:
         return "CORNER";
@@ -2180,6 +2186,10 @@ bool camera_line_follow_status_callback(camera_display_status_t *status,
         status->state = CAMERA_DISPLAY_STATUS_AVOID_FORWARD;
     } else if (s_obstacle_state == OBSTACLE_RIGHT) {
         status->state = CAMERA_DISPLAY_STATUS_AVOID_RIGHT;
+    } else if (s_finished) {
+        status->state = CAMERA_DISPLAY_STATUS_FINDBALL;
+    } else if (s_finish_frames > 0) {
+        status->state = CAMERA_DISPLAY_STATUS_T_FINISH;
     } else {
         status->state = s_post_corner_align ? CAMERA_DISPLAY_STATUS_ALIGN :
                         (s_state == LINE_STATE_CORNER ? CAMERA_DISPLAY_STATUS_CORNER :
