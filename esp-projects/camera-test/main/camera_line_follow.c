@@ -166,9 +166,9 @@
 /* NORMAL 低速用时间脉冲而不是把 PWM 压到静摩擦死区。MIN 只抬 mixer
  * 输入的 forward，绝不逐轮改 A/B/D；esp_timer 只负责切换 duty。 */
 #define LINE_BURST_ENABLE 1
-#define LINE_BURST_PERIOD_MS 600U
-#define LINE_BURST_ON_MS 580U
-#define LINE_BURST_MIN_OUTPUT 27
+#define LINE_BURST_PERIOD_MS 1000U
+#define LINE_BURST_ON_MS 995U
+#define LINE_BURST_MIN_OUTPUT 30
 #define LINE_BURST_TICK_MS 5U
 
 /* 直线回中只补一个很小的 yaw，8 个误差单位以内保持死区，避免来回抖动。 */
