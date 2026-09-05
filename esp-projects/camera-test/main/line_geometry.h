@@ -44,7 +44,7 @@ extern "C" {
  * 会让同一物理姿态在两种尺寸下给出相差一倍的 heading。120x80 时分别得到
  * 3/10/14 行，与此前的固定值完全一致。基线仍与跟踪长度无关。 */
 #define LINE_NEAR_ROWS_PERMILLE 75
-#define LINE_HEADING_ROWS_PERMILLE 250
+#define LINE_HEADING_ROWS_PERMILLE 150
 #define LINE_FAR_ROWS_PERMILLE 350
 
 /* 线段形状分类的相对门限，全部以近场线宽 w 为基准：

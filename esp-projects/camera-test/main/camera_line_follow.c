@@ -143,9 +143,9 @@
  * 落在起转值以下会被混控丢掉，只剩后轮在推。
  * TODO(实测): LINE_CAM_PIVOT_PERCENT 用尺子量 a 和 L 后填 a*100/(2L)。 */
 #define LINE_PIVOT_TURN 15
-#define LINE_TURN_A_SPEED 14
-#define LINE_TURN_B_SPEED 13
-#define LINE_TURN_D_SPEED 15
+#define LINE_TURN_A_SPEED 12
+#define LINE_TURN_B_SPEED 11
+#define LINE_TURN_D_SPEED 13
 #define LINE_TURN_PENDING_MS 1200U
 /* 摄像头在底盘前方：旧线消失并确认要转弯后，先让底盘向前走一小段。 */
 #define LINE_CORNER_CENTER_DELAY_MS 200U
@@ -168,15 +168,15 @@
 #define LINE_BURST_ENABLE 1
 #define LINE_BURST_PERIOD_MS 600U
 #define LINE_BURST_ON_MS 540U
-#define LINE_BURST_MIN_OUTPUT 27
+#define LINE_BURST_MIN_OUTPUT 22
 #define LINE_BURST_TICK_MS 5U
 
 /* 直线回中只补一个很小的 yaw，8 个误差单位以内保持死区，避免来回抖动。 */
 #define LINE_CENTER_YAW_DEADBAND 12
 #define LINE_CENTER_YAW_GAIN 6
 #define LINE_CENTER_YAW_MAX 2
-#define LINE_NORMAL_TURN_SLEW 3
-#define LINE_CENTER_LAT_MAX_OUTPUT 10
+#define LINE_NORMAL_TURN_SLEW 2
+#define LINE_CENTER_LAT_MAX_OUTPUT 0
 #define LINE_NORMAL_LAT_SLEW 3
 
 /* 校准模式：置 1 后不跑视觉，直接按脚本输出电机命令并打日志。
