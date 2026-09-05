@@ -324,7 +324,7 @@ void app_main(void)
     esp_err_t display_err = camera_display_start();
     if (display_err == ESP_OK) {
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
-        ESP_LOGI(TAG, "Camera JPEG decoder ready; TFT color preview + line overlay enabled (160x128 landscape)");
+        ESP_LOGI(TAG, "Camera JPEG decoder ready; TFT low-rate status page enabled (2 Hz)");
 #else
         ESP_LOGI(TAG, "Camera JPEG decoder ready; TFT status page disabled");
 #endif

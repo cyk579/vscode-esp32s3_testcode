@@ -35,13 +35,13 @@
 #define CAMERA_BINARY_LIGHT_PERCENTILE 90
 #define CAMERA_BINARY_MIN_CONTRAST 32
 #define CAMERA_BINARY_BLACK_FRACTION_PERCENT 35
-#define CAMERA_BINARY_THRESHOLD_MIN 75
+#define CAMERA_BINARY_THRESHOLD_MIN 25
 #define CAMERA_BINARY_THRESHOLD_MAX 120
 #define CAMERA_BINARY_THRESHOLD_SLEW 4
 #define CAMERA_BINARY_THRESHOLD_FILTER_OLD 3
 #define CAMERA_BINARY_THRESHOLD_FILTER_NEW 1
 
-#define CAMERA_TFT_REFRESH_US 400000LL
+#define CAMERA_TFT_STATUS_REFRESH_MS 500U
 
 typedef struct {
     uint8_t slot;
@@ -75,7 +75,6 @@ typedef struct {
     void *status_callback_ctx;
     camera_display_preview_callback_t preview_callback;
     void *preview_callback_ctx;
-    int64_t last_preview_us;
     uint8_t binary_threshold;
     bool threshold_initialized;
     uint8_t threshold_filtered;
@@ -471,6 +470,39 @@ static bool enqueue_latest_control(const control_frame_ref_t *frame)
     return false;
 }
 
+#if 0 /* Image preview is intentionally disabled; TFT is a status page. */
+static bool acquire_preview_buffer(uint8_t *buffer)
+{
+    if (xQueueReceive(s_display.free_preview_buffers, buffer, 0) == pdTRUE) {
+        return true;
+    }
+
+    /* If the low-priority TFT task has not consumed the previous frame, reuse
+     * that stale buffer for the newest preview. */
+    preview_frame_ref_t stale;
+    if (xQueueReceive(s_display.ready_preview_frames, &stale, 0) == pdTRUE) {
+        *buffer = stale.buffer;
+        ++s_display.preview_dropped_frames;
+        ++s_display.frames_dropped;
+        return true;
+    }
+    return false;
+}
+
+static bool enqueue_latest_preview(const preview_frame_ref_t *frame)
+{
+    if (xQueueSend(s_display.ready_preview_frames, frame, 0) == pdTRUE) {
+        return true;
+    }
+    if (xQueueSend(s_display.free_preview_buffers, &frame->buffer, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "Preview buffer pool corruption");
+    }
+    ++s_display.preview_dropped_frames;
+    ++s_display.frames_dropped;
+    return false;
+}
+#endif
+
 static void camera_control_task(void *arg)
 {
     (void)arg;
@@ -487,34 +519,39 @@ static void camera_control_task(void *arg)
             ++s_display.control_frames;
             s_display.frame_callback(s_display.control_rgb565[frame.buffer],
                                      frame.width, frame.height, frame.threshold,
-                                     s_display.tft_ready,
+                                     false,
                                      s_display.frame_callback_ctx);
         }
-#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
-        /* Reuse the frame that control just processed. Decoding the same JPEG
-         * again for TFT was starving the control decoder. */
+#if 0 /* Image preview is intentionally disabled; TFT is a status page. */
+        /* Copy only at the low preview cadence. SPI and preview callbacks run
+         * in a separate low-priority task, so the control task never blocks
+         * on TFT transfer. */
         const int64_t preview_now = esp_timer_get_time();
         const bool preview_due = s_display.tft_ready &&
                                  (s_display.last_preview_us == 0 ||
                                   preview_now - s_display.last_preview_us >=
                                       CAMERA_TFT_REFRESH_US);
         if (preview_due) {
-            if (s_display.preview_callback != NULL) {
-                s_display.preview_callback(s_display.control_rgb565[frame.buffer],
-                                            frame.width, frame.height,
-                                            frame.threshold, frame.sequence,
-                                            frame.capture_us,
-                                            s_display.preview_callback_ctx);
-            }
-            const int64_t tft_start_us = esp_timer_get_time();
-            if (tft_st7735_draw_rgb565(s_display.control_rgb565[frame.buffer],
-                                       frame.width, frame.height)) {
-                s_display.last_tft_us =
-                    (uint32_t)(esp_timer_get_time() - tft_start_us);
-                s_display.last_preview_us = preview_now;
-                ++s_display.preview_frames;
+            /* Reserve this cadence even if both preview buffers are busy; a
+             * slow SPI transfer must not make every control frame retry. */
+            s_display.last_preview_us = preview_now;
+            uint8_t preview_buffer = 0;
+            if (acquire_preview_buffer(&preview_buffer)) {
+                const size_t bytes = (size_t)frame.width * frame.height * 2U;
+                memcpy(s_display.preview_rgb565[preview_buffer],
+                       s_display.control_rgb565[frame.buffer], bytes);
+                const preview_frame_ref_t preview = {
+                    .buffer = preview_buffer,
+                    .width = frame.width,
+                    .height = frame.height,
+                    .threshold = frame.threshold,
+                    .sequence = frame.sequence,
+                    .capture_us = frame.capture_us,
+                };
+                (void)enqueue_latest_preview(&preview);
             } else {
-                ESP_LOGW(TAG, "TFT control-frame draw failed");
+                ++s_display.preview_dropped_frames;
+                ++s_display.frames_dropped;
             }
         }
 #endif
@@ -524,7 +561,38 @@ static void camera_control_task(void *arg)
     }
 }
 
-#if 0 /* Image preview is the debug page; do not let a status task overwrite it. */
+#if 0 /* Image preview is intentionally disabled; TFT is a status page. */
+static void camera_preview_task(void *arg)
+{
+    (void)arg;
+    preview_frame_ref_t frame;
+    while (true) {
+        if (xQueueReceive(s_display.ready_preview_frames, &frame, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        ++s_display.preview_frames;
+        if (s_display.preview_callback != NULL) {
+            s_display.preview_callback(s_display.preview_rgb565[frame.buffer],
+                                        frame.width, frame.height, frame.threshold,
+                                        frame.sequence, frame.capture_us,
+                                        s_display.preview_callback_ctx);
+        }
+        const int64_t tft_start_us = esp_timer_get_time();
+        if (!tft_st7735_draw_rgb565(s_display.preview_rgb565[frame.buffer],
+                                    frame.width, frame.height)) {
+            ESP_LOGW(TAG, "TFT control-frame draw failed");
+        } else {
+            s_display.last_tft_us =
+                (uint32_t)(esp_timer_get_time() - tft_start_us);
+        }
+        if (xQueueSend(s_display.free_preview_buffers, &frame.buffer, 0) != pdTRUE) {
+            ESP_LOGE(TAG, "Preview buffer pool corruption after draw");
+        }
+    }
+}
+#endif
+
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
 static const char *status_state_name(camera_display_status_state_t state)
 {
     switch (state) {
@@ -701,6 +769,12 @@ static void release_allocations(void)
         heap_caps_free(s_display.control_rgb565[i]);
         s_display.control_rgb565[i] = NULL;
     }
+#if 0 /* Image preview buffers are disabled; no display framebuffer is needed. */
+    for (size_t i = 0; i < CAMERA_PREVIEW_BUFFER_COUNT; ++i) {
+        heap_caps_free(s_display.preview_rgb565[i]);
+        s_display.preview_rgb565[i] = NULL;
+    }
+#endif
     heap_caps_free(s_display.control_jpeg_work);
     s_display.control_jpeg_work = NULL;
     if (s_display.free_slots != NULL) {
@@ -719,6 +793,16 @@ static void release_allocations(void)
         vQueueDelete(s_display.ready_control_frames);
         s_display.ready_control_frames = NULL;
     }
+#if 0 /* Image preview queues are disabled; TFT uses the status task only. */
+    if (s_display.free_preview_buffers != NULL) {
+        vQueueDelete(s_display.free_preview_buffers);
+        s_display.free_preview_buffers = NULL;
+    }
+    if (s_display.ready_preview_frames != NULL) {
+        vQueueDelete(s_display.ready_preview_frames);
+        s_display.ready_preview_frames = NULL;
+    }
+#endif
 }
 
 esp_err_t camera_display_start(void)
@@ -742,7 +826,6 @@ esp_err_t camera_display_start(void)
     s_display.last_tft_us = 0;
     s_display.last_control_age_us = 0;
     s_display.last_control_sequence = 0;
-    s_display.last_preview_us = 0;
     s_display.next_sequence = 0;
     s_mjpeg_drop_log_count = 0;
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
@@ -759,9 +842,19 @@ esp_err_t camera_display_start(void)
     s_display.free_control_buffers =
         xQueueCreate(CAMERA_CONTROL_BUFFER_COUNT, sizeof(uint8_t));
     s_display.ready_control_frames = xQueueCreate(1, sizeof(control_frame_ref_t));
+#if 0 /* Image preview queues are disabled; TFT uses the status task only. */
+    s_display.free_preview_buffers =
+        xQueueCreate(CAMERA_PREVIEW_BUFFER_COUNT, sizeof(uint8_t));
+    s_display.ready_preview_frames = xQueueCreate(1, sizeof(preview_frame_ref_t));
+#endif
     if (s_display.free_slots == NULL || s_display.ready_slots == NULL ||
         s_display.free_control_buffers == NULL ||
-        s_display.ready_control_frames == NULL) {
+        s_display.ready_control_frames == NULL
+#if 0 /* Image preview queues are disabled; TFT uses the status task only. */
+        || s_display.free_preview_buffers == NULL ||
+        s_display.ready_preview_frames == NULL
+#endif
+        ) {
         ESP_LOGE(TAG, "Could not allocate camera pipeline queues");
         release_allocations();
         return ESP_ERR_NO_MEM;
@@ -794,6 +887,22 @@ esp_err_t camera_display_start(void)
             return ESP_ERR_NO_MEM;
         }
     }
+#if 0 /* Image preview buffers are disabled; TFT uses the status task only. */
+    for (uint8_t buffer = 0; buffer < CAMERA_PREVIEW_BUFFER_COUNT; ++buffer) {
+        s_display.preview_rgb565[buffer] = heap_caps_malloc(
+            CAMERA_PREVIEW_RGB565_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (s_display.preview_rgb565[buffer] == NULL) {
+            s_display.preview_rgb565[buffer] = heap_caps_malloc(
+                CAMERA_PREVIEW_RGB565_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
+        if (s_display.preview_rgb565[buffer] == NULL ||
+            xQueueSend(s_display.free_preview_buffers, &buffer, 0) != pdTRUE) {
+            ESP_LOGE(TAG, "Could not allocate preview RGB565 buffer %u", buffer);
+            release_allocations();
+            return ESP_ERR_NO_MEM;
+        }
+    }
+#endif
     s_display.control_jpeg_work = heap_caps_malloc(
         CAMERA_DISPLAY_JPEG_WORK_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (s_display.control_jpeg_work == NULL) {
@@ -811,11 +920,27 @@ esp_err_t camera_display_start(void)
         ESP_LOGE(TAG, "Could not create camera control tasks");
         return ESP_ERR_NO_MEM;
     }
+#if 0 /* Image preview task is disabled; TFT uses the status task only. */
+    if (s_display.tft_ready &&
+        xTaskCreatePinnedToCore(camera_preview_task, "tft_preview", 3072,
+                                NULL, 1, NULL, 1) != pdPASS) {
+        ESP_LOGW(TAG, "Could not create TFT preview task; control remains active");
+        s_display.tft_ready = false;
+    }
+#endif
     s_display.started = true;
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+    if (s_display.tft_ready &&
+        xTaskCreatePinnedToCore(camera_tft_status_task, "tft_status", 3072,
+                                NULL, 1, NULL, 1) != pdPASS) {
+        ESP_LOGW(TAG, "Could not create TFT status task; control remains active");
+        s_display.tft_ready = false;
+    }
+#endif
     ESP_LOGI(TAG, "Camera pipeline started: control <=%ux%u, TFT=%s",
              CAMERA_CONTROL_MAX_WIDTH, CAMERA_CONTROL_MAX_HEIGHT,
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
-             s_display.tft_ready ? "direct control frame" : "unavailable"
+             s_display.tft_ready ? "low-priority status task (2Hz)" : "unavailable"
 #else
              "disabled"
 #endif

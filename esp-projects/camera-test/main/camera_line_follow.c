@@ -267,7 +267,7 @@
 #define ULTRASONIC_ECHO GPIO_NUM_11
 #define ULTRASONIC_MIN_CM 2.0f
 #define ULTRASONIC_MAX_CM 400.0f
-#define OBSTACLE_DETECT_CM 25.0f
+#define OBSTACLE_DETECT_CM 10.0f
 #define OBSTACLE_CLOSE_CONFIRM_SAMPLES 3U
 /* HC-SR04 practical lower bound; the read routine still performs its own
  * echo timeout, so a missing echo can make the effective period longer. */
@@ -682,10 +682,19 @@ static void save_overlay_snapshot(uint16_t width, uint16_t height,
     if (xSemaphoreTake(s_overlay_mutex, 0) != pdTRUE) {
         return;
     }
-    /* Keep the last usable overlay through a detector miss. Clearing it here
-     * made the TFT appear to stop updating exactly when the car lost the line,
-     * which hid the evidence needed to tune the controller. */
+    /* The preview must describe the latest detector result.  Keeping an old
+     * path after a miss makes a lost line look falsely valid on the TFT. */
     if (observation->point_count == 0) {
+        s_overlay_snapshot.valid = false;
+        s_overlay_snapshot.control_width = width;
+        s_overlay_snapshot.control_height = height;
+        s_overlay_snapshot.point_count = 0;
+        s_overlay_snapshot.seed_x = -1;
+        s_overlay_snapshot.seed_y = -1;
+        s_overlay_snapshot.corner_valid = false;
+        s_overlay_snapshot.corner_x = -1;
+        s_overlay_snapshot.corner_y = -1;
+        s_overlay_snapshot.sequence = sequence;
         (void)xSemaphoreGive(s_overlay_mutex);
         return;
     }

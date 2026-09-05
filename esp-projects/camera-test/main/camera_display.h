@@ -44,7 +44,7 @@ typedef struct {
 typedef bool (*camera_display_status_callback_t)(camera_display_status_t *status,
                                                  void *user_ctx);
 
-/* Called at the TFT refresh rate with the decoded control RGB565 frame. */
+/* Retained for source compatibility; the image preview path is disabled. */
 typedef void (*camera_display_preview_callback_t)(uint8_t *rgb565_big_endian,
                                                    uint16_t width,
                                                    uint16_t height,
@@ -69,7 +69,7 @@ typedef struct {
     uint32_t last_control_sequence;
 } camera_display_pipeline_stats_t;
 
-/** Initialise the asynchronous JPEG decoder and optional direct TFT preview. */
+/** Initialise the asynchronous JPEG decoder and optional low-rate TFT status page. */
 esp_err_t camera_display_start(void);
 
 /**
@@ -77,8 +77,7 @@ esp_err_t camera_display_start(void);
  * decoder. The callback receives the writable decoded RGB565 frame without
  * any display-only conversion. source_threshold is the adaptive grayscale
  * threshold, or zero when the source frame did not have enough contrast.
- * draw_overlay is true when the low-frequency TFT preview is enabled, allowing
- * the callback to update a small overlay snapshot on the writable frame.
+ * draw_overlay is reserved for compatibility and is false for the status page.
  * The callback runs in the control task and must not block for long.
  */
 void camera_display_set_frame_callback(camera_display_frame_callback_t callback,
@@ -87,8 +86,7 @@ void camera_display_set_frame_callback(camera_display_frame_callback_t callback,
 void camera_display_set_status_callback(camera_display_status_callback_t callback,
                                          void *user_ctx);
 
-/* Register the low-frequency preview callback. It receives the decoded
- * control frame while that buffer is still owned by the control task. */
+/* Retained for source compatibility; the image preview path is disabled. */
 void camera_display_set_preview_callback(camera_display_preview_callback_t callback,
                                          void *user_ctx);
 
