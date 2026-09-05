@@ -116,7 +116,7 @@
 #define LINE_PID_KH 65
 #define LINE_PID_SCALE 100
 #define LINE_TURN_MAX 13
-#define LINE_YAW_MIN_OUTPUT 13
+#define LINE_YAW_MIN_OUTPUT 7
 #define LINE_LAT_MAX 16
 #define LINE_LAT_MIN_OUTPUT 11
 #define LINE_SEED_SLEW_PX 12
@@ -166,8 +166,8 @@
 /* NORMAL 低速用时间脉冲而不是把 PWM 压到静摩擦死区。MIN 只抬 mixer
  * 输入的 forward，绝不逐轮改 A/B/D；esp_timer 只负责切换 duty。 */
 #define LINE_BURST_ENABLE 1
-#define LINE_BURST_PERIOD_MS 100U
-#define LINE_BURST_ON_MS 80U
+#define LINE_BURST_PERIOD_MS 600U
+#define LINE_BURST_ON_MS 580U
 #define LINE_BURST_MIN_OUTPUT 27
 #define LINE_BURST_TICK_MS 5U
 
