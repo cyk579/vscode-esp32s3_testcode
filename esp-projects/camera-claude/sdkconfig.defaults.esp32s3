@@ -10,6 +10,20 @@ CONFIG_ESPTOOLPY_OCT_FLASH=y
 CONFIG_ESPTOOLPY_FLASHMODE_OPI=y
 CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
 
+# 下面两项本来靠 IDF 默认值就能对，但这个工程要在两台电脑上编译，
+# IDF 版本不同默认值就可能不同。这两项一旦和 camera-test（这台车上
+# 已经验证能跑）不一致，症状是"烧录成功但一启动就崩"，很难查。
+# 所以照抄 camera-test/sdkconfig 里已验证的值，钉死，不靠默认。
+#
+# OPI flash 必须 80MHz。
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+#
+# 欠压检测阈值。7 是最低的那一档（约 2.51V），也就是最不容易误触发。
+# 舵机和三个电机启动时的电流冲击会把 3.3V 拽下去，阈值设高了会直接
+# 复位 —— 表现就是反复重启。camera-test 用的是 7。
+CONFIG_BROWNOUT_DET=y
+CONFIG_BROWNOUT_DET_LVL_SEL_7=y
+
 # Keep USB logs available during the 3-second diagnostic window.
 # CONFIG_ESP_CONSOLE_SECONDARY_NONE is not set
 CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y

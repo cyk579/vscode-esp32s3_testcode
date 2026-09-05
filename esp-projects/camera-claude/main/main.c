@@ -2,6 +2,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"          // <-- 新增
+#include "esp_system.h"       // esp_get_free_heap_size()，模式 8 打剩余内存用
 #include <math.h>             // 🌟 新增：引入数学库以支持 fabsf()
 
 #include "motor.h"
@@ -14,7 +15,19 @@
 #include "wifi_mjpeg.h"
 #include "tft.h"              // 🌟 新增：引入屏幕驱动头文件
 
-#define TEST_MODE 6
+// ┌──────────────────────────────────────────────────────────────────────┐
+// │ 当前是 8 = 分段启动排查，不是 6。                                     │
+// │                                                                      │
+// │ 因为 3ed8ddc 在本车上启动就崩：屏幕约每 500ms 闪一次，车不动。        │
+// │ 500ms 正好是下面 app_main 开头那个 vTaskDelay(500)，也就是每次重启    │
+// │ 都跑一遍 tft_init + 清屏 + 画字，然后崩，再重启。                     │
+// │                                                                      │
+// │ 模式 8 的初始化顺序和模式 6 完全一致，只是每步前打一行 [n/9]、        │
+// │ 全程不驱动电机。串口里最后出现的 [n/9] 就是崩溃点。                   │
+// │                                                                      │
+// │ 排查完把这里改回 6，就是完整巡线。                                    │
+// └──────────────────────────────────────────────────────────────────────┘
+#define TEST_MODE 8
 #define PID_CONTROL_PERIOD_MS 10
 #define PID_PRINT_PERIOD_MS 100
 
@@ -531,6 +544,85 @@ void app_main(void) {
         set_motor_D(0, 0);
         printf("\n一轮结束，5 秒后重来。Ctrl+] 退出 monitor。\n");
         vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+
+// ==================== 模式 8：分段启动排查 ====================
+// 用来定位启动崩溃。模式 6 里初始化是一口气做完的，崩了只知道"没跑起来"，
+// 不知道崩在哪一步。这里每一步前面打一行标记并停 300ms，
+// 串口里最后出现的那行就是崩溃点。
+//
+// 全程不驱动电机，安全。跑完会停在最后的空循环里打心跳。
+#elif TEST_MODE == 8
+    printf("\n===== 分段启动排查 =====\n");
+    printf("串口里最后出现的 [n/9] 就是崩溃点。\n");
+    printf("如果连 [1/9] 都没有，说明崩在 app_main 之前 ——\n");
+    printf("往上翻找 rst: 开头那行复位原因，和 PSRAM/Flash 的初始化日志。\n\n");
+
+    printf("[1/9] TFT 初始化...\n");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    tft_init();
+    tft_clear(TFT_BLACK);
+    printf("      OK\n");
+
+    printf("[2/9] 电机初始化（含 STBY 拉高，不给功率）...\n");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    motor_init();
+    printf("      OK\n");
+
+    printf("[3/9] PID 初始化...\n");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    pid_init();
+    printf("      OK\n");
+
+    printf("[4/9] 编码器初始化（PCNT，六个脚配成输入）...\n");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    encoder_init();
+    printf("      OK\n");
+
+    // 这一步在模式 6 里就有，而且在摄像头之前。display_task 每 100ms 刷一次
+    // TFT，优先级 4 比 app_main（1）高，建起来就会立刻抢过去画。
+    // 顺序必须和模式 6 一致，否则"抢 SPI"这类崩因在这里复现不出来。
+    printf("[5/9] 屏幕刷新任务（优先级 4，会立刻抢占 app_main）...\n");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    xTaskCreate(display_task, "display_task", 4096, NULL, 4, NULL);
+    printf("      OK\n");
+
+    printf("[6/9] 超声波任务...\n");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    xTaskCreate(ultrasonic_task, "ultrasonic_task", 2048, NULL, 5, NULL);
+    printf("      OK\n");
+
+    printf("[7/9] 舵机初始化 + 摆到初始角度（电流冲击最大的一步）...\n");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    camera_track_init();
+    printf("      OK\n");
+
+    printf("[8/9] 摄像头取流任务（USB 枚举 + 480x320 协商）...\n");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    camera_track_start();
+    printf("      OK（协商结果看后面 CAM_TRACK 的日志）\n");
+
+    printf("[9/9] Wi-Fi SoftAP + MJPEG 服务...\n");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    QueueHandle_t q8 = camera_track_get_frame_queue();
+    if (q8) {
+        wifi_mjpeg_start(q8);
+        printf("      OK\n");
+    } else {
+        printf("      跳过：帧队列没建起来\n");
+    }
+
+    printf("\n===== 九步全过，启动没问题 =====\n");
+    printf("下面每 2 秒打一次心跳和剩余内存。\n");
+    printf("编码器计数会跟着手拨轮子变化 —— 这是验证接线最快的办法。\n\n");
+
+    while (1) {
+        float ra, rb, rd;
+        encoder_get_raw_speeds(&ra, &rb, &rd);
+        printf("心跳 | 距:%.1fcm | 编码器 A:%+6.1f B:%+6.1f D:%+6.1f | 空闲内存:%u\n",
+               g_obstacle_distance, ra, rb, rd,
+               (unsigned)esp_get_free_heap_size());
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 #endif
 }
