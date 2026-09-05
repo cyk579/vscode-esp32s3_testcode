@@ -482,5 +482,55 @@ void app_main(void) {
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+
+// ==================== 模式 7：编码器标定 ====================
+// 用来测 pid.c 里的 POWER_TO_SPEED_A/B/D。这个数是"功率 1000 对应每 10ms
+// 多少个编码器计数"，取决于编码器线数 × 减速比 × PCNT 倍频，换电机就得重测。
+//
+// 这里直接调 set_motor_X() 驱动，绕开 pid_manual_control ——
+// 后者内部会跑 speed_loop_control()，闭环会拿自己的输出当输入，测不准。
+#elif TEST_MODE == 7
+    motor_init();
+    encoder_init();
+
+    printf("\n===== 编码器标定模式 =====\n");
+    printf("每 500ms 打印一次原始计数（每 10ms 采样一次的累加值）。\n");
+    printf("A/B/D 三个轮依次单独转 4 秒，其余两轮停。\n\n");
+    printf("要看的两件事：\n");
+    printf("  1. 符号。轮子正转时计数应该为正。为负说明该轮编码器\n");
+    printf("     A/B 两线接反了，把 board_pins.h 里那一对脚号对调。\n");
+    printf("  2. 数值。取平稳后的平均值，算 POWER_TO_SPEED = 计数 / 1.385\n");
+    printf("     （测试功率 1385 = 他们的巡航速度 1600 x 0.866）\n\n");
+    printf("注意：必须落地带负载测，垫起来空转的读数偏高。\n");
+    printf("用空转值标定会让目标转速永远追不上，闭环一路顶到上限。\n\n");
+
+    const int cal_power = 1385;
+    while (1) {
+        for (int wheel = 0; wheel < 3; wheel++) {
+            const char *name = (wheel == 0) ? "A" : (wheel == 1) ? "B" : "D";
+            printf("\n--- %s 轮，功率 %d ---\n", name, cal_power);
+
+            set_motor_A(0, 0);
+            set_motor_B(0, 0);
+            set_motor_D(0, 0);
+            if (wheel == 0) set_motor_A(1, cal_power);
+            else if (wheel == 1) set_motor_B(1, cal_power);
+            else set_motor_D(1, cal_power);
+
+            for (int i = 0; i < 8; i++) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+                float ra, rb, rd;
+                encoder_get_raw_speeds(&ra, &rb, &rd);
+                float target = (wheel == 0) ? ra : (wheel == 1) ? rb : rd;
+                printf("  原始计数 A:%+6.1f B:%+6.1f D:%+6.1f  | %s 轮 POWER_TO_SPEED = %.1f\n",
+                       ra, rb, rd, name, target / (cal_power / 1000.0f));
+            }
+        }
+        set_motor_A(0, 0);
+        set_motor_B(0, 0);
+        set_motor_D(0, 0);
+        printf("\n一轮结束，5 秒后重来。Ctrl+] 退出 monitor。\n");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
 #endif
 }

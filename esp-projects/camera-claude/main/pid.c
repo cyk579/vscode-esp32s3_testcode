@@ -48,9 +48,17 @@
 #define SPEED_MIN_POWER 100          // 电机最小启动功率（低于此值不做闭环）
 #define TARGET_SPEED_SMOOTH_ALPHA 0.8f  // 目标速度低通滤波（0.8=变化快，0.5=更平滑）
 
-#define POWER_TO_SPEED_A 12.0f       // A 轮：1000 功率 对应 编码器计数/周期
-#define POWER_TO_SPEED_B 12.0f       // B 轮：（辅助轮）
-#define POWER_TO_SPEED_D 12.0f       // D 轮：
+/* 功率 1000 对应每 10ms 多少个编码器计数。取决于编码器线数 × 减速比 ×
+ * PCNT 倍频方式，换电机就必须重测 —— 下面 12.0 是他们车上的值。
+ *
+ * 用 TEST_MODE 7 测（main.c 末尾），落地带负载测，不能垫起来空转。
+ * 错在哪个方向都会坏事：
+ *   偏大 → 目标转速永远追不上，闭环每周期补 +500 顶到 PID_MAX_SPEED，
+ *          车以 44% 占空比冲出去，而不是巡航的 22%
+ *   偏小 → 目标低于实际，speed_diff 变负，闭环反过来减功率，车比设定的还慢 */
+#define POWER_TO_SPEED_A 12.0f       // A 轮：待实测
+#define POWER_TO_SPEED_B 12.0f       // B 轮：待实测（辅助轮）
+#define POWER_TO_SPEED_D 12.0f       // D 轮：待实测
 
 #define SPEED_KP_SMALL 0.3f          // 电机小偏差增益（< 8 计数/周期）
 #define SPEED_KP_MEDIUM 0.6f         // 电机中偏差增益（8 ~ 20）

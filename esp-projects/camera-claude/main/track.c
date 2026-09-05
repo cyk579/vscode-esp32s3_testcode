@@ -1,10 +1,22 @@
 #include "track.h"
 #include "board_pins.h"
+#include "track_config.h"
 #include "driver/gpio.h"
 
-/* 摄像头模式下（track_config.h 定义了 USE_CAMERA_TRACK）track_init() 不会被
- * 调用，这四脚实际不配置。本车这几个脚和舵机、编码器占位脚重复，要切回红外
- * 模式前必须先确认接线，见 board_pins.h 的说明。 */
+/* 本车的红外模块已经物理拆除，那四个脚现在给了别的外设：
+ *   41/42 → D 轮编码器
+ *   2/1   → 俯仰舵机 / 水平舵机
+ * 摄像头模式下 track_init() 不会被调用，所以这四脚实际不会被配置，编译通过
+ * 但代码是死的。
+ *
+ * 下面这句 #error 是为了拦住"注释掉 USE_CAMERA_TRACK 切回红外"这个操作 ——
+ * 一旦切回去，track_init() 会把这四脚重新配成输入，D 轮编码器和两个舵机同时
+ * 失效，而且现象是"车能跑但转向不对、摄像头不动"，很难往引脚上想。
+ * 真要用红外循迹，先在 board_pins.h 里给它分配真正空闲的脚。 */
+#ifndef USE_CAMERA_TRACK
+#error "本车红外模块已拆除，PIN_IR_OUT1..4 现在是 D 轮编码器(41/42)和两个舵机(2/1)。切回红外模式前必须先在 board_pins.h 里重新分配这四个脚，再删掉这句 #error。"
+#endif
+
 #define SENSOR_OUT1 PIN_IR_OUT1
 #define SENSOR_OUT2 PIN_IR_OUT2
 #define SENSOR_OUT3 PIN_IR_OUT3

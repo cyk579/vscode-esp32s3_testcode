@@ -1,3 +1,10 @@
-test/harness
-test/harness.exe
 build/
+managed_components/
+dependencies.lock
+
+# sdkconfig 是 idf.py set-target 生成的，不进版本库。
+# 配置的唯一来源是 sdkconfig.defaults 和 sdkconfig.defaults.esp32s3 ——
+# 想让某项设置在两台电脑上都生效，就写进那两个文件，而不是 menuconfig 改完
+# 指望 sdkconfig 跟着走。
+sdkconfig
+sdkconfig.old
