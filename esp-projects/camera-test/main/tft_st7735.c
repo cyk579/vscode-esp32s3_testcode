@@ -430,6 +430,12 @@ bool tft_st7735_init(void)
     gpio_set_direction(TFT_CS, GPIO_MODE_OUTPUT);
     gpio_reset_pin(TFT_RST);
     gpio_set_direction(TFT_RST, GPIO_MODE_OUTPUT);
+    /* Keep the panel deselected and out of command mode while the ESP32
+     * peripheral/SPI bus is coming back after a reset. */
+    gpio_set_level(TFT_CS, 1);
+    gpio_set_level(TFT_DC, 0);
+    gpio_set_level(TFT_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     const spi_bus_config_t bus_config = {
         .sclk_io_num = TFT_SCLK,
@@ -458,9 +464,9 @@ bool tft_st7735_init(void)
     }
 
     gpio_set_level(TFT_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(30));
     gpio_set_level(TFT_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(120));
+    vTaskDelay(pdMS_TO_TICKS(150));
 
     uint8_t color_mode = 0x05;  // RGB565
     uint8_t madctl = TFT_MADCTL_LANDSCAPE;

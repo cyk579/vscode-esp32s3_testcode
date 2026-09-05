@@ -143,6 +143,10 @@
 #define LINE_POST_CORNER_HEADING_PERCENT 25
 #define LINE_POST_CORNER_ALIGN_FRAMES 4U
 #define LINE_POST_CORNER_ALIGN_TIMEOUT_MS 1200U
+/* Do not interpret the same near-field corner pixels as a second turn while
+ * the chassis is still settling after a pivot. */
+#define LINE_POST_CORNER_NEXT_GUARD_MS 350U
+#define LINE_POST_CORNER_NEXT_MIN_ALIGN_FRAMES 2U
 /* 绕摄像头旋转：lat = turn * a/(2L)。偏航量必须够大，否则 a/d = lat - turn
  * 落在起转值以下会被混控丢掉，只剩后轮在推。
  * TODO(实测): LINE_CAM_PIVOT_PERCENT 用尺子量 a 和 L 后填 a*100/(2L)。 */
@@ -1631,8 +1635,8 @@ static bool enter_findball_after_finish_line_loss(int64_t now)
     return true;
 }
 
-/* LOST is a terminal safety result.  The only intentional hand-off is the
- * first line loss after the fixed obstacle route has completed. */
+/* LOST is a safe stop.  A later confirmed line can re-arm the normal tracker;
+ * the only intentional hand-off is the first loss after obstacle completion. */
 static void enter_terminal_lost(int64_t now, const char *reason)
 {
     s_state = LINE_STATE_LOST;
@@ -1642,6 +1646,11 @@ static void enter_terminal_lost(int64_t now, const char *reason)
     s_turn_started_us = 0;
     s_corner_center_delay_until_us = 0;
     s_turn_pending_until_us = 0;
+    s_arm_frames = 0;
+    /* A manual reposition after LOST must not be constrained to the old
+     * seed; the next candidate starts with the normal bottom-center search. */
+    s_seed_valid = false;
+    s_last_good_observation_us = 0;
     reset_control();
     if (enter_findball_after_finish_line_loss(now)) {
         return;
@@ -1649,7 +1658,8 @@ static void enter_terminal_lost(int64_t now, const char *reason)
     s_line_stopped = true;
     s_armed = false;
     stop_motors();
-    ESP_LOGW(TAG, "line LOST: terminal stop (%s)", reason == NULL ? "unknown" : reason);
+    ESP_LOGW(TAG, "line LOST: stopped; waiting for reacquire (%s)",
+             reason == NULL ? "unknown" : reason);
 }
 
 static void ball_next_search(int64_t now)
@@ -2489,15 +2499,9 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         ball_process_frame(rgb565_big_endian, width, height, now);
         goto done;
     }
-    if (s_line_stopped) {
-        /* Do not let a later frame or ultrasonic sample restart a terminal
-         * LOST run.  FINDBALL uses s_finished and is handled above. */
-        stop_motors();
-        goto done;
-    }
     /* Ultrasonic avoidance has priority over all camera state, including an
-     * already disarmed LOST state.  Do not spend a frame on vision or let the
-     * unarmed path pull STBY low while the fixed route owns the motors. */
+     * already disarmed LOST state.  A stopped LOST run still samples vision so
+     * a later reliable line can re-arm it. */
     if (obstacle_step(now, width)) {
         goto done;
     }
@@ -2621,8 +2625,11 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 ++s_arm_frames;
             }
             if (s_arm_frames >= LINE_ARM_CONFIRM_FRAMES) {
+                const bool recovering_lost = s_line_stopped ||
+                                              s_state == LINE_STATE_LOST;
                 s_armed = true;
                 s_mission_started = true;
+                s_line_stopped = false;
                 s_state = LINE_STATE_NORMAL;
                 reset_control();
                 update_seed(&observation);
@@ -2631,6 +2638,9 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                 gpio_set_level(STBY_GPIO, 1);
                 s_stby_enabled = true;
                 ESP_LOGI(TAG, "line confirmed; camera steering enabled");
+                if (recovering_lost) {
+                    ESP_LOGI(TAG, "line reacquired after LOST; resuming NORMAL");
+                }
             }
         } else if (!candidate) {
             s_arm_frames = 0;
@@ -2673,7 +2683,13 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
              * the normal four-frame alignment window completes. */
             const int trigger_y = (int)height * LINE_TURN_TRIGGER_PERCENT / 100;
             const int hint_y = (int)height * LINE_TURN_HINT_MIN_PERCENT / 100;
-            const bool next_corner = candidate &&
+            const bool align_guard_elapsed =
+                s_post_corner_align_started_us != 0 &&
+                now - s_post_corner_align_started_us >=
+                    (int64_t)LINE_POST_CORNER_NEXT_GUARD_MS * 1000;
+            const bool next_corner = candidate && align_guard_elapsed &&
+                                     s_post_corner_align_frames >=
+                                         LINE_POST_CORNER_NEXT_MIN_ALIGN_FRAMES &&
                                      observation.corner_direction != 0 &&
                                      observation.corner_row_y >= hint_y;
             if (next_corner) {
@@ -2860,7 +2876,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         goto done;
     }
 
-    /* ---- LOST：立即停车；避障完成后的首次 LOST 才交给找球 ---- */
+    /* ---- LOST：保持停车；后续连续确认到黑线后由上面的 arm 流程恢复 ---- */
     if (s_state == LINE_STATE_LOST) {
         if (enter_findball_after_finish_line_loss(now)) {
             goto done;
