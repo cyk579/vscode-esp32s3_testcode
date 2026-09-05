@@ -26,11 +26,11 @@ menu "Example Configuration"
 
     config EXAMPLE_ENABLE_TFT_PREVIEW
         bool "Enable TFT status page"
-        default n
+        default y
         help
-            Enables the optional low-rate ST7735 color camera preview with
-            black status text overlay. The competition default keeps this off
-            so SPI drawing cannot delay camera control.
+            Enables the low-rate ST7735 color camera preview with status text
+            and line overlay. Preview runs in a low-priority task and never
+            blocks camera control; disable it for maximum competition speed.
 
     config EXAMPLE_ENABLE_CAMERA_LINE_FOLLOW
         bool "Enable camera black-line following"

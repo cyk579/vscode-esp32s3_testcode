@@ -49,7 +49,7 @@ typedef struct {
 typedef bool (*camera_display_status_callback_t)(camera_display_status_t *status,
                                                  void *user_ctx);
 
-/* Called at the TFT refresh rate with the decoded control RGB565 frame. */
+/* Called by the low-priority TFT task with a recent decoded control frame. */
 typedef void (*camera_display_preview_callback_t)(uint8_t *rgb565_big_endian,
                                                    uint16_t width,
                                                    uint16_t height,
@@ -82,9 +82,8 @@ esp_err_t camera_display_start(void);
  * decoder. The callback receives the writable decoded RGB565 frame without
  * any display-only conversion. source_threshold is the adaptive grayscale
  * threshold, or zero when the source frame did not have enough contrast.
- * draw_overlay is true when the low-frequency TFT preview is enabled, allowing
- * the callback to update a small overlay snapshot on the writable frame.
- * The callback runs in the control task and must not block for long.
+ * draw_overlay is true when this frame will be offered to the low-frequency
+ * TFT task. The callback runs in the control task and must not block for long.
  */
 void camera_display_set_frame_callback(camera_display_frame_callback_t callback,
                                        void *user_ctx);
@@ -92,8 +91,8 @@ void camera_display_set_frame_callback(camera_display_frame_callback_t callback,
 void camera_display_set_status_callback(camera_display_status_callback_t callback,
                                          void *user_ctx);
 
-/* Register the low-frequency preview callback. It receives the decoded
- * control frame while that buffer is still owned by the control task. */
+/* Register the low-frequency preview callback. It runs outside the control
+ * task while the preview task owns the decoded frame buffer. */
 void camera_display_set_preview_callback(camera_display_preview_callback_t callback,
                                          void *user_ctx);
 

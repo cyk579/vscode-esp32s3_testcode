@@ -18,7 +18,8 @@
 /* Three JPEG slots let USB reception and control decode overlap. */
 #define CAMERA_DISPLAY_SLOT_COUNT 3
 #define CAMERA_DISPLAY_MAX_JPEG_BYTES (256 * 1024)
-#define CAMERA_CONTROL_BUFFER_COUNT 2
+#define CAMERA_CONTROL_BUFFER_COUNT 3
+#define CAMERA_PREVIEW_QUEUE_LENGTH 1
 #define CAMERA_CONTROL_MAX_WIDTH 160
 #define CAMERA_CONTROL_MAX_HEIGHT 120
 #define CAMERA_CONTROL_RGB565_BYTES \
@@ -67,6 +68,7 @@ typedef struct {
     QueueHandle_t ready_slots;
     QueueHandle_t free_control_buffers;
     QueueHandle_t ready_control_frames;
+    QueueHandle_t ready_preview_frames;
     bool started;
     bool tft_ready;
     camera_display_frame_callback_t frame_callback;
@@ -102,6 +104,7 @@ static uint32_t s_mjpeg_drop_log_count;
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
 static void camera_tft_overlay_status(uint8_t *frame, uint16_t width,
                                       uint16_t height);
+static void camera_preview_task(void *arg);
 #endif
 
 static void log_mjpeg_drop(const char *reason, size_t jpeg_len)
@@ -487,6 +490,41 @@ static bool enqueue_latest_control(const control_frame_ref_t *frame)
     return false;
 }
 
+static bool release_control_buffer(uint8_t buffer)
+{
+    if (xQueueSend(s_display.free_control_buffers, &buffer, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "Control frame pool corruption (buffer=%u)",
+                 (unsigned)buffer);
+        return false;
+    }
+    return true;
+}
+
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+/* Preview owns a decoded buffer until the low-priority TFT task finishes.
+ * Replacing a queued frame is non-blocking, so SPI can never stall control. */
+static bool enqueue_latest_preview(const control_frame_ref_t *frame)
+{
+    if (s_display.ready_preview_frames == NULL || frame == NULL) {
+        return false;
+    }
+    if (xQueueSend(s_display.ready_preview_frames, frame, 0) == pdTRUE) {
+        return true;
+    }
+
+    control_frame_ref_t stale;
+    if (xQueueReceive(s_display.ready_preview_frames, &stale, 0) == pdTRUE) {
+        (void)release_control_buffer(stale.buffer);
+        ++s_display.preview_dropped_frames;
+        ++s_display.frames_dropped;
+    }
+    if (xQueueSend(s_display.ready_preview_frames, frame, 0) == pdTRUE) {
+        return true;
+    }
+    return false;
+}
+#endif
+
 static void camera_control_task(void *arg)
 {
     (void)arg;
@@ -512,35 +550,55 @@ static void camera_control_task(void *arg)
                                      s_display.frame_callback_ctx);
         }
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
-        /* Reuse the frame that control just processed. Decoding the same JPEG
-         * again for TFT was starving the control decoder. */
+        bool preview_queued = false;
         if (preview_due) {
-            if (s_display.preview_callback != NULL) {
-                s_display.preview_callback(s_display.control_rgb565[frame.buffer],
-                                            frame.width, frame.height,
-                                            frame.threshold, frame.sequence,
-                                            frame.capture_us,
-                                            s_display.preview_callback_ctx);
-            }
-            const int64_t tft_start_us = esp_timer_get_time();
-            camera_tft_overlay_status(s_display.control_rgb565[frame.buffer],
-                                      frame.width, frame.height);
-            if (tft_st7735_draw_rgb565(s_display.control_rgb565[frame.buffer],
-                                       frame.width, frame.height)) {
-                s_display.last_tft_us =
-                    (uint32_t)(esp_timer_get_time() - tft_start_us);
+            preview_queued = enqueue_latest_preview(&frame);
+            if (preview_queued) {
+                /* Rate-limit at enqueue time, independent of SPI duration. */
                 s_display.last_preview_us = preview_now;
-                ++s_display.preview_frames;
-            } else {
-                ESP_LOGW(TAG, "TFT control-frame draw failed");
             }
         }
-#endif
-        if (xQueueSend(s_display.free_control_buffers, &frame.buffer, 0) != pdTRUE) {
-            ESP_LOGE(TAG, "Control frame pool corruption after callback");
+        if (!preview_queued) {
+            (void)release_control_buffer(frame.buffer);
         }
+#else
+        (void)release_control_buffer(frame.buffer);
+#endif
     }
 }
+
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+static void camera_preview_task(void *arg)
+{
+    (void)arg;
+    control_frame_ref_t frame;
+    while (true) {
+        if (xQueueReceive(s_display.ready_preview_frames, &frame,
+                          portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        const int64_t tft_start_us = esp_timer_get_time();
+        if (s_display.preview_callback != NULL) {
+            s_display.preview_callback(s_display.control_rgb565[frame.buffer],
+                                       frame.width, frame.height, frame.threshold,
+                                       frame.sequence, frame.capture_us,
+                                       s_display.preview_callback_ctx);
+        }
+        camera_tft_overlay_status(s_display.control_rgb565[frame.buffer],
+                                  frame.width, frame.height);
+        if (tft_st7735_draw_rgb565(s_display.control_rgb565[frame.buffer],
+                                    frame.width, frame.height)) {
+            s_display.last_tft_us =
+                (uint32_t)(esp_timer_get_time() - tft_start_us);
+            ++s_display.preview_frames;
+        } else {
+            ESP_LOGW(TAG, "TFT control-frame draw failed");
+        }
+        (void)release_control_buffer(frame.buffer);
+    }
+}
+#endif
 
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
 static const char *status_state_name(camera_display_status_state_t state)
@@ -745,6 +803,12 @@ static void release_allocations(void)
         vQueueDelete(s_display.ready_control_frames);
         s_display.ready_control_frames = NULL;
     }
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+    if (s_display.ready_preview_frames != NULL) {
+        vQueueDelete(s_display.ready_preview_frames);
+        s_display.ready_preview_frames = NULL;
+    }
+#endif
 }
 
 esp_err_t camera_display_start(void)
@@ -785,9 +849,17 @@ esp_err_t camera_display_start(void)
     s_display.free_control_buffers =
         xQueueCreate(CAMERA_CONTROL_BUFFER_COUNT, sizeof(uint8_t));
     s_display.ready_control_frames = xQueueCreate(1, sizeof(control_frame_ref_t));
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+    s_display.ready_preview_frames =
+        xQueueCreate(CAMERA_PREVIEW_QUEUE_LENGTH, sizeof(control_frame_ref_t));
+#endif
     if (s_display.free_slots == NULL || s_display.ready_slots == NULL ||
         s_display.free_control_buffers == NULL ||
-        s_display.ready_control_frames == NULL) {
+        s_display.ready_control_frames == NULL
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+        || s_display.ready_preview_frames == NULL
+#endif
+        ) {
         ESP_LOGE(TAG, "Could not allocate camera pipeline queues");
         release_allocations();
         return ESP_ERR_NO_MEM;
@@ -833,7 +905,13 @@ esp_err_t camera_display_start(void)
     if (xTaskCreatePinnedToCore(camera_decode_task, "camera_decode", 6144,
                                 NULL, 4, NULL, 1) != pdPASS ||
         xTaskCreatePinnedToCore(camera_control_task, "camera_control", 4096,
-                                NULL, 6, NULL, 1) != pdPASS) {
+                                NULL, 6, NULL, 1) != pdPASS
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+        || (s_display.tft_ready &&
+            xTaskCreatePinnedToCore(camera_preview_task, "camera_preview", 4096,
+                                    NULL, 2, NULL, 0) != pdPASS)
+#endif
+        ) {
         ESP_LOGE(TAG, "Could not create camera control tasks");
         return ESP_ERR_NO_MEM;
     }
@@ -841,7 +919,7 @@ esp_err_t camera_display_start(void)
     ESP_LOGI(TAG, "Camera pipeline started: control <=%ux%u, TFT=%s",
              CAMERA_CONTROL_MAX_WIDTH, CAMERA_CONTROL_MAX_HEIGHT,
 #if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
-             s_display.tft_ready ? "direct control frame" : "unavailable"
+             s_display.tft_ready ? "independent low-rate preview" : "unavailable"
 #else
              "disabled"
 #endif
