@@ -42,9 +42,10 @@ extern "C" {
 /* 近场/航向/远场取样窗口按扫描高度的千分比折算成行数，而不是固定行数：
  * 控制帧可能是 120x80（480x320 输入）或 160x120（320x240 输入），固定行数
  * 会让同一物理姿态在两种尺寸下给出相差一倍的 heading。120x80 时分别得到
- * 3/10/14 行，与此前的固定值完全一致。基线仍与跟踪长度无关。 */
+ * 3/6/14 行；heading 有意只看近场，避免直角弯远处分支把车带离当前线，
+ * far_error 仍保留给速度限制。基线仍与跟踪长度无关。 */
 #define LINE_NEAR_ROWS_PERMILLE 75
-#define LINE_HEADING_ROWS_PERMILLE 250
+#define LINE_HEADING_ROWS_PERMILLE 150
 #define LINE_FAR_ROWS_PERMILLE 350
 
 /* 线段形状分类的相对门限，全部以近场线宽 w 为基准：

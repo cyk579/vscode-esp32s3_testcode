@@ -591,10 +591,10 @@ static void camera_tft_overlay_status(uint8_t *frame, uint16_t width,
     previous = stats;
     previous_us = now;
 
-    char lines[8][32];
-    const char *line_ptrs[8] = {
+    char lines[9][32];
+    const char *line_ptrs[9] = {
         lines[0], lines[1], lines[2], lines[3],
-        lines[4], lines[5], lines[6], lines[7],
+        lines[4], lines[5], lines[6], lines[7], lines[8],
     };
     (void)snprintf(lines[0], sizeof(lines[0]), "STATE:%s",
                    status_state_name(cached.state));
@@ -611,14 +611,18 @@ static void camera_tft_overlay_status(uint8_t *frame, uint16_t width,
     (void)snprintf(lines[6], sizeof(lines[6]), "DROP:%u CD:%u",
                    (unsigned)stats.frames_dropped,
                    (unsigned)stats.control_dropped_frames);
+    (void)snprintf(lines[7], sizeof(lines[7]), "T:%d F:%u O:%d",
+                   cached.finish_candidate ? 1 : 0,
+                   (unsigned)cached.finish_frames,
+                   cached.obstacle_completed ? 1 : 0);
     if (cached.ultrasonic_cm < 0) {
-        (void)snprintf(lines[7], sizeof(lines[7]), "US:--");
+        (void)snprintf(lines[8], sizeof(lines[8]), "US:--");
     } else {
-        (void)snprintf(lines[7], sizeof(lines[7]), "US:%d CM",
+        (void)snprintf(lines[8], sizeof(lines[8]), "US:%d CM",
                        cached.ultrasonic_cm);
     }
     if (!tft_st7735_overlay_text_rgb565(frame, width, height, line_ptrs,
-                                        8, 0x0000)) {
+                                        9, 0x0000)) {
         ESP_LOGW(TAG, "TFT status overlay failed");
     }
 }

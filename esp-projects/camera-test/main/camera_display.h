@@ -41,6 +41,9 @@ typedef struct {
     int heading_error;
     int turn_command;
     int ultrasonic_cm;
+    bool finish_candidate;
+    uint8_t finish_frames;
+    bool obstacle_completed;
 } camera_display_status_t;
 
 typedef bool (*camera_display_status_callback_t)(camera_display_status_t *status,

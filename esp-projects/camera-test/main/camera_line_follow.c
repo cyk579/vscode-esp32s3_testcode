@@ -84,11 +84,12 @@
 /* 终点 T 停车；固定避障路线完成后才会启用。 */
 #define LINE_FINISH_ENABLE 1
 
-/* 22% 是 car-spin 已验证的低速可持续区间；斜坡仍按控制周期平滑上升。 */
-#define LINE_FORWARD_FAST 22
-#define LINE_FORWARD_MEDIUM 20
-#define LINE_FORWARD_SLOW 18
-#define LINE_FORWARD_CRAWL 14
+/* 连续 PWM 前进档提高到可克服当前底盘静摩擦的范围；斜坡仍按控制周期
+ * 平滑上升，弯中由 line_control_speed 自动降档。 */
+#define LINE_FORWARD_FAST 26
+#define LINE_FORWARD_MEDIUM 24
+#define LINE_FORWARD_SLOW 22
+#define LINE_FORWARD_CRAWL 16
 #define LINE_FORWARD_SLEW 4
 
 /* A short scan miss is often a JPEG/lighting miss, not a genuine loss of the
@@ -113,7 +114,10 @@
  * TODO(实测): KP_LAT 按"1 单位 lat 对应多少 cm/s 侧移"标定；
  * TODO(实测): KH 按"1 单位 heading 对应多少度"标定。 */
 #define LINE_PID_KP_LAT 18
-#define LINE_PID_KH 65
+/* Lower continuous yaw gain keeps the calibrated minimum steering pulse from
+ * arriving on every frame; the dithered 13-point pulse remains available when
+ * a real correction is needed. */
+#define LINE_PID_KH 50
 #define LINE_PID_SCALE 100
 #define LINE_TURN_MAX 13
 #define LINE_YAW_MIN_OUTPUT 13
@@ -142,10 +146,10 @@
 /* 绕摄像头旋转：lat = turn * a/(2L)。偏航量必须够大，否则 a/d = lat - turn
  * 落在起转值以下会被混控丢掉，只剩后轮在推。
  * TODO(实测): LINE_CAM_PIVOT_PERCENT 用尺子量 a 和 L 后填 a*100/(2L)。 */
-#define LINE_PIVOT_TURN 15
-#define LINE_TURN_A_SPEED 14
+#define LINE_PIVOT_TURN 12
+#define LINE_TURN_A_SPEED 11
 #define LINE_TURN_B_SPEED 13
-#define LINE_TURN_D_SPEED 15
+#define LINE_TURN_D_SPEED 12
 #define LINE_TURN_PENDING_MS 1200U
 /* 摄像头在底盘前方：旧线消失并确认要转弯后，先让底盘向前走一小段。 */
 #define LINE_CORNER_CENTER_DELAY_MS 200U
@@ -175,7 +179,7 @@
 #define LINE_CENTER_YAW_DEADBAND 12
 #define LINE_CENTER_YAW_GAIN 6
 #define LINE_CENTER_YAW_MAX 2
-#define LINE_NORMAL_TURN_SLEW 3
+#define LINE_NORMAL_TURN_SLEW 2
 #define LINE_CENTER_LAT_MAX_OUTPUT 10
 #define LINE_NORMAL_LAT_SLEW 3
 
@@ -391,6 +395,7 @@ static uint8_t s_last_valid_rows;
 static uint8_t s_last_confidence;
 static int s_last_threshold;
 static bool s_last_candidate;
+static bool s_last_finish_candidate;
 static int s_last_seed_x;
 static uint16_t s_last_frame_width;
 static uint16_t s_last_frame_height;
@@ -2202,6 +2207,9 @@ bool camera_line_follow_status_callback(camera_display_status_t *status,
     status->turn_command = s_last_drive_turn;
     status->ultrasonic_cm = s_ultrasonic_valid ?
                             (int)(s_ultrasonic_distance_cm + 0.5f) : -1;
+    status->finish_candidate = s_last_finish_candidate;
+    status->finish_frames = s_finish_frames;
+    status->obstacle_completed = s_obstacle_completed;
 
     (void)xSemaphoreGive(s_control_mutex);
     return true;
@@ -2268,7 +2276,8 @@ static void maybe_log_summary(int64_t now)
              "held=%d reacq=%u/%u seed_valid=%d threshold=%d seed_x=%d line_w=%d "
              "scan_bottom=%d points=%d valid_rows=%u near_rows=%d confidence=%u "
              "near_line=%d far_error=%d corner=%d@%d pending=%d/%lldms "
-             "line_age_ms=%lld avoid=%s dist_x10=%d dist_ok=%d phase_ms=%u ball=%s",
+             "finish=%d/%u obstacle_done=%d line_age_ms=%lld avoid=%s "
+             "dist_x10=%d dist_ok=%d phase_ms=%u ball=%s",
              state_name(), s_armed, s_stby_enabled, s_last_candidate,
              (unsigned)s_arm_frames, (unsigned)s_lost_frames,
              s_last_observation_held,
@@ -2278,7 +2287,9 @@ static void maybe_log_summary(int64_t now)
              (unsigned)s_last_valid_rows, s_last_near_normal_rows,
              (unsigned)s_last_confidence, s_last_near_line_visible,
              s_last_far_error, s_last_corner_direction, s_last_corner_row_y,
-             pending, (long long)pending_ms, (long long)line_age_ms,
+             pending, (long long)pending_ms,
+             s_last_finish_candidate, (unsigned)s_finish_frames,
+             s_obstacle_completed, (long long)line_age_ms,
              obstacle_state_name(), obstacle_distance_x10, s_ultrasonic_valid,
              (unsigned)obstacle_phase_ms, ball_phase_name());
     ESP_LOGI(TAG,
@@ -2480,6 +2491,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     s_last_observation_held = partial_candidate;
     s_last_threshold = observation.threshold;
     s_last_candidate = candidate;
+    s_last_finish_candidate = observation.finish_candidate;
     s_last_seed_x = observation.valid_rows > 0 ? observation.seed_x : -1;
     s_last_valid_rows = observation.valid_rows;
     s_last_confidence = observation.confidence;
@@ -3199,6 +3211,7 @@ esp_err_t camera_line_follow_start(void)
     s_last_confidence = 0;
     s_last_threshold = 0;
     s_last_candidate = false;
+    s_last_finish_candidate = false;
     s_last_observation_held = false;
     s_last_seed_x = -1;
     s_last_direction[0] = 0;
