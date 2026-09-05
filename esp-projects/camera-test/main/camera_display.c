@@ -566,6 +566,8 @@ static void camera_tft_overlay_status(uint8_t *frame, uint16_t width,
         .state = CAMERA_DISPLAY_STATUS_LOST,
         .ultrasonic_cm = -1,
     };
+    static camera_display_status_state_t previous_state =
+        CAMERA_DISPLAY_STATUS_LOST;
     static camera_display_pipeline_stats_t previous;
     static int64_t previous_us;
     camera_display_status_t sampled = cached;
@@ -573,6 +575,16 @@ static void camera_tft_overlay_status(uint8_t *frame, uint16_t width,
         s_display.status_callback(&sampled, s_display.status_callback_ctx)) {
         cached = sampled;
     }
+    if (cached.state == CAMERA_DISPLAY_STATUS_FINDBALL &&
+        previous_state != CAMERA_DISPLAY_STATUS_FINDBALL) {
+        /* Servo startup or a motor power transient can leave the panel white
+         * even though the ESP32 and camera continue running. Recover once at
+         * the endpoint transition so FINDBALL is visible on the next draw. */
+        if (!tft_st7735_reinit()) {
+            ESP_LOGW(TAG, "TFT reinit at FINDBALL transition failed");
+        }
+    }
+    previous_state = cached.state;
 
     camera_display_pipeline_stats_t stats = {0};
     camera_display_get_pipeline_stats(&stats);

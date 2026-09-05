@@ -418,51 +418,16 @@ bool tft_st7735_overlay_text_rgb565(uint8_t *rgb565_big_endian,
     return true;
 }
 
-bool tft_st7735_init(void)
+static bool tft_controller_init_sequence(void)
 {
-    if (s_initialized) {
-        return true;
+    if (s_tft == NULL) {
+        return false;
     }
 
-    gpio_reset_pin(TFT_DC);
-    gpio_set_direction(TFT_DC, GPIO_MODE_OUTPUT);
-    gpio_reset_pin(TFT_CS);
-    gpio_set_direction(TFT_CS, GPIO_MODE_OUTPUT);
-    gpio_reset_pin(TFT_RST);
-    gpio_set_direction(TFT_RST, GPIO_MODE_OUTPUT);
-    /* Keep the panel deselected and out of command mode while the ESP32
-     * peripheral/SPI bus is coming back after a reset. */
     gpio_set_level(TFT_CS, 1);
     gpio_set_level(TFT_DC, 0);
     gpio_set_level(TFT_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
-
-    const spi_bus_config_t bus_config = {
-        .sclk_io_num = TFT_SCLK,
-        .mosi_io_num = TFT_MOSI,
-        .miso_io_num = -1,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = TFT_ST7735_WIDTH * 2,
-    };
-    esp_err_t err = spi_bus_initialize(SPI2_HOST, &bus_config, SPI_DMA_CH_AUTO);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    const spi_device_interface_config_t device_config = {
-        .clock_speed_hz = TFT_SPI_CLOCK_HZ,
-        .mode = 0,
-        .spics_io_num = TFT_CS,
-        .queue_size = 1,
-    };
-    err = spi_bus_add_device(SPI2_HOST, &device_config, &s_tft);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SPI device init failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
     gpio_set_level(TFT_RST, 0);
     vTaskDelay(pdMS_TO_TICKS(30));
     gpio_set_level(TFT_RST, 1);
@@ -489,7 +454,50 @@ bool tft_st7735_init(void)
         return false;
     }
     vTaskDelay(pdMS_TO_TICKS(20));
+    return true;
+}
 
+bool tft_st7735_init(void)
+{
+    if (s_initialized) {
+        return true;
+    }
+
+    gpio_reset_pin(TFT_DC);
+    gpio_set_direction(TFT_DC, GPIO_MODE_OUTPUT);
+    gpio_reset_pin(TFT_CS);
+    gpio_set_direction(TFT_CS, GPIO_MODE_OUTPUT);
+    gpio_reset_pin(TFT_RST);
+    gpio_set_direction(TFT_RST, GPIO_MODE_OUTPUT);
+    const spi_bus_config_t bus_config = {
+        .sclk_io_num = TFT_SCLK,
+        .mosi_io_num = TFT_MOSI,
+        .miso_io_num = -1,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = TFT_ST7735_WIDTH * 2,
+    };
+    esp_err_t err = spi_bus_initialize(SPI2_HOST, &bus_config, SPI_DMA_CH_AUTO);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    const spi_device_interface_config_t device_config = {
+        .clock_speed_hz = TFT_SPI_CLOCK_HZ,
+        .mode = 0,
+        .spics_io_num = TFT_CS,
+        .queue_size = 1,
+    };
+    err = spi_bus_add_device(SPI2_HOST, &device_config, &s_tft);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SPI device init failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    if (!tft_controller_init_sequence()) {
+        return false;
+    }
     s_initialized = true;
     if (!tft_st7735_fill(0x0000)) {
         ESP_LOGE(TAG, "ST7735 clear failed");
@@ -498,5 +506,24 @@ bool tft_st7735_init(void)
     }
     ESP_LOGI(TAG, "ST7735 initialized on SPI2 (%dx%d landscape)",
              TFT_ST7735_WIDTH, TFT_ST7735_HEIGHT);
+    return true;
+}
+
+bool tft_st7735_reinit(void)
+{
+    if (s_tft == NULL) {
+        return false;
+    }
+    s_initialized = false;
+    if (!tft_controller_init_sequence()) {
+        return false;
+    }
+    s_initialized = true;
+    if (!tft_st7735_fill(0x0000)) {
+        s_initialized = false;
+        ESP_LOGE(TAG, "ST7735 clear after reinit failed");
+        return false;
+    }
+    ESP_LOGW(TAG, "ST7735 reinitialized after display state transition");
     return true;
 }

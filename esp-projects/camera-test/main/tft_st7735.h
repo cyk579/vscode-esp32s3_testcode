@@ -10,6 +10,8 @@
 #define TFT_ST7735_HEIGHT 128
 
 bool tft_st7735_init(void);
+/* Re-apply the panel reset/init sequence after a peripheral or power glitch. */
+bool tft_st7735_reinit(void);
 bool tft_st7735_fill(uint16_t color);
 bool tft_st7735_draw_rgb565(const uint8_t *rgb565_big_endian,
                              uint16_t width,

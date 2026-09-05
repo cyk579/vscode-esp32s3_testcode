@@ -263,7 +263,7 @@
  * 对 f=27、turn=±13 的 NORMAL 向量，44 比最大实际轮值 40 多留 4 个单位。 */
 #define MOTOR_PWM_CEILING 44
 #define LINE_SPEED_CAP 30
-#define MOTOR_TRIM_A 90
+#define MOTOR_TRIM_A 100
 #define MOTOR_TRIM_D 100
 
 /* 方向符号与 car-spin 的实车校准一致。 */
