@@ -113,11 +113,11 @@ typedef struct {
     const char* name;
 } uvc_stream_profile_t;
 
-/* 保持当前摄像头的 480x320@25 输入；控制解码器再做 1/4 缩放。
- * 若设备不接受该档位，再退回到 320x240@30。 */
+/* Prefer the highest useful control cadence first.  The decoder still scales
+ * either accepted profile into its fixed control buffer. */
 uvc_stream_profile_t uvc_stream_profiles[EXAMPLE_UVC_PROTOCOL_AUTO_COUNT] = {
     {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, "320x240, fps 30"},
-    {UVC_FRAME_FORMAT_MJPEG, 480, 320, 25, "480x320, fps 25"},
+    {UVC_FRAME_FORMAT_MJPEG, 480, 320, 15, "480x320, fps 15"},
     {UVC_FRAME_FORMAT_MJPEG, 480, 320,  0, "480x320, any fps"},
     {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, "640x480, fps 15"},
     {UVC_FRAME_FORMAT_MJPEG, 1280, 720,  0, "1280x720, any fps"}

@@ -82,7 +82,7 @@
 #define LINE_FRAME_TIMEOUT_MS 1800U
 #define LINE_FINISH_CONFIRM_FRAMES 3U
 /* 终点 T 停车；固定避障路线完成后才会启用。 */
-#define LINE_FINISH_ENABLE 0
+#define LINE_FINISH_ENABLE 1
 
 /* 连续 PWM 前进档提高到可克服当前底盘静摩擦的范围；斜坡仍按控制周期
  * 平滑上升，弯中由 line_control_speed 自动降档。 */
@@ -363,8 +363,9 @@ static bool s_armed;
 /* Set once a line has been confirmed since start; survives a later disarm. */
 static bool s_mission_started;
 static bool s_finished;
-/* A normal line loss is terminal.  This latch prevents a later good frame or
- * ultrasonic sample from silently re-arming the chassis after it has stopped. */
+/* Set only after the bounded LOST search/watchdog has disarmed the chassis;
+ * while the search is active this remains clear so a confirmed line can
+ * resume NORMAL and the post-obstacle loss can hand over to FINDBALL. */
 static bool s_line_stopped;
 static bool s_stby_enabled;
 static volatile float s_ultrasonic_distance_cm = -1.0f;
@@ -390,6 +391,7 @@ static uint8_t s_finish_frames;
 static int64_t s_first_frame_us;
 static int64_t s_last_line_us;
 static int64_t s_last_frame_us;
+static int64_t s_lost_started_us;
 
 static line_state_t s_state;
 static bool s_seed_valid;
@@ -1635,30 +1637,37 @@ static bool enter_findball_after_finish_line_loss(int64_t now)
     return true;
 }
 
-/* LOST is a safe stop.  A later confirmed line can re-arm the normal tracker;
- * the only intentional hand-off is the first loss after obstacle completion. */
-static void enter_terminal_lost(int64_t now, const char *reason)
+/* A short line loss is recoverable: keep the last seed and sweep slowly.  The
+ * existing disarm path remains the hard timeout, so a broken camera cannot
+ * leave the chassis turning forever. */
+static void enter_lost_search(int64_t now, const char *reason)
 {
     s_state = LINE_STATE_LOST;
-    s_lost_frames = 1;
+    s_lost_frames = 0;
     s_reacquire_frames = 0;
     s_turn_direction = 0;
     s_turn_started_us = 0;
     s_corner_center_delay_until_us = 0;
     s_turn_pending_until_us = 0;
     s_arm_frames = 0;
-    /* A manual reposition after LOST must not be constrained to the old
-     * seed; the next candidate starts with the normal bottom-center search. */
-    s_seed_valid = false;
     s_last_good_observation_us = 0;
+    s_lost_started_us = now;
     reset_control();
+    remember_lost_search_direction();
     if (enter_findball_after_finish_line_loss(now)) {
         return;
     }
-    s_line_stopped = true;
-    s_armed = false;
-    stop_motors();
-    ESP_LOGW(TAG, "line LOST: stopped; waiting for reacquire (%s)",
+    s_line_stopped = false;
+    /* The normal loss happens after arming.  Keep STBY asserted while the
+     * bounded search runs; only disarm_tracking() drops it on timeout. */
+    if (s_mission_started && !s_stby_enabled) {
+        gpio_set_level(STBY_GPIO, 1);
+        s_stby_enabled = true;
+    }
+    if (s_mission_started) {
+        s_armed = true;
+    }
+    ESP_LOGW(TAG, "line LOST: bounded search started (%s)",
              reason == NULL ? "unknown" : reason);
 }
 
@@ -1842,6 +1851,7 @@ static void reset_tracking(void)
     s_lost_frames = 0;
     s_reacquire_frames = 0;
     s_reacquire_x = 0;
+    s_lost_started_us = 0;
     s_lost_search_direction = 0;
     s_turn_direction = 0;
     s_turn_hint_frames = 0;
@@ -1927,6 +1937,8 @@ static void obstacle_begin(int64_t now)
     s_obstacle_phase_start_us = now;
     s_obstacle_close_samples = 0;
     s_obstacle_reacquire_until_us = 0;
+    s_line_stopped = false;
+    s_lost_started_us = 0;
     /* Obstacle avoidance is allowed to start even when the camera has
      * disarmed after a frame timeout.  Re-enable TB6612 explicitly so the
      * timed route cannot remain stuck at the brake phase with STBY low. */
@@ -1970,6 +1982,9 @@ static void obstacle_finish(int64_t now, uint16_t width)
     s_obstacle_phase_start_us = 0;
     s_obstacle_close_samples = 0;
     s_obstacle_completed = true;
+    /* The fixed route is allowed to recover from a prior camera timeout. */
+    s_line_stopped = false;
+    s_armed = true;
     s_obstacle_reacquire_until_us =
         now + (int64_t)AVOID_REACQUIRE_GRACE_MS * 1000;
 
@@ -1978,7 +1993,7 @@ static void obstacle_finish(int64_t now, uint16_t width)
     s_last_line_us = now;
     s_reacquire_x = (int)width / 2;
     zero_motor_outputs();
-    ESP_LOGI(TAG, "avoidance complete; visual line follow resumed (T finish disabled)");
+    ESP_LOGI(TAG, "avoidance complete; visual line follow resumed (T finish armed)");
 }
 
 /* Return true while the fixed obstacle route owns the motors. */
@@ -2139,8 +2154,10 @@ static void drive_normal_limited(const line_observation_t *observation,
     /* 正常巡线只用车体转向校正，不用横移硬拉回数学中心线。
      * lateral 正值表示线在左侧，因此折算成负 heading，yaw PD 输出左转。
      * 死区内保留有宽度的中心区域，避免小车左右来回校正。 */
-    /* The legacy lateral term still contributes a small yaw correction.  The
-     * bounded strafe below is the primary optical-centering correction. */
+    /* Keep the legacy lateral term in the yaw calculation, but never command
+     * a normal-line strafe.  The successful reference controller corrects the
+     * optical offset with yaw; a lateral vector makes this chassis cut across
+     * a straight segment and can also collapse a wheel at the mixer floor. */
     const int lateral_for_steer = abs(lateral_error) <= LINE_ERROR_DEADBAND ?
                                   0 : lateral_error;
     /* 摄像头在底盘前方时，单靠远端 heading 容易留下一个长期横向偏差。
@@ -2182,22 +2199,8 @@ static void drive_normal_limited(const line_observation_t *observation,
                                                       s_lateral_output);
     /* Strafe only on fresh, straight-line geometry: a held (stale) frame or
      * the re-centering phase right after a pivot must not push sideways. */
-    const bool center_valid = observation->near_line_visible &&
-                              observation->corner_direction == 0 &&
-                              !observation->finish_candidate &&
-                              !s_last_observation_held &&
-                              !s_post_corner_align;
     int requested_lat = 0;
-    if (center_valid) {
-        /* Move the chassis toward the optical center.  The mixer convention
-         * is lat < 0 when the tape is left of the image center. */
-        requested_lat = line_control_strafe_pd(
-            &cfg, lateral_error, s_lateral_error_rate, LINE_PD_KD_LAT,
-            &s_lat_accum);
-        requested_lat = clamp_int(requested_lat, LINE_CENTER_LAT_MAX_OUTPUT);
-    } else {
-        s_lat_accum = 0;
-    }
+    s_lat_accum = 0;
     const int lat_delta = requested_lat - s_lateral_output;
     if (lat_delta > LINE_NORMAL_LAT_SLEW) {
         s_lateral_output += LINE_NORMAL_LAT_SLEW;
@@ -2209,7 +2212,7 @@ static void drive_normal_limited(const line_observation_t *observation,
     s_turn_output = limit_normal_turn_for_wheel_floor(forward,
                                                       s_turn_output,
                                                       s_lateral_output);
-    drive_normal_output(forward, s_turn_output, s_lateral_output);
+    drive_normal_output(forward, s_turn_output, 0);
 }
 
 static void drive_normal(const line_observation_t *observation, int64_t now)
@@ -2761,7 +2764,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
                     s_post_corner_align = false;
                     s_post_corner_align_frames = 0;
                     s_post_corner_align_started_us = 0;
-                    enter_terminal_lost(now, "post-corner align timeout");
+                    enter_lost_search(now, "post-corner align timeout");
                     goto done;
                 }
                 s_post_corner_align = false;
@@ -2864,7 +2867,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         }
         if (s_turn_started_us != 0 &&
             now - s_turn_started_us > (int64_t)LINE_TURN_TIMEOUT_MS * 1000) {
-            enter_terminal_lost(now, "corner timeout");
+            enter_lost_search(now, "corner timeout");
             goto done;
         }
         /* 摄像头在旋转中心前方 a 处，纯原地旋转会让它横扫 a*theta 而丢线。
@@ -2876,14 +2879,60 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         goto done;
     }
 
-    /* ---- LOST：保持停车；后续连续确认到黑线后由上面的 arm 流程恢复 ---- */
+    /* ---- LOST：短时低速扫线，连续看到同一近场候选后恢复 NORMAL。 ---- */
     if (s_state == LINE_STATE_LOST) {
         if (enter_findball_after_finish_line_loss(now)) {
             goto done;
         }
-        s_line_stopped = true;
-        s_armed = false;
-        stop_motors();
+
+        const int64_t lost_us = s_lost_started_us == 0 ||
+                                now < s_lost_started_us ?
+                                0 : now - s_lost_started_us;
+        const int expected_seed = s_seed_valid ? s_seed_x : (int)width / 2;
+        const int search_half = line_geometry_positive_percent(
+            (int)width, state_search_half_percent(), LINE_SEARCH_HALF_MIN);
+        /* The geometry layer already searched this corridor.  Repeat the
+         * check here so an isolated black segment outside the remembered
+         * track cannot immediately re-arm the chassis. */
+        const bool seed_in_corridor = candidate &&
+                                      observation.valid_rows >=
+                                          LINE_CORNER_MIN_VALID_ROWS &&
+                                      observation.seed_x >= 0 &&
+                                      abs(observation.seed_x - expected_seed) <=
+                                          search_half + LINE_SEED_SLEW_PX;
+        if (seed_in_corridor) {
+            if (s_reacquire_frames < LINE_REACQUIRE_CONFIRM_FRAMES) {
+                ++s_reacquire_frames;
+            }
+        } else {
+            s_reacquire_frames = 0;
+        }
+
+        if (s_reacquire_frames >= LINE_REACQUIRE_CONFIRM_FRAMES) {
+            s_state = LINE_STATE_NORMAL;
+            s_line_stopped = false;
+            s_armed = true;
+            s_lost_frames = 0;
+            s_reacquire_frames = 0;
+            s_lost_started_us = 0;
+            s_last_line_us = now;
+            update_seed(&observation);
+            reset_control();
+            ESP_LOGI(TAG, "line reacquired during LOST search; resuming NORMAL");
+            drive_normal(&observation, now);
+            goto done;
+        }
+
+        if (lost_us >= (int64_t)LINE_LOST_STOP_MS * 1000) {
+            disarm_tracking();
+            ESP_LOGW(TAG, "line LOST search timeout; motors disarmed");
+            goto done;
+        }
+
+        /* Keep the camera sweeping while the route is still recoverable.  The
+         * command is time based, so a stalled/degraded camera cannot make the
+         * search spin faster or reset its direction on every frame. */
+        drive_slow_spin(lost_search_turn_command(lost_us));
         goto done;
     }
 
@@ -2971,7 +3020,7 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
         goto done;
     }
 
-    enter_terminal_lost(now, "normal frame lost");
+    enter_lost_search(now, "normal frame lost");
 
 done:
     {
@@ -3230,6 +3279,7 @@ esp_err_t camera_line_follow_start(void)
     s_first_frame_us = 0;
     s_last_line_us = 0;
     s_last_frame_us = 0;
+    s_lost_started_us = 0;
     s_state = LINE_STATE_NORMAL;
     s_last_lateral_error = 0;
     s_last_heading_error = 0;

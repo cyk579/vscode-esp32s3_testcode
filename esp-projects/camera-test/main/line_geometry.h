@@ -21,26 +21,26 @@ extern "C" {
 #define LINE_ROI_TOP_PERCENT 15
 #define LINE_ROI_BOTTOM_PERCENT 100
 #define LINE_LOCAL_CONTRAST_MIN 28
-/* The tape is deliberately pure black.  An adaptive threshold may rise under
- * bright lighting, but it must not classify ordinary dark objects or a hand as
- * track pixels solely because the whole frame became dim. */
-#define LINE_ABSOLUTE_BLACK_MAX_LUMA 88
+/* Keep a ceiling for the adaptive threshold, but do not reject a black tape
+ * that is slightly washed out by the room light.  Continuity and width checks
+ * below remain the environment filter. */
+#define LINE_ABSOLUTE_BLACK_MAX_LUMA 120
 #define LINE_NEAR_TOP_PERCENT 65
 #define LINE_NEAR_BOTTOM_PERCENT 92
 #define LINE_ROW_STEP 2
 #define LINE_BOTTOM_SKIP_ROWS 0
 #define LINE_SCAN_MAX_ROWS 64
-#define LINE_SEARCH_HALF_PERCENT 26
+#define LINE_SEARCH_HALF_PERCENT 18
 #define LINE_SEARCH_HALF_MIN 6
 #define LINE_SEARCH_HALF_MAX 80
 /* 逐行搜索用上一行的斜率做预测，所以跳变门限可以比原来紧。 */
-#define LINE_MAX_CENTER_JUMP_PERCENT 18
+#define LINE_MAX_CENTER_JUMP_PERCENT 10
 #define LINE_MIN_SEGMENT_WIDTH 2
 #define LINE_BRIDGE_GAP_PIXELS 1
-#define LINE_MAX_SEGMENT_WIDTH_PERCENT 55
+#define LINE_MAX_SEGMENT_WIDTH_PERCENT 40
 #define LINE_MIN_VALID_ROWS 4
 #define LINE_CORNER_MIN_VALID_ROWS 2
-#define LINE_SEED_MISS_ROWS 6
+#define LINE_SEED_MISS_ROWS 8
 #define LINE_TRACK_MISS_ROWS 3
 
 /* 近场/航向/远场取样窗口按扫描高度的千分比折算成行数，而不是固定行数：

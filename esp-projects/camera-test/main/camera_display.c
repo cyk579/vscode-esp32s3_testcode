@@ -31,11 +31,11 @@
 #define CAMERA_BINARY_ROI_LEFT_PERCENT 10
 #define CAMERA_BINARY_ROI_RIGHT_PERCENT 90
 #define CAMERA_BINARY_ROW_STEP 2
-#define CAMERA_BINARY_DARK_PERCENTILE 2
-#define CAMERA_BINARY_LIGHT_PERCENTILE 90
-#define CAMERA_BINARY_MIN_CONTRAST 32
+#define CAMERA_BINARY_DARK_PERCENTILE 1
+#define CAMERA_BINARY_LIGHT_PERCENTILE 85
+#define CAMERA_BINARY_MIN_CONTRAST 20
 #define CAMERA_BINARY_BLACK_FRACTION_PERCENT 35
-#define CAMERA_BINARY_THRESHOLD_MIN 75
+#define CAMERA_BINARY_THRESHOLD_MIN 60
 #define CAMERA_BINARY_THRESHOLD_MAX 120
 #define CAMERA_BINARY_THRESHOLD_SLEW 4
 #define CAMERA_BINARY_THRESHOLD_FILTER_OLD 3
@@ -125,10 +125,14 @@ static uint8_t rgb565_luma(const uint8_t *pixel)
 }
 
 static uint8_t histogram_percentile(const uint16_t histogram[256],
-                                    uint32_t sample_count,
-                                    uint32_t percentile)
+                                     uint32_t sample_count,
+                                     uint32_t percentile)
 {
-    const uint32_t target = (sample_count * percentile + 99U) / 100U;
+    /* Percentile zero is used for the low-contrast fallback.  Its cumulative
+     * target must still be one sample; a target of zero would always return
+     * histogram bin 0 even when no pixel has that luma. */
+    const uint32_t target = percentile == 0 ? 1U :
+                            (sample_count * percentile + 99U) / 100U;
     uint32_t cumulative = 0;
     for (uint32_t value = 0; value < 256U; ++value) {
         cumulative += histogram[value];
@@ -164,12 +168,18 @@ static uint8_t calculate_binary_threshold(const uint8_t *frame,
         return 0;
     }
 
-    const int dark = histogram_percentile(histogram, sample_count,
-                                          CAMERA_BINARY_DARK_PERCENTILE);
+    int dark = histogram_percentile(histogram, sample_count,
+                                    CAMERA_BINARY_DARK_PERCENTILE);
     const int light = histogram_percentile(histogram, sample_count,
                                            CAMERA_BINARY_LIGHT_PERCENTILE);
     if (light - dark < CAMERA_BINARY_MIN_CONTRAST) {
-        return 0;
+        /* A narrow black tape can occupy less than one histogram percentile.
+         * Fall back to the darkest sampled value; geometry continuity still
+         * rejects an isolated noise pixel. */
+        dark = histogram_percentile(histogram, sample_count, 0);
+        if (light - dark < CAMERA_BINARY_MIN_CONTRAST) {
+            return 0;
+        }
     }
 
     int threshold = dark +
@@ -186,7 +196,8 @@ static uint8_t calculate_binary_threshold(const uint8_t *frame,
 static uint8_t filter_binary_threshold(uint8_t candidate)
 {
     if (candidate == 0) {
-        return 0;
+        /* Do not turn one low-contrast/JPEG frame into a fake line loss. */
+        return s_display.threshold_initialized ? s_display.threshold_filtered : 0;
     }
     if (!s_display.threshold_initialized) {
         s_display.threshold_filtered = candidate;
