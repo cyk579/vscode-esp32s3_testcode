@@ -33,6 +33,12 @@ CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW=y
 # Enable the vehicle task by default; it keeps TB6612 in standby until a line
 # is confirmed. Disable this in menuconfig for camera-only diagnostics.
 CONFIG_EXAMPLE_ENABLE_CAMERA_LINE_FOLLOW=y
+CONFIG_EXAMPLE_ENABLE_ENCODERS=y
+CONFIG_EXAMPLE_ENCODER_SAMPLE_PERIOD_MS=10
+CONFIG_EXAMPLE_ENCODER_COUNTS_PER_REV=1
+# CONFIG_EXAMPLE_ENCODER_A_INVERT is not set
+# CONFIG_EXAMPLE_ENCODER_B_INVERT is not set
+# CONFIG_EXAMPLE_ENCODER_D_INVERT is not set
 
 # Decode UVC MJPEG frames to the ST7735's RGB565 input.  Use the external
 # decoder so common UVC frames without an embedded Huffman table also work.

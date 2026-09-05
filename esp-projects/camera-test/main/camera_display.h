@@ -30,6 +30,10 @@ typedef enum {
     CAMERA_DISPLAY_STATUS_FINDBALL,
 } camera_display_status_state_t;
 
+/* Keep this small public telemetry shape independent of the encoder driver so
+ * the display pipeline can be built with encoders disabled. */
+#define CAMERA_DISPLAY_ENCODER_COUNT 3
+
 typedef struct {
     camera_display_status_state_t state;
     bool armed;
@@ -44,6 +48,10 @@ typedef struct {
     bool finish_candidate;
     uint8_t finish_frames;
     bool obstacle_completed;
+    bool encoder_ready;
+    int encoder_delta[CAMERA_DISPLAY_ENCODER_COUNT];
+    int encoder_rate_cps[CAMERA_DISPLAY_ENCODER_COUNT];
+    int encoder_total[CAMERA_DISPLAY_ENCODER_COUNT];
 } camera_display_status_t;
 
 typedef bool (*camera_display_status_callback_t)(camera_display_status_t *status,

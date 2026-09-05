@@ -41,6 +41,48 @@ menu "Example Configuration"
             vehicle from the black-line position.  The motors remain in
             standby until a line is confirmed for several frames.
 
+    config EXAMPLE_ENABLE_ENCODERS
+        bool "Enable wheel encoder telemetry"
+        default y
+        depends on EXAMPLE_ENABLE_CAMERA_LINE_FOLLOW
+        help
+            Read the three quadrature wheel encoders for diagnostics only.
+            Encoder values are not used to change motor commands until the
+            wheel direction and counts-per-revolution have been calibrated.
+
+    config EXAMPLE_ENCODER_SAMPLE_PERIOD_MS
+        int "Encoder sample period (ms)"
+        range 5 1000
+        default 10
+        depends on EXAMPLE_ENABLE_ENCODERS
+        help
+            Time between PCNT snapshots.  Ten milliseconds gives useful
+            low-speed telemetry without adding load to the camera task.
+
+    config EXAMPLE_ENCODER_COUNTS_PER_REV
+        int "Encoder counts per revolution"
+        range 1 100000
+        default 1
+        depends on EXAMPLE_ENABLE_ENCODERS
+        help
+            Counts per wheel revolution used in the diagnostic report.  The
+            default is intentionally uncalibrated; measure it on the vehicle.
+
+    config EXAMPLE_ENCODER_A_INVERT
+        bool "Invert Motor A encoder direction"
+        default n
+        depends on EXAMPLE_ENABLE_ENCODERS
+
+    config EXAMPLE_ENCODER_B_INVERT
+        bool "Invert Motor B encoder direction"
+        default n
+        depends on EXAMPLE_ENABLE_ENCODERS
+
+    config EXAMPLE_ENCODER_D_INVERT
+        bool "Invert Motor D encoder direction"
+        default n
+        depends on EXAMPLE_ENABLE_ENCODERS
+
     config EXAMPLE_ENABLE_SERVO_TEST
         bool "Run servo test at startup"
         default n

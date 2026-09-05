@@ -692,15 +692,21 @@ static void camera_tft_overlay_status(uint8_t *frame, uint16_t width,
     (void)snprintf(lines[6], sizeof(lines[6]), "DROP:%u CD:%u",
                    (unsigned)stats.frames_dropped,
                    (unsigned)stats.control_dropped_frames);
-    (void)snprintf(lines[7], sizeof(lines[7]), "T:%d F:%u O:%d",
-                   cached.finish_candidate ? 1 : 0,
-                   (unsigned)cached.finish_frames,
-                   cached.obstacle_completed ? 1 : 0);
     if (cached.ultrasonic_cm < 0) {
-        (void)snprintf(lines[8], sizeof(lines[8]), "US:--");
+        (void)snprintf(lines[7], sizeof(lines[7]), "US:-- O:%d",
+                       cached.obstacle_completed ? 1 : 0);
     } else {
-        (void)snprintf(lines[8], sizeof(lines[8]), "US:%d CM",
-                       cached.ultrasonic_cm);
+        (void)snprintf(lines[7], sizeof(lines[7]), "US:%d O:%d",
+                       cached.ultrasonic_cm,
+                       cached.obstacle_completed ? 1 : 0);
+    }
+    if (cached.encoder_ready) {
+        (void)snprintf(lines[8], sizeof(lines[8]), "ENC:%d %d %d",
+                       cached.encoder_rate_cps[0],
+                       cached.encoder_rate_cps[1],
+                       cached.encoder_rate_cps[2]);
+    } else {
+        (void)snprintf(lines[8], sizeof(lines[8]), "ENC:--");
     }
     if (!tft_st7735_overlay_text_rgb565(frame, width, height, line_ptrs,
                                         9, 0x0000)) {

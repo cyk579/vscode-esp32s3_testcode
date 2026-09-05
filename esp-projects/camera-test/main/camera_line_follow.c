@@ -11,6 +11,9 @@
 #include "camera_display.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#if CONFIG_EXAMPLE_ENABLE_ENCODERS
+#include "encoder.h"
+#endif
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -499,6 +502,7 @@ static SemaphoreHandle_t s_control_mutex;
 static bool s_watchdog_created;
 static bool s_logged_frame_size;
 static bool s_suppress_kick;
+static bool s_encoder_ready;
 
 #define LINE_OVERLAY_MAX_POINTS (LINE_SCAN_MAX_ROWS / 2 + 1)
 typedef struct {
@@ -2295,6 +2299,23 @@ bool camera_line_follow_status_callback(camera_display_status_t *status,
     status->finish_candidate = s_last_finish_candidate;
     status->finish_frames = s_finish_frames;
     status->obstacle_completed = s_obstacle_completed;
+    status->encoder_ready = false;
+    for (int i = 0; i < CAMERA_DISPLAY_ENCODER_COUNT; ++i) {
+        status->encoder_delta[i] = 0;
+        status->encoder_rate_cps[i] = 0;
+        status->encoder_total[i] = 0;
+    }
+#if CONFIG_EXAMPLE_ENABLE_ENCODERS
+    encoder_snapshot_t encoder = {0};
+    if (s_encoder_ready && encoder_get_snapshot(&encoder)) {
+        status->encoder_ready = true;
+        for (int i = 0; i < CAMERA_DISPLAY_ENCODER_COUNT; ++i) {
+            status->encoder_delta[i] = encoder.delta[i];
+            status->encoder_rate_cps[i] = encoder.rate_cps[i];
+            status->encoder_total[i] = encoder.total[i];
+        }
+    }
+#endif
 
     (void)xSemaphoreGive(s_control_mutex);
     return true;
@@ -2402,6 +2423,28 @@ static void maybe_log_summary(int64_t now)
              s_ultrasonic_valid ?
                  (int)(s_ultrasonic_distance_cm * 10.0f + 0.5f) : -1,
              s_ultrasonic_valid, s_obstacle_completed);
+#if CONFIG_EXAMPLE_ENABLE_ENCODERS
+    encoder_snapshot_t encoder = {0};
+    if (s_encoder_ready && encoder_get_snapshot(&encoder)) {
+        ESP_LOGI(TAG,
+                 "encoder ready=1 delta[A,B,D]=[%d,%d,%d] "
+                 "rate_cps[A,B,D]=[%d,%d,%d] total[A,B,D]=[%d,%d,%d] "
+                 "sample_ms=%u cpr=%u",
+                 encoder.delta[ENCODER_WHEEL_A],
+                 encoder.delta[ENCODER_WHEEL_B],
+                 encoder.delta[ENCODER_WHEEL_D],
+                 encoder.rate_cps[ENCODER_WHEEL_A],
+                 encoder.rate_cps[ENCODER_WHEEL_B],
+                 encoder.rate_cps[ENCODER_WHEEL_D],
+                 encoder.total[ENCODER_WHEEL_A],
+                 encoder.total[ENCODER_WHEEL_B],
+                 encoder.total[ENCODER_WHEEL_D],
+                 (unsigned)encoder.sample_period_ms,
+                 (unsigned)encoder.counts_per_revolution);
+    } else {
+        ESP_LOGW(TAG, "encoder ready=0 (telemetry unavailable)");
+    }
+#endif
 
     s_summary_camera_frames = pipeline.camera_frames;
     s_summary_processed_frames = pipeline.processed_frames;
@@ -3250,6 +3293,20 @@ esp_err_t camera_line_follow_start(void)
             return err;
         }
     }
+
+    s_encoder_ready = false;
+#if CONFIG_EXAMPLE_ENABLE_ENCODERS
+    const esp_err_t encoder_err = encoder_init();
+    if (encoder_err == ESP_OK) {
+        s_encoder_ready = true;
+        ESP_LOGI(TAG, "wheel encoder telemetry enabled (A=39/40 B=17/3 D=41/42)");
+    } else {
+        /* Encoders are observational only; a wiring/resource error must not
+         * prevent the already validated camera line follower from starting. */
+        ESP_LOGW(TAG, "wheel encoder telemetry unavailable: %s",
+                 esp_err_to_name(encoder_err));
+    }
+#endif
 
     ultrasonic_init(ULTRASONIC_TRIG, ULTRASONIC_ECHO);
     s_started = true;

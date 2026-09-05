@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "tcp_server.c" "camera_display.c" "camera_line_follow.c" "line_geometry.c" "line_mixer.c" "line_control.c" "tft_st7735.c" "ultrasonic.c"
+idf_component_register(SRCS "main.c" "tcp_server.c" "camera_display.c" "camera_line_follow.c" "line_geometry.c" "line_mixer.c" "line_control.c" "tft_st7735.c" "ultrasonic.c" "encoder.c"
                     INCLUDE_DIRS ""
                     PRIV_REQUIRES
                         nvs_flash
@@ -9,6 +9,7 @@ idf_component_register(SRCS "main.c" "tcp_server.c" "camera_display.c" "camera_l
                         esp_wifi
                         esp_driver_gpio
                         esp_driver_ledc
+                        esp_driver_pcnt
                         esp_driver_spi
                         esp_jpeg
                         heap
