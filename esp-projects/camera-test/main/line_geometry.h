@@ -20,7 +20,11 @@ extern "C" {
 #define LINE_ROI_RIGHT_PERCENT 90
 #define LINE_ROI_TOP_PERCENT 15
 #define LINE_ROI_BOTTOM_PERCENT 100
-#define LINE_LOCAL_CONTRAST_MIN 18
+#define LINE_LOCAL_CONTRAST_MIN 28
+/* The tape is deliberately pure black.  An adaptive threshold may rise under
+ * bright lighting, but it must not classify ordinary dark objects or a hand as
+ * track pixels solely because the whole frame became dim. */
+#define LINE_ABSOLUTE_BLACK_MAX_LUMA 88
 #define LINE_NEAR_TOP_PERCENT 65
 #define LINE_NEAR_BOTTOM_PERCENT 92
 #define LINE_ROW_STEP 2

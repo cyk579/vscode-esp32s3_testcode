@@ -195,9 +195,9 @@ UVC MJPEG(320x240@30 或 480x320@25) -> 三槽位最新帧队列
 
 - `NORMAL` 用近场中心计算 `lateral_error`，用中远场中心序列计算 `heading_error`，控制只使用整数 PD（P、heading 前馈和 D），并保留 turn/slew 限幅。斜线始终是 `NORMAL`，`heading_error` 不会触发转弯状态。
 - 只有在线末端附近检测到明确新支路，连续 2~3 帧确认后才保存 `pending_turn`；旧直线仍可见时继续沿旧线控制，旧线消失后才进入 `CORNER`。`CORNER` 低速强转，直到底部连续 2~3 帧得到新的中心线后回到 `NORMAL`。
-- `LOST` 保存最后的种子和方向，从预测位置附近重新搜索，窗口随丢线帧数扩大；候选线必须连续确认，超时仍使用现有停车和重新布防保护，不会退回全图找最大黑块。
+- `LOST` 立即停车并锁存，不会因下一帧重新看见线而自动重启；固定避障已经完成时，首次 `LOST` 才交给 `FINDBALL`。
 
-宽黑终点线只在当前种子附近的近场区域确认，侧面或远处黑块不能触发停车。上电后 `STBY` 保持低电平，黑线连续确认后才使能电机；watchdog、方向换向保护和超时停车逻辑保持有效。
+当前版本不依赖 T 型口检测，固定避障完成后以视觉 `LOST` 作为找球交接条件。上电后 `STBY` 保持低电平，黑线连续确认后才使能电机；watchdog、方向换向保护和终端停车逻辑保持有效。
 
 需要实车调整的参数集中在 `main/camera_line_follow.c` 文件顶部，优先调整镜像方向、ROI/搜索窗口、合理线宽、PD 增益、转向/斜率限幅以及 CORNER/LOST 的确认和超时参数。一次只改一个参数，并先观察下面的低频统计。
 
@@ -213,6 +213,25 @@ STBY motor[A,B,D]
 其中 `camera_fps` 是 UVC 输入帧率，`processed_fps` 是实际完成解码/巡线的帧率，`control_fps` 是电机控制刷新率；`line_us_avg/max` 用 `esp_timer_get_time()` 统计单帧巡线耗时。比赛时通过 UART 观察这些统计，不依赖 TFT 或 Wi-Fi。
 
 需要只测试摄像头而不让车动时，在 `idf.py menuconfig -> Example Configuration` 关闭 `Enable camera black-line following`，并把 TB6612 的 `STBY` 固定拉低。需要时可关闭 `Enable TFT status page`；不要同时开启舵机测试，舵机配置会与整车接线/LEDC 资源冲突。
+
+### 视觉阈值校准
+
+需要让摄像头只识别黑胶带时，把 `main/camera_line_follow.c` 顶部的
+`LINE_VISION_CALIB_MODE` 临时改为 `1`，并打开 TFT 状态页。该模式锁住电机，
+只运行解码和局部识别，每 500 ms 打印 `VISION_CALIB threshold/candidate/seed_x/rows`
+并在 TFT 上画当前识别点。依次把白底、黑胶带、手和彩色物体放到镜头 ROI，
+确认黑胶带能得到稳定 `candidate=1`，手和其它物体不能形成连续点列。实际黑像素还会经过
+`LINE_ABSOLUTE_BLACK_MAX_LUMA`（默认 88）和颜色饱和度过滤；手仍被识别时先降到 72，
+黑胶带在暗光下丢失才升到 96。校准完成后恢复为 `0`。
+
+在 ESP-IDF Terminal 中烧录校准固件：
+
+```text
+cd esp-projects/camera-test
+idf.py set-target esp32s3
+idf.py build
+idf.py -p COM6 flash monitor
+```
 
 ## 舵机测试动作
 

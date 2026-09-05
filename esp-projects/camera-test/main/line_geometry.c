@@ -164,7 +164,8 @@ static bool pixel_is_dark(const uint8_t *frame, const line_scan_cfg_t *cfg,
         return false;
     }
     const uint8_t *pixel = frame + (((size_t)by * cfg->width + (size_t)bx) * 2);
-    if (line_geometry_luma(pixel) > row_threshold) {
+    const int luma = line_geometry_luma(pixel);
+    if (luma > row_threshold || luma > LINE_ABSOLUTE_BLACK_MAX_LUMA) {
         return false;
     }
     if (cfg->saturation_guard && rgb565_saturation(pixel) > cfg->saturation_max) {
