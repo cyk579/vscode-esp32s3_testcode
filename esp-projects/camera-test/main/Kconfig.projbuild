@@ -28,9 +28,9 @@ menu "Example Configuration"
         bool "Enable TFT status page"
         default y
         help
-            Enables a low-priority ST7735 status page at about 2 Hz. No camera
-            preview frame is decoded for the display, so camera control remains
-            independent from TFT updates.
+            Enables a low-rate ST7735 color camera preview with black status
+            text overlay. The preview reuses the decoded control frame and does
+            not add a display-only JPEG decode or framebuffer.
 
     config EXAMPLE_ENABLE_CAMERA_LINE_FOLLOW
         bool "Enable camera black-line following"

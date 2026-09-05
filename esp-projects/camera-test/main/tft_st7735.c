@@ -61,6 +61,10 @@ static const uint8_t s_font[][7] = {
     {0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00}, /* - */
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* space */
     {0x1f, 0x11, 0x05, 0x02, 0x04, 0x00, 0x04}, /* fallback */
+    {0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f}, /* F */
+    {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}, /* K */
+    {0x11, 0x11, 0x11, 0x0a, 0x0a, 0x04, 0x04}, /* V */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f}, /* _ */
 };
 
 static const uint8_t *font_glyph(char ch)
@@ -100,6 +104,10 @@ static const uint8_t *font_glyph(char ch)
     case ':': return s_font[28];
     case '-': return s_font[29];
     case ' ': return s_font[30];
+    case 'F': return s_font[32];
+    case 'K': return s_font[33];
+    case 'V': return s_font[34];
+    case '_': return s_font[35];
     default: return s_font[31];
     }
 }
@@ -346,6 +354,65 @@ bool tft_st7735_draw_text_lines(const char *const lines[],
         }
         if (write_data(line, sizeof(line)) != ESP_OK) {
             return false;
+        }
+    }
+    return true;
+}
+
+bool tft_st7735_overlay_text_rgb565(uint8_t *rgb565_big_endian,
+                                    uint16_t width,
+                                    uint16_t height,
+                                    const char *const lines[],
+                                    size_t line_count,
+                                    uint16_t foreground)
+{
+    if (!s_initialized || rgb565_big_endian == NULL || lines == NULL ||
+        width == 0 || height == 0) {
+        return false;
+    }
+
+    const size_t columns = width > TFT_TEXT_MARGIN_X ?
+                           (width - TFT_TEXT_MARGIN_X) / 6U : 0U;
+    const size_t rows = height > TFT_TEXT_MARGIN_Y ?
+                        (height - TFT_TEXT_MARGIN_Y) / 8U : 0U;
+    if (columns == 0 || rows == 0) {
+        return true;
+    }
+    if (line_count > rows) {
+        line_count = rows;
+    }
+
+    for (size_t row = 0; row < line_count; ++row) {
+        const char *text = lines[row];
+        if (text == NULL) {
+            continue;
+        }
+        for (size_t column = 0; column < columns; ++column) {
+            const char ch = text[column];
+            if (ch == '\0') {
+                break;
+            }
+            const uint8_t *glyph = font_glyph(ch);
+            for (size_t glyph_y = 0; glyph_y < 7U; ++glyph_y) {
+                const size_t y = TFT_TEXT_MARGIN_Y + row * 8U + glyph_y;
+                if (y >= height) {
+                    continue;
+                }
+                const uint8_t bits = glyph[glyph_y];
+                for (size_t glyph_x = 0; glyph_x < 5U; ++glyph_x) {
+                    if ((bits & (uint8_t)(1U << (4U - glyph_x))) == 0) {
+                        continue;
+                    }
+                    const size_t x = TFT_TEXT_MARGIN_X + column * 6U + glyph_x;
+                    if (x >= width) {
+                        continue;
+                    }
+                    uint8_t *pixel = rgb565_big_endian +
+                                     ((y * (size_t)width + x) * 2U);
+                    pixel[0] = (uint8_t)(foreground >> 8);
+                    pixel[1] = (uint8_t)foreground;
+                }
+            }
         }
     }
     return true;

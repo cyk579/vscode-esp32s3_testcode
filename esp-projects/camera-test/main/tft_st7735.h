@@ -36,3 +36,13 @@ bool tft_st7735_draw_text_lines(const char *const lines[],
                                 size_t line_count,
                                 uint16_t foreground,
                                 uint16_t background);
+
+/* Paint diagnostic text into an existing RGB565 frame without clearing its
+ * image. The caller can then send the frame once, so no extra framebuffer or
+ * per-character SPI transaction is needed. */
+bool tft_st7735_overlay_text_rgb565(uint8_t *rgb565_big_endian,
+                                    uint16_t width,
+                                    uint16_t height,
+                                    const char *const lines[],
+                                    size_t line_count,
+                                    uint16_t foreground);

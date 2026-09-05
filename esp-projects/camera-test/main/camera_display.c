@@ -99,6 +99,11 @@ static const char *TAG = "camera_display";
 static camera_display_state_t s_display;
 static uint32_t s_mjpeg_drop_log_count;
 
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+static void camera_tft_overlay_status(uint8_t *frame, uint16_t width,
+                                      uint16_t height);
+#endif
+
 static void log_mjpeg_drop(const char *reason, size_t jpeg_len)
 {
     const uint32_t count = ++s_mjpeg_drop_log_count;
@@ -483,21 +488,21 @@ static void camera_control_task(void *arg)
         const int64_t age = now >= frame.capture_us ? now - frame.capture_us : 0;
         s_display.last_control_age_us = age > UINT32_MAX ? UINT32_MAX : (uint32_t)age;
         s_display.last_control_sequence = frame.sequence;
-        if (s_display.frame_callback != NULL) {
-            ++s_display.control_frames;
-            s_display.frame_callback(s_display.control_rgb565[frame.buffer],
-                                     frame.width, frame.height, frame.threshold,
-                                     s_display.tft_ready,
-                                     s_display.frame_callback_ctx);
-        }
-#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
-        /* Reuse the frame that control just processed. Decoding the same JPEG
-         * again for TFT was starving the control decoder. */
         const int64_t preview_now = esp_timer_get_time();
         const bool preview_due = s_display.tft_ready &&
                                  (s_display.last_preview_us == 0 ||
                                   preview_now - s_display.last_preview_us >=
                                       CAMERA_TFT_REFRESH_US);
+        if (s_display.frame_callback != NULL) {
+            ++s_display.control_frames;
+            s_display.frame_callback(s_display.control_rgb565[frame.buffer],
+                                     frame.width, frame.height, frame.threshold,
+                                     preview_due,
+                                     s_display.frame_callback_ctx);
+        }
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
+        /* Reuse the frame that control just processed. Decoding the same JPEG
+         * again for TFT was starving the control decoder. */
         if (preview_due) {
             if (s_display.preview_callback != NULL) {
                 s_display.preview_callback(s_display.control_rgb565[frame.buffer],
@@ -507,6 +512,8 @@ static void camera_control_task(void *arg)
                                             s_display.preview_callback_ctx);
             }
             const int64_t tft_start_us = esp_timer_get_time();
+            camera_tft_overlay_status(s_display.control_rgb565[frame.buffer],
+                                      frame.width, frame.height);
             if (tft_st7735_draw_rgb565(s_display.control_rgb565[frame.buffer],
                                        frame.width, frame.height)) {
                 s_display.last_tft_us =
@@ -524,7 +531,7 @@ static void camera_control_task(void *arg)
     }
 }
 
-#if 0 /* Image preview is the debug page; do not let a status task overwrite it. */
+#if CONFIG_EXAMPLE_ENABLE_TFT_PREVIEW
 static const char *status_state_name(camera_display_status_state_t state)
 {
     switch (state) {
@@ -542,85 +549,77 @@ static const char *status_state_name(camera_display_status_state_t state)
         return "AVOID_F";
     case CAMERA_DISPLAY_STATUS_AVOID_RIGHT:
         return "AVOID_R";
+    case CAMERA_DISPLAY_STATUS_T_FINISH:
+        return "T_FINISH";
+    case CAMERA_DISPLAY_STATUS_FINDBALL:
+        return "FINDBALL";
     case CAMERA_DISPLAY_STATUS_NORMAL:
     default:
         return "NORMAL";
     }
 }
 
-static void camera_tft_status_task(void *arg)
+static void camera_tft_overlay_status(uint8_t *frame, uint16_t width,
+                                      uint16_t height)
 {
-    (void)arg;
-    camera_display_status_t cached = {
+    static camera_display_status_t cached = {
         .state = CAMERA_DISPLAY_STATUS_LOST,
         .ultrasonic_cm = -1,
     };
-    camera_display_pipeline_stats_t previous = {0};
-    int64_t previous_us = 0;
+    static camera_display_pipeline_stats_t previous;
+    static int64_t previous_us;
+    camera_display_status_t sampled = cached;
+    if (s_display.status_callback != NULL &&
+        s_display.status_callback(&sampled, s_display.status_callback_ctx)) {
+        cached = sampled;
+    }
 
-    while (true) {
-        vTaskDelay(pdMS_TO_TICKS(CAMERA_TFT_STATUS_REFRESH_MS));
-        if (!s_display.started || !s_display.tft_ready) {
-            continue;
-        }
+    camera_display_pipeline_stats_t stats = {0};
+    camera_display_get_pipeline_stats(&stats);
+    const int64_t now = esp_timer_get_time();
+    uint32_t camera_fps = 0;
+    uint32_t control_fps = 0;
+    if (previous_us != 0 && now > previous_us) {
+        const uint64_t elapsed = (uint64_t)(now - previous_us);
+        camera_fps = (uint32_t)(((uint64_t)(stats.camera_frames -
+                                            previous.camera_frames) * 1000000U) /
+                               elapsed);
+        control_fps = (uint32_t)(((uint64_t)(stats.control_frames -
+                                            previous.control_frames) * 1000000U) /
+                               elapsed);
+    }
+    previous = stats;
+    previous_us = now;
 
-        camera_display_status_t sampled = cached;
-        if (s_display.status_callback != NULL &&
-            s_display.status_callback(&sampled, s_display.status_callback_ctx)) {
-            cached = sampled;
-        }
-
-        camera_display_pipeline_stats_t stats = {0};
-        camera_display_get_pipeline_stats(&stats);
-        const int64_t now = esp_timer_get_time();
-        uint32_t camera_fps = 0;
-        uint32_t control_fps = 0;
-        if (previous_us != 0 && now > previous_us) {
-            const uint64_t elapsed = (uint64_t)(now - previous_us);
-            camera_fps = (uint32_t)(((uint64_t)(stats.camera_frames -
-                                                previous.camera_frames) * 1000000U) /
-                                   elapsed);
-            control_fps = (uint32_t)(((uint64_t)(stats.control_frames -
-                                                previous.control_frames) * 1000000U) /
-                                   elapsed);
-        }
-        previous = stats;
-        previous_us = now;
-
-        char lines[8][32];
-        const char *line_ptrs[8] = {
-            lines[0], lines[1], lines[2], lines[3],
-            lines[4], lines[5], lines[6], lines[7],
-        };
-        (void)snprintf(lines[0], sizeof(lines[0]), "STATE:%s",
-                       status_state_name(cached.state));
-        (void)snprintf(lines[1], sizeof(lines[1]), "ARM:%d STBY:%d",
-                       cached.armed ? 1 : 0, cached.stby ? 1 : 0);
-        (void)snprintf(lines[2], sizeof(lines[2]), "M A:%d B:%d D:%d",
-                       cached.motor_a, cached.motor_b, cached.motor_d);
-        (void)snprintf(lines[3], sizeof(lines[3]), "LAT:%d HEAD:%d",
-                       cached.lateral_error, cached.heading_error);
-        (void)snprintf(lines[4], sizeof(lines[4]), "TURN:%d",
-                       cached.turn_command);
-        (void)snprintf(lines[5], sizeof(lines[5]), "CAM:%u CTRL:%u",
-                       (unsigned)camera_fps, (unsigned)control_fps);
-        (void)snprintf(lines[6], sizeof(lines[6]), "DROP:%u CD:%u",
-                       (unsigned)stats.frames_dropped,
-                       (unsigned)stats.control_dropped_frames);
-        if (cached.ultrasonic_cm < 0) {
-            (void)snprintf(lines[7], sizeof(lines[7]), "US:--");
-        } else {
-            (void)snprintf(lines[7], sizeof(lines[7]), "US:%d CM",
-                           cached.ultrasonic_cm);
-        }
-
-        const int64_t draw_start_us = esp_timer_get_time();
-        if (!tft_st7735_draw_text_lines(line_ptrs, 8, 0xffff, 0x0000)) {
-            ESP_LOGW(TAG, "TFT status draw failed");
-        } else {
-            s_display.last_tft_us =
-                (uint32_t)(esp_timer_get_time() - draw_start_us);
-        }
+    char lines[8][32];
+    const char *line_ptrs[8] = {
+        lines[0], lines[1], lines[2], lines[3],
+        lines[4], lines[5], lines[6], lines[7],
+    };
+    (void)snprintf(lines[0], sizeof(lines[0]), "STATE:%s",
+                   status_state_name(cached.state));
+    (void)snprintf(lines[1], sizeof(lines[1]), "ARM:%d STBY:%d",
+                   cached.armed ? 1 : 0, cached.stby ? 1 : 0);
+    (void)snprintf(lines[2], sizeof(lines[2]), "M A:%d B:%d D:%d",
+                   cached.motor_a, cached.motor_b, cached.motor_d);
+    (void)snprintf(lines[3], sizeof(lines[3]), "LAT:%d HEAD:%d",
+                   cached.lateral_error, cached.heading_error);
+    (void)snprintf(lines[4], sizeof(lines[4]), "TURN:%d",
+                   cached.turn_command);
+    (void)snprintf(lines[5], sizeof(lines[5]), "CAM:%u CTRL:%u",
+                   (unsigned)camera_fps, (unsigned)control_fps);
+    (void)snprintf(lines[6], sizeof(lines[6]), "DROP:%u CD:%u",
+                   (unsigned)stats.frames_dropped,
+                   (unsigned)stats.control_dropped_frames);
+    if (cached.ultrasonic_cm < 0) {
+        (void)snprintf(lines[7], sizeof(lines[7]), "US:--");
+    } else {
+        (void)snprintf(lines[7], sizeof(lines[7]), "US:%d CM",
+                       cached.ultrasonic_cm);
+    }
+    if (!tft_st7735_overlay_text_rgb565(frame, width, height, line_ptrs,
+                                        8, 0x0000)) {
+        ESP_LOGW(TAG, "TFT status overlay failed");
     }
 }
 #endif

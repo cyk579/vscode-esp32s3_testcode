@@ -165,7 +165,7 @@
 
 /* NORMAL 低速用时间脉冲而不是把 PWM 压到静摩擦死区。MIN 只抬 mixer
  * 输入的 forward，绝不逐轮改 A/B/D；esp_timer 只负责切换 duty。 */
-#define LINE_BURST_ENABLE 1
+#define LINE_BURST_ENABLE 0
 #define LINE_BURST_PERIOD_MS 600U
 #define LINE_BURST_ON_MS 540U
 #define LINE_BURST_MIN_OUTPUT 27
@@ -267,15 +267,15 @@
 #define ULTRASONIC_ECHO GPIO_NUM_11
 #define ULTRASONIC_MIN_CM 2.0f
 #define ULTRASONIC_MAX_CM 400.0f
-#define OBSTACLE_DETECT_CM 25.0f
-#define OBSTACLE_CLOSE_CONFIRM_SAMPLES 3U
+#define OBSTACLE_DETECT_CM 10.0f
+#define OBSTACLE_CLOSE_CONFIRM_SAMPLES 2U
 /* HC-SR04 practical lower bound; the read routine still performs its own
  * echo timeout, so a missing echo can make the effective period longer. */
 #define ULTRASONIC_PERIOD_MS 70U
 #define AVOID_BRAKE_MS 500U
-#define AVOID_LEFT_MS 1500U
+#define AVOID_LEFT_MS 2500U
 #define AVOID_FORWARD_MS 2000U
-#define AVOID_RIGHT_MS 1300U
+#define AVOID_RIGHT_MS 2500U
 #define AVOID_REACQUIRE_GRACE_MS 1000U
 #define AVOID_LEFT_A_SPEED 24
 #define AVOID_LEFT_B_SPEED 35
@@ -976,11 +976,6 @@ static void normal_burst_deactivate(void)
     burst_apply_duty(false);
 }
 #else
-static bool normal_burst_activate(void)
-{
-    return false;
-}
-
 static void normal_burst_deactivate(void)
 {
 }
@@ -995,8 +990,6 @@ static void motor_set(const motor_t *motor, int command)
     const bool direction_changed = direction != s_last_direction[index];
 #if LINE_BURST_ENABLE
     const bool burst_output = s_burst_context && s_burst_active;
-#else
-    const bool burst_output = false;
 #endif
 
     if (direction_changed) {
@@ -1600,6 +1593,24 @@ static void ball_begin(int64_t now)
     ESP_LOGW(TAG, "finish task: tilt high, searching RED then GREEN");
 }
 
+/* A line miss before the obstacle/finish section is recoverable: keep the
+ * existing slow alternating search. Once the fixed obstacle route has
+ * completed, however, the next confirmed LOST is the endpoint fallback and
+ * must hand control to the ball task instead of sweeping indefinitely. */
+static bool enter_findball_after_finish_line_loss(int64_t now)
+{
+    if (!s_obstacle_completed || s_finished || s_ball_phase != BALL_IDLE ||
+        (s_obstacle_reacquire_until_us != 0 &&
+         now < s_obstacle_reacquire_until_us)) {
+        return false;
+    }
+    s_finished = true;
+    stop_motors();
+    ball_begin(now);
+    ESP_LOGW(TAG, "finish line LOST after obstacle; entering FINDBALL");
+    return true;
+}
+
 static void ball_next_search(int64_t now)
 {
     ball_stream_clear();
@@ -2171,6 +2182,10 @@ bool camera_line_follow_status_callback(camera_display_status_t *status,
         status->state = CAMERA_DISPLAY_STATUS_AVOID_FORWARD;
     } else if (s_obstacle_state == OBSTACLE_RIGHT) {
         status->state = CAMERA_DISPLAY_STATUS_AVOID_RIGHT;
+    } else if (s_finished) {
+        status->state = CAMERA_DISPLAY_STATUS_FINDBALL;
+    } else if (s_finish_frames > 0) {
+        status->state = CAMERA_DISPLAY_STATUS_T_FINISH;
     } else {
         status->state = s_post_corner_align ? CAMERA_DISPLAY_STATUS_ALIGN :
                         (s_state == LINE_STATE_CORNER ? CAMERA_DISPLAY_STATUS_CORNER :
@@ -2745,6 +2760,9 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
 
     /* ---- LOST：只在最后可信种子附近重捕获 ---- */
     if (s_state == LINE_STATE_LOST) {
+        if (enter_findball_after_finish_line_loss(now)) {
+            goto done;
+        }
         const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
         const bool obstacle_grace = s_obstacle_reacquire_until_us != 0 &&
                                     now < s_obstacle_reacquire_until_us;
@@ -2899,6 +2917,9 @@ static void camera_line_follow_process_frame(uint8_t *rgb565_big_endian,
     s_reacquire_frames = 0;
     s_reacquire_x = s_seed_x;
     reset_control();
+    if (enter_findball_after_finish_line_loss(now)) {
+        goto done;
+    }
     {
         const int64_t lost_us = s_last_line_us == 0 ? INT64_MAX : now - s_last_line_us;
         const bool obstacle_grace = s_obstacle_reacquire_until_us != 0 &&
