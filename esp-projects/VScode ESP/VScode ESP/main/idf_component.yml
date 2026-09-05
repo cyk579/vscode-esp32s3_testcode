@@ -1,0 +1,4 @@
+dependencies:
+  idf: ">=5.0"
+  espressif/usb_stream: "^1.5.2"
+  esp_jpeg: "*"
