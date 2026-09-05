@@ -20,7 +20,9 @@ if [ "$#" -eq 0 ]; then
     $CC $CFLAGS -Iesp_stubs -Iesp_stubs/freertos -ffunction-sections -fdata-sections \
         -Wl,--gc-sections -o obstacle_priority_harness obstacle_priority_harness.c
     $CC $CFLAGS -o lowres_corner_harness lowres_corner_harness.c ../main/line_geometry.c
+    $CC $CFLAGS -Iesp_stubs -Iesp_stubs/freertos -o tft_status_harness tft_status_harness.c
     ./obstacle_priority_harness
     ./lowres_corner_harness
+    ./tft_status_harness
 fi
 ./harness "$@"

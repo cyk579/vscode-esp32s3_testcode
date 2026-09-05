@@ -26,10 +26,10 @@
 #define CAMERA_DISPLAY_JPEG_WORK_BYTES (16 * 1024)
 #define CAMERA_DECODE_IDLE_YIELD_FRAMES 4U
 
-#define CAMERA_BINARY_ROI_TOP_PERCENT 25
+#define CAMERA_BINARY_ROI_TOP_PERCENT 15
 #define CAMERA_BINARY_ROI_BOTTOM_PERCENT 100
-#define CAMERA_BINARY_ROI_LEFT_PERCENT 15
-#define CAMERA_BINARY_ROI_RIGHT_PERCENT 85
+#define CAMERA_BINARY_ROI_LEFT_PERCENT 10
+#define CAMERA_BINARY_ROI_RIGHT_PERCENT 90
 #define CAMERA_BINARY_ROW_STEP 2
 #define CAMERA_BINARY_DARK_PERCENTILE 2
 #define CAMERA_BINARY_LIGHT_PERCENTILE 90
@@ -41,7 +41,7 @@
 #define CAMERA_BINARY_THRESHOLD_FILTER_OLD 3
 #define CAMERA_BINARY_THRESHOLD_FILTER_NEW 1
 
-#define CAMERA_TFT_STATUS_REFRESH_MS 1000U
+#define CAMERA_TFT_STATUS_REFRESH_MS 500U
 
 typedef struct {
     uint8_t slot;
@@ -659,10 +659,10 @@ static void camera_tft_status_task(void *arg)
         previous = stats;
         previous_us = now;
 
-        char lines[8][32];
-        const char *line_ptrs[8] = {
+        char lines[9][32];
+        const char *line_ptrs[9] = {
             lines[0], lines[1], lines[2], lines[3],
-            lines[4], lines[5], lines[6], lines[7],
+            lines[4], lines[5], lines[6], lines[7], lines[8],
         };
         (void)snprintf(lines[0], sizeof(lines[0]), "STATE:%s",
                        status_state_name(cached.state));
@@ -686,8 +686,16 @@ static void camera_tft_status_task(void *arg)
                            cached.ultrasonic_cm);
         }
 
+        /* T confirmation can finish between two screen refreshes. Keep its
+         * enable/progress/result visible without delaying the controller. */
+        const char *finish_status = cached.state == CAMERA_DISPLAY_STATUS_FINDBALL ?
+                                    "DONE" : (!cached.finish_enabled ? "OFF" :
+                                    (cached.finish_frames > 0 ? "CHECK" : "READY"));
+        (void)snprintf(lines[8], sizeof(lines[8]), "T:%s %u-%u", finish_status,
+                       cached.finish_frames, cached.finish_required_frames);
+
         const int64_t draw_start_us = esp_timer_get_time();
-        if (!tft_st7735_draw_text_lines(line_ptrs, 8, 0xffff, 0x0000)) {
+        if (!tft_st7735_draw_text_lines(line_ptrs, 9, 0xffff, 0x0000)) {
             ESP_LOGW(TAG, "TFT status draw failed");
         } else {
             s_display.last_tft_us =

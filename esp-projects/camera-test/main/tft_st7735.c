@@ -61,6 +61,10 @@ static const uint8_t s_font[][7] = {
     {0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00}, /* - */
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* space */
     {0x1f, 0x11, 0x05, 0x02, 0x04, 0x00, 0x04}, /* fallback */
+    {0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10}, /* F */
+    {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}, /* K */
+    {0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04}, /* V */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f}, /* _ */
 };
 
 static const uint8_t *font_glyph(char ch)
@@ -100,6 +104,10 @@ static const uint8_t *font_glyph(char ch)
     case ':': return s_font[28];
     case '-': return s_font[29];
     case ' ': return s_font[30];
+    case 'F': return s_font[32];
+    case 'K': return s_font[33];
+    case 'V': return s_font[34];
+    case '_': return s_font[35];
     default: return s_font[31];
     }
 }
@@ -307,42 +315,45 @@ bool tft_st7735_draw_text_lines(const char *const lines[],
     if (line_count > rows) {
         line_count = rows;
     }
-    const size_t draw_rows = line_count;
+    if (set_window(0, 0, TFT_ST7735_WIDTH - 1, TFT_ST7735_HEIGHT - 1) != ESP_OK) {
+        return false;
+    }
+
     uint8_t line[TFT_ST7735_WIDTH * 2];
-    for (size_t text_row = 0; text_row < draw_rows; ++text_row) {
-        const uint16_t y0 = (uint16_t)(TFT_TEXT_MARGIN_Y + text_row * 8U);
-        if (set_window(0, y0, TFT_ST7735_WIDTH - 1, y0 + 7U) != ESP_OK) {
-            return false;
+    for (uint16_t y = 0; y < TFT_ST7735_HEIGHT; ++y) {
+        for (uint16_t x = 0; x < TFT_ST7735_WIDTH; ++x) {
+            line[(size_t)x * 2] = (uint8_t)(background >> 8);
+            line[(size_t)x * 2 + 1] = (uint8_t)background;
         }
-        const char *text = lines[text_row];
-        for (uint8_t glyph_row = 0; glyph_row < 8U; ++glyph_row) {
-            for (size_t x = 0; x < TFT_ST7735_WIDTH; ++x) {
-                line[x * 2] = (uint8_t)(background >> 8);
-                line[x * 2 + 1] = (uint8_t)background;
-            }
-            if (text != NULL && glyph_row < 7U) {
-                for (size_t column = 0; column < columns; ++column) {
-                    const char ch = text[column];
-                    if (ch == '\0') {
-                        break;
+
+        const bool in_text_area = y >= TFT_TEXT_MARGIN_Y;
+        const size_t text_y = in_text_area ? y - TFT_TEXT_MARGIN_Y : 0;
+        const size_t text_row = text_y / 8;
+        const uint8_t glyph_row = (uint8_t)(text_y % 8);
+        const char *text = in_text_area && text_row < line_count ?
+                           lines[text_row] : NULL;
+        if (text != NULL) {
+            for (size_t column = 0; column < columns; ++column) {
+                const char ch = text[column];
+                if (ch == '\0') {
+                    break;
+                }
+                const uint8_t *glyph = font_glyph(ch);
+                const uint8_t bits = glyph_row < 7 ? glyph[glyph_row] : 0;
+                for (size_t glyph_x = 0; glyph_x < 5; ++glyph_x) {
+                    if ((bits & (uint8_t)(1U << (4U - glyph_x))) == 0) {
+                        continue;
                     }
-                    const uint8_t *glyph = font_glyph(ch);
-                    const uint8_t bits = glyph[glyph_row];
-                    for (size_t glyph_x = 0; glyph_x < 5; ++glyph_x) {
-                        if ((bits & (uint8_t)(1U << (4U - glyph_x))) == 0) {
-                            continue;
-                        }
-                        const size_t x = TFT_TEXT_MARGIN_X + column * 6 + glyph_x;
-                        if (x < TFT_ST7735_WIDTH) {
-                            line[x * 2] = (uint8_t)(foreground >> 8);
-                            line[x * 2 + 1] = (uint8_t)foreground;
-                        }
+                    const size_t x = TFT_TEXT_MARGIN_X + column * 6 + glyph_x;
+                    if (x < TFT_ST7735_WIDTH) {
+                        line[x * 2] = (uint8_t)(foreground >> 8);
+                        line[x * 2 + 1] = (uint8_t)foreground;
                     }
                 }
             }
-            if (write_data(line, sizeof(line)) != ESP_OK) {
-                return false;
-            }
+        }
+        if (write_data(line, sizeof(line)) != ESP_OK) {
+            return false;
         }
     }
     return true;

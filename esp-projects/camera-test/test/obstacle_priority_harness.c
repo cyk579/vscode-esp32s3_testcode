@@ -149,5 +149,43 @@ int main(void)
     assert(s_command_d == -AVOID_LEFT_D_SPEED);
 
     puts("PASS: never-armed car ignores obstacle; disarmed-after-run car owns BRAKE and LEFT with STBY enabled");
+
+    /* Display-only states must follow the real mission flags. LOST after
+     * avoidance is still LOST, never an implicit transition to FINDBALL. */
+    camera_display_status_t status = {0};
+    s_control_mutex = xSemaphoreCreateMutex();
+    s_obstacle_state = OBSTACLE_IDLE;
+    s_obstacle_completed = false;
+    s_state = LINE_STATE_NORMAL;
+    s_post_corner_align = false;
+    s_finished = false;
+    s_finish_frames = 0;
+    assert(camera_line_follow_status_callback(&status, NULL));
+    assert(status.state == CAMERA_DISPLAY_STATUS_NORMAL);
+    assert(!status.finish_enabled);
+
+    s_obstacle_completed = true;
+    s_state = LINE_STATE_LOST;
+    assert(camera_line_follow_status_callback(&status, NULL));
+    assert(status.state == CAMERA_DISPLAY_STATUS_LOST);
+    assert(status.finish_enabled && status.finish_frames == 0);
+    assert(status.finish_required_frames == LINE_FINISH_CONFIRM_FRAMES);
+
+    s_state = LINE_STATE_NORMAL;
+    s_finish_frames = 1;
+    assert(camera_line_follow_status_callback(&status, NULL));
+    assert(status.state == CAMERA_DISPLAY_STATUS_T_FINISH);
+    assert(status.finish_frames == 1);
+    assert(strcmp(state_name(), "T_FINISH") == 0);
+
+    s_finished = true;
+    s_finish_frames = LINE_FINISH_CONFIRM_FRAMES;
+    assert(camera_line_follow_status_callback(&status, NULL));
+    assert(status.state == CAMERA_DISPLAY_STATUS_FINDBALL);
+    assert(status.finish_frames == status.finish_required_frames);
+    assert(strcmp(state_name(), "FINDBALL") == 0);
+    assert(status.motor_a == s_command_a && status.motor_b == s_command_b &&
+           status.motor_d == s_command_d);
+    puts("PASS: TFT reports T enable/confirmation and FINDBALL; post-avoid LOST stays LOST");
     return 0;
 }
