@@ -1,0 +1,4 @@
+{
+  "cmake.sourceDirectory": "${workspaceFolder}/esp-projects/VScode ESP/VScode ESP",
+  "cmake.buildDirectory": "${workspaceFolder}/esp-projects/VScode ESP/VScode ESP/build-local"
+}

@@ -10,10 +10,9 @@
 .venv/
 venv/
 
-# VS Code and local IDE state
-.vscode/
+# Share VS Code project configuration and workspace entry points.
+# Keep only IDE caches out of version control.
 .idea/
-*.code-workspace
 
 # OS and temporary files
 .DS_Store

@@ -49,7 +49,29 @@ GPIO13/14 是 SPI2 通过 GPIO Matrix 路由的时钟/MOSI，并非原生 IO_MUX
 
 ## 构建和烧录
 
-在已经安装 ESP-IDF 的终端中，进入**本 README 所在的内层工程目录**。原组留下的 `build` 包含 `C:/VScode ESP/build` 等旧电脑绝对路径与旧引脚固件，不能直接使用。
+### 从仓库恢复环境
+
+1. 拉取当前分支的最新提交，用 VS Code“文件 -> 从文件打开工作区”打开根目录的 `VScode-ESP.code-workspace`。左侧应只有 `VScode ESP` 一个工程；终端当前目录应是本 README 所在的内层目录。
+2. 安装工作区推荐的 Espressif ESP-IDF 扩展和 Microsoft C/C++ 扩展，在 ESP-IDF 扩展中选择本机安装的 **ESP-IDF v5.5.5** 及其 Python/工具链环境。这是本工程现有 `dependencies.lock` 记录的 SDK 版本，不使用其他工程的 5.4.4 环境覆盖本锁文件。
+3. 通过 ESP-IDF 扩展打开终端，运行 `idf.py --version`，应显示 `ESP-IDF v5.5.5`。串口选择实际连接开发板的 COM 口，下面的 COM5 只是示例。
+
+已提交根目录及本工程的 `.vscode` 配置和单工程工作区文件。工程内的 CMake、ESP-IDF（含 Windows 的 `idf.buildPathWin`）和 C/C++ `compileCommands` 全部使用 `build-local`；C/C++ 在首次构建后从生成的编译数据库读取真实工具链和头文件路径。配置不再写死原电脑的 `C:/Espressif` 或 COM5。
+
+| 环境项目 | 本仓库记录 |
+| --- | --- |
+| ESP-IDF | 5.5.5，见现有 `dependencies.lock` 的 `idf` 项 |
+| 芯片 | ESP32-S3，见 `sdkconfig` 和 IDE 的 `IDF_TARGET` |
+| Flash / PSRAM | WROOM-2-N32R16V：32MB OPI Flash / 16MB Octal PSRAM |
+| USB 组件 | `espressif/usb_stream` 1.5.2 |
+| JPEG 组件 | `espressif/esp_jpeg` 1.3.1 |
+| 间接依赖 | `espressif/cmake_utilities` 0.5.3 |
+| 共享配置 | `sdkconfig`、`sdkconfig.defaults`、`main/idf_component.yml`、`dependencies.lock`、`.vscode/` |
+
+以上组件版本及校验值已在原锁文件中提交，本次保留。`managed_components` 由 IDF 按锁文件下载；SDK、Python 和交叉编译器由本机 ESP-IDF 安装器安装。仓库保存复现配置，不把旧电脑的编译缓存当作环境。
+
+### 编译并确认实际固件
+
+在上述 ESP-IDF 终端中构建。原组留下的 `build` 包含 `C:/VScode ESP/build` 等旧电脑绝对路径与旧引脚固件，不能直接使用。
 
 ```powershell
 # 当前目录应包含本工程的 CMakeLists.txt、sdkconfig、main/。
@@ -58,7 +80,9 @@ idf.py -B build-local build
 idf.py -B build-local -p COM5 flash monitor
 ```
 
-把 COM5 换成实际 **UART 桥** 的串口。若工作区从其他工程切过来，确认 VS Code IDF 扩展的项目目录和构建目录也指向此工程，勿在 `camera-test` 中编译。原组记录为 IDF 5.5.5，本仓库其他工程记录为 5.4.4；以实际构建结果为准，不替换原有 `dependencies.lock`。
+把 COM5 换成开发板 USB 烧录接口实际枚举的串口，不需要外接 UART 模块。根目录的 CMake 配置也指向此工程，但 ESP-IDF 扩展应使用上面的单工程工作区，不在仓库根目录直接点击其烧录按钮。
+
+本工程的 CMake 项目名是 `esp32s3-camera-line-follow`，构建产物应为 `build-local/esp32s3-camera-line-follow.bin`。若显示 `usb-uvc` 或日志出现 `camera_line: fps camera=...`、`Servo test disabled; continuing to USB Host`，说明运行的是 `camera-test`，应检查烧录目录或是否仍在运行旧固件。正确的本版启动日志见下方白屏排查。
 
 构建后核对：`CONFIG_IDF_TARGET="esp32s3"`、`CONFIG_ESPTOOLPY_OCT_FLASH=y`、`CONFIG_ESPTOOLPY_FLASHMODE_OPI=y`、32MB 和 Octal PSRAM。OPI 时内部 `CONFIG_ESPTOOLPY_FLASHMODE="dout"` 是 IDF 对烧录镜像头的表示，不是错误配置。
 

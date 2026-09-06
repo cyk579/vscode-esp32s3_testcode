@@ -1,6 +1,8 @@
 # ESP32-S3 电子设计项目
 
-本仓库集中管理 ESP32-S3 小车与摄像头测试程序，使用 ESP-IDF 5.4.4 开发。
+本仓库集中管理 ESP32-S3 小车与摄像头测试程序。原有工程使用 ESP-IDF 5.4.4，VScode ESP 的现有依赖锁记录为 5.5.5，各工程环境按各自说明选择。
+
+**当前复现 VScode ESP：拉取代码后，在 VS Code 中使用“文件 -> 从文件打开工作区”，选择根目录 [VScode-ESP.code-workspace](VScode-ESP.code-workspace)。** 它只打开内层 VScode ESP 工程，ESP-IDF 扩展的构建/烧录入口不会再因多工程选择而落到 camera-test。具体步骤见 [VScode ESP 构建说明](esp-projects/VScode%20ESP/VScode%20ESP/README.md#构建和烧录)。
 
 ## 工程目录
 
@@ -23,7 +25,7 @@
 ## 开发环境
 
 - ESP32-S3 DevKitC-1
-- ESP-IDF 5.4.4
+- VScode ESP：ESP-IDF 5.5.5；原有 car-spin / camera-test：ESP-IDF 5.4.4
 - Visual Studio Code + Espressif IDF 扩展
 - Git + Git Graph 扩展
 
@@ -34,7 +36,9 @@ git clone <repository-url>
 cd vscode-esp32s3_testcode
 ```
 
-ESP-IDF 的 `build` 和 `managed_components` 目录是本地生成内容，不进入版本控制。克隆后进入具体工程并重新构建：
+VScode ESP 的 `.vscode` 设置、工作区入口、`sdkconfig`、默认配置和 `dependencies.lock` 都纳入版本控制。构建目录统一为 `build-local`，SDK/Python 安装位置和串口在每台电脑的 ESP-IDF 扩展中选择；工程设置使用相对路径。
+
+ESP-IDF 的 `build` / `build-local` 是编译产物，`managed_components` 可由锁文件下载恢复；它们不是工程选择配置，仍不进入版本控制。编译器与 SDK 程序需要在烧录电脑按相应版本安装。若运行原有 car-spin，进入它自己的目录构建：
 
 ```powershell
 cd esp-projects\car-spin

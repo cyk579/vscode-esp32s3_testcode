@@ -1,0 +1,11 @@
+{
+  "cmake.sourceDirectory": "${workspaceFolder}",
+  "cmake.buildDirectory": "${workspaceFolder}/build-local",
+  "idf.buildPath": "${workspaceFolder}/build-local",
+  "idf.buildPathWin": "${workspaceFolder}/build-local",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "idf.openOcdConfigs": ["board/esp32s3-builtin.cfg"],
+  "idf.flashType": "UART"
+}

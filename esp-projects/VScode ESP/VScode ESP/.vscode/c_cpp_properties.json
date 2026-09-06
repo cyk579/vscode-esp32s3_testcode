@@ -1,0 +1,22 @@
+{
+    "configurations": [
+        {
+            "name": "ESP-IDF",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "compileCommands": "${workspaceFolder}/build-local/compile_commands.json",
+            "includePath": [
+                "${workspaceFolder}/main/**",
+                "${workspaceFolder}/managed_components/**"
+            ],
+            "browse": {
+                "path": [
+                    "${workspaceFolder}/main",
+                    "${workspaceFolder}/managed_components"
+                ],
+                "limitSymbolsToIncludedHeaders": false
+            }
+        }
+    ],
+    "version": 4
+}
