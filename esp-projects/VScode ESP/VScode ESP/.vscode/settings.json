@@ -10,5 +10,6 @@
   "idf.port": "COM6",
   "idf.portWin": "COM6",
   "idf.monitorPort": "COM6",
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.currentSetup": "C:\\esp\\v5.4.4\\esp-idf"
 }

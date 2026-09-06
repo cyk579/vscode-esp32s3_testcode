@@ -1,5 +1,6 @@
 #include "camera_line_follow.h"
 
+#include <inttypes.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -2427,8 +2428,9 @@ static void maybe_log_summary(int64_t now)
     encoder_snapshot_t encoder = {0};
     if (s_encoder_ready && encoder_get_snapshot(&encoder)) {
         ESP_LOGI(TAG,
-                 "encoder ready=1 delta[A,B,D]=[%d,%d,%d] "
-                 "rate_cps[A,B,D]=[%d,%d,%d] total[A,B,D]=[%d,%d,%d] "
+                 "encoder ready=1 delta[A,B,D]=[%" PRId32 ",%" PRId32 ",%" PRId32 "] "
+                 "rate_cps[A,B,D]=[%" PRId32 ",%" PRId32 ",%" PRId32 "] "
+                 "total[A,B,D]=[%" PRId32 ",%" PRId32 ",%" PRId32 "] "
                  "sample_ms=%u cpr=%u",
                  encoder.delta[ENCODER_WHEEL_A],
                  encoder.delta[ENCODER_WHEEL_B],

@@ -387,7 +387,7 @@ static void set_motor_speed(int idx, float speed)
 #define LINE_LOST_RATIO         0.01f   // 框内黑像素占比低于此值视为丢线
 #define CAM_IMAGE_MIRROR        1       // 1=画面水平翻转（实测左右反了）
 #define LINE_MIN_BLACK_PIXELS   4       // 框内至少多少个黑像素才算找到线
-#define BASE_SPEED              0.17f   // 循迹前进速度（0~1）
+#define BASE_SPEED              0.28f   // 循迹前进速度（0~1）
 #define CTRL_PERIOD_MS          50      // 控制周期
 
 static volatile int vision_ready = 0;        // 处理过第一帧后才允许出车
@@ -1383,12 +1383,12 @@ static void overlay_detected_ball(uint8_t *scaled, uint32_t img_w, uint32_t img_
 #define PID_KD              0.30f
 #define PID_OMEGA_MAX       0.08f   // 转向输出上限
 #define PID_INTEGRAL_MAX    0.40f
-#define TURN_PULSE_MS       150     // 每次短促转向的最长持续时间（减小单次转向幅度）
-#define TURN_PULSE_SPEED    0.10f   // 短促转向速度
-#define OBSERVE_HOLD_MS     100     // 一次转向后原地停住的观察时间（0.1s）
-#define SEARCH_TURN_SPEED   0.12f   // 丢线时搜索转向速度
-#define STEER_DEADBAND      0.20f   // 回差退出阈值：|err|<此值停止转向
-#define STEER_TRIGGER_ERR   0.28f   // 回差触发阈值：|err|>=此值才开始转向
+#define TURN_PULSE_MS       80     // 每次短促转向的最长持续时间（减小单次转向幅度）
+#define TURN_PULSE_SPEED    0.20f  // 短促转向速度
+#define OBSERVE_HOLD_MS     120    // 一次转向后原地停住的观察时间（0.1s）
+#define SEARCH_TURN_SPEED   0.20f  // 丢线时搜索转向速度
+#define STEER_DEADBAND      0.27f   // 回差退出阈值：|err|<此值停止转向
+#define STEER_TRIGGER_ERR   0.35f   // 回差触发阈值：|err|>=此值才开始转向
 #define ERR_SMOOTH_K        0.40f   // 误差平滑系数（0~1，越小越平滑）
 
 static volatile int avoid_active = 0;       // 1=避障任务接管电机（循迹任务暂停）
@@ -1533,45 +1533,42 @@ static void line_follow_task(void *arg)
 }
 
 // ==================== 超声波避障（参考之前红外版逻辑，条件一致） ====================
-// 流程：距离 < 触发值 -> 左平移直到距离 > 脱离值 -> 前冲一段时间
-//       -> 右平移直到摄像头找回黑线 -> 恢复循迹；
+// 流程：连续两次距离 < 触发值 -> 制动 -> 定时左平移 -> 定时前进 -> 定时右平移 -> 恢复循迹；
 // 避障完成后武装一次“全黑停车”：一旦全黑立即停车，只有居中持续 2s 才解锁
-#define AVOID_TRIGGER_CM        11.0f   // 距离小于此值触发避障
-#define AVOID_LEFT_EXIT_CM      25.0f   // 左平移直到距离大于此值
-#define AVOID_LEFT_TIMEOUT_MS   3000    // 左平移最长持续时间（安全超时）
-#define AVOID_FWD_MS            1260    // 前冲时间
-#define AVOID_RIGHT_TIMEOUT_MS  3000    // 右平移找线超时（超时停车，安全起见）
-#define AVOID_LEFT_SPEED        0.12f   // 左平移速度
-#define AVOID_RIGHT_SPEED       0.15f   // 右平移速度
-#define AVOID_FWD_SPEED         0.18f   // 前冲（直行）速度
-#define TRANSLATE_FRONT_COEF    0.72f   // 平移时前轮速度系数（过高会导致车身旋转）
-#define TRANSLATE_LEFT_REAR_COEF   1.05f  // 左平移后轮系数
-#define TRANSLATE_RIGHT_REAR_COEF  1.00f  // 右平移后轮系数
+#define ULTRASONIC_MIN_CM              2.0f
+#define ULTRASONIC_MAX_CM            400.0f
+#define ULTRASONIC_PERIOD_MS          20U
+#define AVOID_TRIGGER_CM              11.0f   // 距离小于此值触发避障
+#define AVOID_CLOSE_CONFIRM_SAMPLES    2U
+#define AVOID_BRAKE_MS               500U
+#define AVOID_LEFT_MS               1500U
+#define AVOID_FWD_MS                1800U
+#define AVOID_RIGHT_MS              1500U
+
+// 原测试参数按百分比归一化；A/B/D 分轮设置，避免统一系数破坏实测比例。
+#define AVOID_LEFT_A_SPEED            0.24f
+#define AVOID_LEFT_B_SPEED            0.35f
+#define AVOID_LEFT_D_SPEED            0.18f
+#define AVOID_RIGHT_A_SPEED           0.18f
+#define AVOID_RIGHT_B_SPEED           0.38f
+#define AVOID_RIGHT_D_SPEED           0.24f
+#define AVOID_FWD_A_SPEED             0.24f
+#define AVOID_FWD_D_SPEED             0.27f
 #define POST_AVOID_UNLOCK_MS    2000    // 全黑停车后，居中持续多久才解锁
 
-typedef enum { AV_NORMAL, AV_LEFT, AV_FWD, AV_RIGHT } avoid_state_t;
+typedef enum { AV_NORMAL, AV_BRAKE, AV_LEFT, AV_FWD, AV_RIGHT } avoid_state_t;
 
 /**
- * @brief 麦克纳姆轮横向平移（只在避障流程里用）
- * @param s        平移速度 0~1
- * @param left_dir 非 0 = 向左平移，0 = 向右平移
- * @note  两前轮同向、后轮反向：前轮乘 TRANSLATE_FRONT_COEF，后轮按左右各用一个实测系数
- *        （TRANSLATE_LEFT_REAR_COEF / TRANSLATE_RIGHT_REAR_COEF）。
- *        系数配不好时车会边平移边打转，调平移直线度就是调这三个系数
+ * @brief 按物理轮 A/B/D 的独立速度驱动避障动作
+ * @param a A 轮逻辑速度（M3）
+ * @param b B 轮逻辑速度（M2）
+ * @param d D 轮逻辑速度（M1）
  */
-static void set_translate_speed(float s, int left_dir)
+static void set_avoid_wheel_speed(float a, float b, float d)
 {
-    float front = TRANSLATE_FRONT_COEF * s;
-    float rear = (left_dir ? TRANSLATE_LEFT_REAR_COEF : TRANSLATE_RIGHT_REAR_COEF) * s;
-    if (left_dir) {
-        set_motor_speed(0,  front);
-        set_motor_speed(1, -rear);
-        set_motor_speed(2,  front);
-    } else {
-        set_motor_speed(0, -front);
-        set_motor_speed(1,  rear);
-        set_motor_speed(2, -front);
-    }
+    set_motor_speed(0, d);  // M1 = D
+    set_motor_speed(1, b);  // M2 = B
+    set_motor_speed(2, a);  // M3 = A
 }
 
 /**
@@ -1581,13 +1578,12 @@ static void set_translate_speed(float s, int left_dir)
  * @return 不返回；死循环，每 50ms 测一次距离
  *
  * 状态流转：
- *   AV_NORMAL --连续 2 次 dist<AVOID_TRIGGER_CM--> AV_LEFT（左平移，直到连续 3 次
- *   dist>AVOID_LEFT_EXIT_CM 或 AVOID_LEFT_TIMEOUT_MS 超时）--> AV_FWD（直行 AVOID_FWD_MS）
- *   --> AV_RIGHT（右平移找线，直到 line_found 恢复；AVOID_RIGHT_TIMEOUT_MS 超时则停车）
- *   --> AV_NORMAL。trig_cnt / clear_cnt 这两个连续计数用来滤掉超声波偶发的噪声读数。
+ *   AV_NORMAL --连续 AVOID_CLOSE_CONFIRM_SAMPLES 次 dist<AVOID_TRIGGER_CM--> AV_BRAKE
+ *   --> AV_LEFT（固定左平移 AVOID_LEFT_MS）--> AV_FWD（固定前进 AVOID_FWD_MS）
+ *   --> AV_RIGHT（固定右平移 AVOID_RIGHT_MS）--> AV_NORMAL。
  *
- * 和循迹的分工：一进 AV_LEFT 就置 avoid_active=1，line_follow_task 立刻松手，整个避障过程
- * 由本任务独占电机；AV_RIGHT 阶段靠摄像头找回黑线后清零 avoid_active 交还控制权，同时置
+ * 和循迹的分工：一进 AV_BRAKE 就置 avoid_active=1，line_follow_task 立刻松手，整个避障过程
+ * 由本任务独占电机；AV_RIGHT 定时结束后清零 avoid_active 交还控制权，同时置
  * avoid_stop_armed=1 —— 回到线上后第一次遇到“几乎全黑”就锁定停车，之后需要黑线重新居中
  * （|line_err| < STEER_DEADBAND）并持续 POST_AVOID_UNLOCK_MS 才解锁继续跑。
  *
@@ -1599,11 +1595,11 @@ static void avoid_task(void *arg)
     avoid_state_t st = AV_NORMAL;
     int64_t phase_start = 0;
     int trig_cnt = 0;    // 连续几次测到障碍才触发（防噪声误判）
-    int clear_cnt = 0;   // 连续几次测到距离够大才结束左平移
     int dbg_cnt = 0;     // 调试打印计数
 
     for (;;) {
         float dist = measure_distance_cm();
+        bool valid_dist = dist >= ULTRASONIC_MIN_CM && dist <= ULTRASONIC_MAX_CM;
         bool has_line = line_found;
 
         switch (st) {
@@ -1632,12 +1628,12 @@ static void avoid_task(void *arg)
 
             // 正常循迹：关闭寻线控制，直到右平移找回线后才恢复
             if (!avoid_active) {
-                if (dist > 0.0f && dist < AVOID_TRIGGER_CM) {
-                    if (++trig_cnt >= 2) {
-                        ESP_LOGI(TAG, "avoid: trigger d=%.1fcm -> left translate", dist);
+                if (valid_dist && dist < AVOID_TRIGGER_CM) {
+                    if (++trig_cnt >= AVOID_CLOSE_CONFIRM_SAMPLES) {
+                        ESP_LOGI(TAG, "avoid: trigger d=%.1fcm -> brake", dist);
                         avoid_active = 1;      // 立即关闭摄像头寻线控制
                         trig_cnt = 0;
-                        st = AV_LEFT;
+                        st = AV_BRAKE;
                         phase_start = esp_timer_get_time();
                     }
                 } else {
@@ -1646,22 +1642,20 @@ static void avoid_task(void *arg)
             }
             break;
 
-        case AV_LEFT:
-            // 左平移（寻线保持关闭），直到连续几次距离大于脱离值（或安全超时）
-            set_translate_speed(AVOID_LEFT_SPEED, 1);
-            if (dist > AVOID_LEFT_EXIT_CM) {
-                if (++clear_cnt >= 3) {
-                    clear_cnt = 0;
-                    ESP_LOGI(TAG, "avoid: left done d=%.1fcm -> forward dash", dist);
-                    st = AV_FWD;
-                    phase_start = esp_timer_get_time();
-                }
-            } else {
-                clear_cnt = 0;
+        case AV_BRAKE:
+            set_avoid_wheel_speed(0.0f, 0.0f, 0.0f);
+            if (esp_timer_get_time() - phase_start >= AVOID_BRAKE_MS * 1000) {
+                ESP_LOGI(TAG, "avoid: brake done -> left translate");
+                st = AV_LEFT;
+                phase_start = esp_timer_get_time();
             }
-            if (esp_timer_get_time() - phase_start >= AVOID_LEFT_TIMEOUT_MS * 1000) {
-                clear_cnt = 0;
-                ESP_LOGI(TAG, "avoid: left timeout -> forward dash");
+            break;
+
+        case AV_LEFT:
+            set_avoid_wheel_speed(AVOID_LEFT_A_SPEED, -AVOID_LEFT_B_SPEED,
+                                  AVOID_LEFT_D_SPEED);
+            if (esp_timer_get_time() - phase_start >= AVOID_LEFT_MS * 1000) {
+                ESP_LOGI(TAG, "avoid: left fixed-time done -> forward dash");
                 st = AV_FWD;
                 phase_start = esp_timer_get_time();
             }
@@ -1669,9 +1663,7 @@ static void avoid_task(void *arg)
 
         case AV_FWD:
             // 前冲：直行一段固定时间（寻线仍关闭）
-            set_motor_speed(0, -0.8660254f * AVOID_FWD_SPEED);
-            set_motor_speed(1, 0.0f);
-            set_motor_speed(2,  0.8660254f * AVOID_FWD_SPEED);
+            set_avoid_wheel_speed(AVOID_FWD_A_SPEED, 0.0f, -AVOID_FWD_D_SPEED);
             if (esp_timer_get_time() - phase_start >= AVOID_FWD_MS * 1000) {
                 ESP_LOGI(TAG, "avoid: forward done -> right translate, line-follow ON");
                 st = AV_RIGHT;
@@ -1680,18 +1672,15 @@ static void avoid_task(void *arg)
             break;
 
         case AV_RIGHT:
-            // 右平移，摄像头寻线重新生效用于找回黑线；超时则停车
-            set_translate_speed(AVOID_RIGHT_SPEED, 0);
-            if (has_line) {
-                ESP_LOGI(TAG, "avoid: line reacquired -> resume line follow");
-                avoid_active = 0;
-                avoid_stop_armed = 1;   // 找回黑线进入循迹时武装全黑停车
-                st = AV_NORMAL;
-            } else if (esp_timer_get_time() - phase_start >= AVOID_RIGHT_TIMEOUT_MS * 1000) {
-                ESP_LOGI(TAG, "avoid: right translate timeout, stopping");
+            // 右平移固定时间，结束后再交回巡线
+            set_avoid_wheel_speed(-AVOID_RIGHT_A_SPEED, AVOID_RIGHT_B_SPEED,
+                                  -AVOID_RIGHT_D_SPEED);
+            if (esp_timer_get_time() - phase_start >= AVOID_RIGHT_MS * 1000) {
+                ESP_LOGI(TAG, "avoid: right fixed-time done -> resume line follow (line=%d)",
+                         has_line ? 1 : 0);
                 for (int i = 0; i < MOTOR_COUNT; i++) set_motor_speed(i, 0.0f);
                 avoid_active = 0;
-                avoid_stop_armed = 0;
+                avoid_stop_armed = has_line ? 1 : 0;
                 st = AV_NORMAL;
             }
             break;
@@ -1702,7 +1691,7 @@ static void avoid_task(void *arg)
             ESP_LOGI(TAG, "us dist=%.1fcm echo=%d (st=%d line=%d active=%d)",
                      dist, gpio_get_level(ECHO_GPIO), (int)st, has_line ? 1 : 0, avoid_active);
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(ULTRASONIC_PERIOD_MS));
     }
 }
 
@@ -1769,12 +1758,9 @@ static void camera_display_task(void *arg)
         decode_ok++;
         w = out.width; h = out.height;
         if (w == 0 || h == 0) continue;
-        vision_w = (uint16_t)w;
-        vision_h = (uint16_t)h;
 
         // 只运行原组黑线检测，供巡线和避障找回线使用。
         detect_line_from_rgb565(dec_buf, w, h);
-        last_vision_time = esp_timer_get_time();
         vision_ready = 1;
 
         // 最近邻缩放到屏幕显示区大小（只影响显示，循迹判定用的是上面的原始分辨率）
