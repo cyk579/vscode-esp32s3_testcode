@@ -52,14 +52,14 @@ GPIO13/14 是 SPI2 通过 GPIO Matrix 路由的时钟/MOSI，并非原生 IO_MUX
 ### 从仓库恢复环境
 
 1. 拉取当前分支的最新提交，用 VS Code“文件 -> 从文件打开工作区”打开根目录的 `VScode-ESP.code-workspace`。左侧应只有 `VScode ESP` 一个工程；终端当前目录应是本 README 所在的内层目录。
-2. 安装工作区推荐的 Espressif ESP-IDF 扩展和 Microsoft C/C++ 扩展，在 ESP-IDF 扩展中选择本机安装的 **ESP-IDF v5.5.5** 及其 Python/工具链环境。这是本工程现有 `dependencies.lock` 记录的 SDK 版本，不使用其他工程的 5.4.4 环境覆盖本锁文件。
-3. 通过 ESP-IDF 扩展打开终端，运行 `idf.py --version`，应显示 `ESP-IDF v5.5.5`。串口选择实际连接开发板的 COM 口，下面的 COM5 只是示例。
+2. 安装工作区推荐的 Espressif ESP-IDF 扩展和 Microsoft C/C++ 扩展，在 ESP-IDF 扩展中选择烧录电脑已安装的 **ESP-IDF v5.5.4** 及其 Python/工具链环境。本工程已按用户确认的实际环境调整，不需要为了原锁文件的 5.5.5 记录升级 SDK。
+3. 通过 ESP-IDF 扩展打开终端，运行 `idf.py --version`，应显示 `ESP-IDF v5.5.4`。烧录与 Monitor 的默认串口均已设为 **COM6**，与当前开发板连接一致。
 
-已提交根目录及本工程的 `.vscode` 配置和单工程工作区文件。工程内的 CMake、ESP-IDF（含 Windows 的 `idf.buildPathWin`）和 C/C++ `compileCommands` 全部使用 `build-local`；C/C++ 在首次构建后从生成的编译数据库读取真实工具链和头文件路径。配置不再写死原电脑的 `C:/Espressif` 或 COM5。
+已提交根目录及本工程的 `.vscode` 配置和单工程工作区文件。工程内的 CMake、ESP-IDF（含 Windows 的 `idf.buildPathWin`）和 C/C++ `compileCommands` 全部使用 `build-local`；C/C++ 在首次构建后从生成的编译数据库读取真实工具链和头文件路径。配置不再写死原电脑的 `C:/Espressif`；`idf.port`、`idf.portWin` 和 `idf.monitorPort` 统一为 COM6。
 
 | 环境项目 | 本仓库记录 |
 | --- | --- |
-| ESP-IDF | 5.5.5，见现有 `dependencies.lock` 的 `idf` 项 |
+| ESP-IDF / 串口 | 5.5.4 / COM6，按实际烧录电脑配置 |
 | 芯片 | ESP32-S3，见 `sdkconfig` 和 IDE 的 `IDF_TARGET` |
 | Flash / PSRAM | WROOM-2-N32R16V：32MB OPI Flash / 16MB Octal PSRAM |
 | USB 组件 | `espressif/usb_stream` 1.5.2 |
@@ -67,7 +67,9 @@ GPIO13/14 是 SPI2 通过 GPIO Matrix 路由的时钟/MOSI，并非原生 IO_MUX
 | 间接依赖 | `espressif/cmake_utilities` 0.5.3 |
 | 共享配置 | `sdkconfig`、`sdkconfig.defaults`、`main/idf_component.yml`、`dependencies.lock`、`.vscode/` |
 
-以上组件版本及校验值已在原锁文件中提交，本次保留。`managed_components` 由 IDF 按锁文件下载；SDK、Python 和交叉编译器由本机 ESP-IDF 安装器安装。仓库保存复现配置，不把旧电脑的编译缓存当作环境。
+以上组件版本及校验值已在原锁文件中提交，本次保留。已用官方组件管理器针对 IDF 5.5.4 重新解析依赖，锁文件仅更新 `idf` 版本。该检查确认依赖声明兼容，不代表已完成目标编译。
+
+现有 `sdkconfig` 最初由 5.5.5 生成，保留原始文件头作为来源记录；首次使用 5.5.4 时执行下面的 `reconfigure`，由实际 SDK 更新配置。`managed_components` 由 IDF 按锁文件下载；SDK、Python 和交叉编译器由本机 ESP-IDF 安装器安装。
 
 ### 编译并确认实际固件
 
@@ -77,10 +79,10 @@ GPIO13/14 是 SPI2 通过 GPIO Matrix 路由的时钟/MOSI，并非原生 IO_MUX
 # 当前目录应包含本工程的 CMakeLists.txt、sdkconfig、main/。
 idf.py -B build-local reconfigure
 idf.py -B build-local build
-idf.py -B build-local -p COM5 flash monitor
+idf.py -B build-local -p COM6 flash monitor
 ```
 
-把 COM5 换成开发板 USB 烧录接口实际枚举的串口，不需要外接 UART 模块。根目录的 CMake 配置也指向此工程，但 ESP-IDF 扩展应使用上面的单工程工作区，不在仓库根目录直接点击其烧录按钮。
+COM6 是当前开发板 USB 烧录接口实际枚举的串口，不需要外接 UART 模块；以后换电脑或接口导致串口号变化时，同时更新烧录和 Monitor 的端口。根目录的 CMake 配置也指向此工程，但 ESP-IDF 扩展应使用上面的单工程工作区，不在仓库根目录直接点击其烧录按钮。
 
 本工程的 CMake 项目名是 `esp32s3-camera-line-follow`，构建产物应为 `build-local/esp32s3-camera-line-follow.bin`。若显示 `usb-uvc` 或日志出现 `camera_line: fps camera=...`、`Servo test disabled; continuing to USB Host`，说明运行的是 `camera-test`，应检查烧录目录或是否仍在运行旧固件。正确的本版启动日志见下方白屏排查。
 
