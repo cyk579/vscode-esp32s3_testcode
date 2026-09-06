@@ -87,14 +87,19 @@ static void lcd_set_window(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1)
  */
 static void lcd_fill(uint16_t color)
 {
-    uint16_t buf[64];
-    for (int i = 0; i < 64; i++) buf[i] = color;
+    /* ST7735 expects RGB565 high byte first.  ESP32 is little-endian, so
+     * sending a uint16_t array directly reverses every pixel's byte order. */
+    uint8_t buf[64 * 2];
+    for (int i = 0; i < 64; i++) {
+        buf[i * 2] = (uint8_t)(color >> 8);
+        buf[i * 2 + 1] = (uint8_t)color;
+    }
     lcd_set_window(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
     gpio_set_level(LCD_DC_GPIO, 1);
     int total = LCD_WIDTH * LCD_HEIGHT;
     for (int i = 0; i < total; i += 64) {
         spi_transaction_t t = {0};
-        t.length = 64 * 16;
+        t.length = sizeof(buf) * 8;
         t.tx_buffer = buf;
         ESP_ERROR_CHECK(spi_device_polling_transmit(lcd_spi, &t));
     }
@@ -153,7 +158,9 @@ static void lcd_init(void)
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
 
     spi_device_interface_config_t dev = {
-        .clock_speed_hz = 26 * 1000 * 1000,
+        /* 10 MHz matches the known-good ST7735 configuration and leaves
+         * margin for jumper wires and GPIO-matrix routing on this board. */
+        .clock_speed_hz = 10 * 1000 * 1000,
         .mode = 0,
         .spics_io_num = LCD_CS_GPIO,
         .queue_size = 4,
