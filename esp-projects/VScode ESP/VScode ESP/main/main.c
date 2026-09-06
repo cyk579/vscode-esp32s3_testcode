@@ -19,15 +19,12 @@
 #include "hal/usb_dwc_ll.h"
 #include "soc/usb_dwc_struct.h"
 #include "usb_stream.h"
+#include "board_pins.h"
 
 static const char *TAG = "cam";
 
 // ==================== LCD 屏幕 (ST7735, 128x160) ====================
-#define LCD_CS_GPIO    GPIO_NUM_2
-#define LCD_SCK_GPIO   GPIO_NUM_1
-#define LCD_MOSI_GPIO  GPIO_NUM_45
-#define LCD_DC_GPIO    GPIO_NUM_46
-#define LCD_RST_GPIO   GPIO_NUM_8
+// 本车接线集中在 board_pins.h。
 #define LCD_WIDTH      128
 #define LCD_HEIGHT     160
 
@@ -37,8 +34,6 @@ static const char *TAG = "cam";
 #define CAM_DISP_Y     32
 
 // ==================== 超声波模块 ====================
-#define TRIG_GPIO   GPIO_NUM_14
-#define ECHO_GPIO   GPIO_NUM_4
 #define SOUND_SPEED_CM_PER_US  0.0343f
 #define MAX_RANGE_US           60000
 
@@ -255,26 +250,7 @@ static float measure_distance_cm(void)
 }
 
 // ==================== 三个电机接线（麦克纳姆轮） ====================
-// M1：左前轮，与直行方向夹角 +60°
-#define M1_ENC_A   GPIO_NUM_15
-#define M1_ENC_B   GPIO_NUM_16
-#define M1_INA     GPIO_NUM_17
-#define M1_INB     GPIO_NUM_18
-#define M1_PWM     GPIO_NUM_21
-
-// M2：后轮，180°，循迹直行/转向时不驱动（自由随动）
-#define M2_ENC_A   GPIO_NUM_9
-#define M2_ENC_B   GPIO_NUM_10
-#define M2_INA     GPIO_NUM_11
-#define M2_INB     GPIO_NUM_12
-#define M2_PWM     GPIO_NUM_13
-
-// M3：右前轮，-60°
-#define M3_ENC_A   GPIO_NUM_42
-#define M3_ENC_B   GPIO_NUM_41
-#define M3_INA     GPIO_NUM_40
-#define M3_INB     GPIO_NUM_39
-#define M3_PWM     GPIO_NUM_38
+// 引脚见 board_pins.h：M1=本车左前D，M2=后B，M3=右前A。
 
 #define PWM_FREQ_HZ    1000
 #define MAX_DUTY       1023      // 10bit 占空比满量程
@@ -285,7 +261,8 @@ typedef struct {
 } motor_t;
 
 // 电机顺序：M1=左前(+60°)、M2=后轮(180°)、M3=右前(-60°)
-// 1=正常接线；M3(右前轮)实测接线反了，单独翻转
+// 保留原组方向系数；它是原组的实测值，本车上须架空检查各轮转向。
+// 直行解算为 M1 负、M3 正；乘下列系数后，本车 D/A 两路都是 IN1=0、IN2=1。
 static const int motor_dir[3] = { 1, 1, -1 };
 static const motor_t motors[] = {
     { .enc_a = M1_ENC_A, .enc_b = M1_ENC_B, .ina = M1_INA, .inb = M1_INB, .pwm = M1_PWM },
@@ -302,7 +279,9 @@ static const motor_t motors[] = {
  */
 static void motor_init(void)
 {
-    uint64_t enc_mask = 0, dir_mask = 0;
+    // 本车 STBY 接 GPIO8；先保持待机，方向和 PWM 初始化后才使能。
+    ESP_ERROR_CHECK(gpio_set_level(MOTOR_STBY_GPIO, 0));
+    uint64_t enc_mask = 0, dir_mask = (1ULL << MOTOR_STBY_GPIO);
     for (int i = 0; i < MOTOR_COUNT; i++) {
         enc_mask |= (1ULL << motors[i].enc_a) | (1ULL << motors[i].enc_b);
         dir_mask |= (1ULL << motors[i].ina) | (1ULL << motors[i].inb);
@@ -323,6 +302,10 @@ static void motor_init(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&out_cfg));
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        ESP_ERROR_CHECK(gpio_set_level(motors[i].ina, 0));
+        ESP_ERROR_CHECK(gpio_set_level(motors[i].inb, 0));
+    }
 
     ledc_timer_config_t timer_cfg = {
         .speed_mode = LEDC_LOW_SPEED_MODE,
@@ -344,6 +327,7 @@ static void motor_init(void)
         };
         ESP_ERROR_CHECK(ledc_channel_config(&ch));
     }
+    ESP_ERROR_CHECK(gpio_set_level(MOTOR_STBY_GPIO, 1));
 }
 
 /**
@@ -426,6 +410,7 @@ static uint32_t pixel_luma(const uint8_t *p)
 }
 
 // ==================== 小球检测接口 ====================
+#if 0  // 本工程只复现巡线避障；原组找球代码保留作参考，不参与编译和运行。
 // 检测结果只描述目标，不直接驱动车体；后续接近/推球任务可读取这些量。
 typedef enum {
     BALL_NONE = 0,
@@ -1042,6 +1027,8 @@ static void ball_approach_task(void *arg)
     }
 }
 
+#endif  // 停用原组找球检测与运动任务
+
 /**
  * @brief 从一帧解码后的画面里找出黑线并算出转向误差 —— 循迹的“感知”环节
  *
@@ -1312,6 +1299,7 @@ static void overlay_detected_line(uint8_t *scaled, uint32_t img_w, uint32_t img_
     }
 }
 
+#if 0  // 找球叠加层停用，巡线只绘制 overlay_detected_line。
 #define MARKER_BALL_FIRST_BE  0xF81Fu
 #define MARKER_BALL_SECOND_BE 0x07FFu
 #define MARKER_GOAL_BE        0xF800u
@@ -1373,6 +1361,8 @@ static void overlay_detected_ball(uint8_t *scaled, uint32_t img_w, uint32_t img_
         }
     }
 }
+
+#endif  // 停用找球叠加层
 
 // ==================== 循迹控制参数（开关式短促转向，不是连续 PID） ====================
 // 注意：PID_KP/KI/KD/PID_OMEGA_MAX/PID_INTEGRAL_MAX 是早期连续 PID 方案留下的参数，
@@ -1773,9 +1763,8 @@ static void camera_display_task(void *arg)
         vision_w = (uint16_t)w;
         vision_h = (uint16_t)h;
 
-        // 找球测试阶段暂不运行巡线检测。
-        // 小球检测独立于黑线检测，结果可供后续接近/推球任务读取
-        detect_ball_from_rgb565(dec_buf, w, h);
+        // 只运行原组黑线检测，供巡线和避障找回线使用。
+        detect_line_from_rgb565(dec_buf, w, h);
         last_vision_time = esp_timer_get_time();
         vision_ready = 1;
 
@@ -1792,8 +1781,7 @@ static void camera_display_task(void *arg)
             }
         }
         // 在画面上标注识别到的黑线
-        // 找球测试阶段暂不叠加巡线标记。
-        overlay_detected_ball(scaled, w, h);
+        overlay_detected_line(scaled, w, h);
         lcd_blit_cam(scaled, CAM_DISP_W, CAM_DISP_H);
 
         int64_t now = esp_timer_get_time();
@@ -1894,7 +1882,7 @@ void app_main(void)
 {
     lcd_init();
     lcd_fill(0x0000);
-    // 找球测试阶段暂不启用超声波避障。
+    ultrasonic_init();
 
     jpeg_buf = heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     assert(jpeg_buf);
@@ -1903,8 +1891,9 @@ void app_main(void)
     xTaskCreate(camera_display_task, "cam_lcd", 8192, NULL, 5, NULL);
 
     motor_init();
-    // 找球测试阶段停用巡线和超声波避障任务。
-    xTaskCreate(ball_approach_task, "ball_approach", 4096, NULL, 6, NULL);
+    // 只启动原组巡线和超声波避障，不创建找球任务。
+    xTaskCreate(line_follow_task, "line_follow", 4096, NULL, 6, NULL);
+    xTaskCreate(avoid_task, "avoid", 4096, NULL, 3, NULL);
 
     uint8_t *xfer_a = heap_caps_malloc(XFER_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     if (!xfer_a) xfer_a = heap_caps_malloc(XFER_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);

@@ -7,8 +7,8 @@
  *
  * 脚号和原代码不同：他们用 7/15/12/13/2/1，这六脚在本车上已经是电机方向、
  * TFT 时钟和两个舵机，PCNT 配成输入会和这些输出直接顶牛，所以重新分配到
- * A 轮 39/40、B 轮 17/3、D 轮 41/42（见 board_pins.h，那里写了为什么只剩这六个脚
- * 可用，以及为什么 47/48 不能用 —— 它们是 1.8V 域）。
+ * A 轮 39/40、B 轮 17/3、D 轮 41/42（与引脚表一致）。
+ * GPIO47/48 是1.8V域，不适合3.3V编码器；其余限制见 board_pins.h。
  *
  * 用 USE_ENCODER 开关控制。关掉时整个文件退化成返回 0 的空实现，同时
  * pid.c 的速度闭环也会整段跳过 —— 必须成对，不能只关一个：闭环读到恒 0
@@ -16,7 +16,7 @@
  * 落进不同增益档（0.3/0.6/1.2），把调好的差速非线性放大。
  *
  * 没接编码器却打开这个开关，后果比关掉更糟：PCNT 读不到脉冲恒为 0，
- * 闭环每周期补 +500 一路顶到 PID_MAX_SPEED，车会以 44% 占空比冲出去。
+ * 闭环会按错误的测速值修正输出；每周期修正限±500，不会跨周期累加。
  * ============================================================ */
 
 #ifdef USE_ENCODER
@@ -94,7 +94,7 @@ void encoder_init(void) {
         };
         ESP_ERROR_CHECK(pcnt_new_channel(pcnt_units[i], &chan_config, &pcnt_chans[i]));
 
-        // 设置边缘和电平动作实现四倍频/双向计数
+        // 单通道对A相双边沿计数，B相判方向：2倍频/双向计数（保留原组配置）
         ESP_ERROR_CHECK(pcnt_channel_set_edge_action(pcnt_chans[i], PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_DECREASE));
         ESP_ERROR_CHECK(pcnt_channel_set_level_action(pcnt_chans[i], PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
 

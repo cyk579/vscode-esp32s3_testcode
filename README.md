@@ -8,10 +8,15 @@
 | --- | --- |
 | `esp-projects/car-spin` | 三轮小车电机控制、四路红外检测与巡线 |
 | `esp-projects/camera-test` | USB 摄像头枚举、RGB565 黑线识别、三轮车巡线、ST7735 本地预览与可选 Wi-Fi 图像传输 |
-| `esp-projects/camera-claude` | 另一组能跑的巡线/避障/推球代码移植到本车，引脚重映射 + 编码器关闭 + PWM 上限收到 44% |
+| `esp-projects/camera-claude` | 原组巡线/避障/推球移植，默认模式6，编码器与原组速度闭环启用 |
+| `esp-projects/VScode ESP/VScode ESP` | 另一组摄像头巡线与超声波避障移植，仅启动巡线避障，找球代码停用 |
 | `esp-projects/camera-other_group` | 另一组的原始仓库，只读参考，不要修改 |
 
 每个工程的接线、参数和运行方法请查看对应目录中的 `README.md`。
+
+2026-09-06：上述两份移植工程及 `引脚对应表2.xlsx` 已将 LCD CS 从 GPIO47 改为 GPIO0，
+实物也需同步改线。GPIO0 的复位电平要求、完整映射和验证范围见 [引脚核查与复现说明](引脚核查与复现说明.md)。
+`car-spin` / `camera-test` 保留原版本，切回它们时需另行核对其接线，不能直接套用此次接线。
 
 ## 开发环境
 

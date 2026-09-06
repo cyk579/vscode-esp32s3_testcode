@@ -4,6 +4,7 @@
 #include "encoder.h"
 #include "camera_track.h"
 #include "track_config.h"
+#include "board_pins.h"  // USE_ENCODER 必须在本编译单元可见，才能启用原组速度闭环。
 #include <math.h>
 #include <stddef.h>
 
@@ -11,11 +12,9 @@
 #define PID_CRUISE_SPEED 1600       // 直行巡航速度（乘以 FRONT_FORWARD_RATIO 才是实际输出）
 #define PID_MIN_FORWARD_SPEED 100   // 误差最大时的最低前进速度下限
 #define PID_SLOWDOWN_PER_ERROR 0    // 每 1.0 误差降多少速度（0 = 不关，弯道保持全速）
-/* 原值 8191（13 位满量程 = 100% 占空比）。本车 car-spin 实车标定的安全上限是
- * 44% 占空比，再高会打滑失控，所以这里压到 44% × 8191 = 3604。
- * 他们现有的调参值最大是 STRAFE_POWER 2200（27%），全都在这条线以下，
- * 所以这个限幅不改变当前任何动作，只是防止把参数调大后车冲出去。 */
-#define PID_MAX_SPEED 3604          // 电机功率上限（本车标定 44% 占空比）
+/* 按复现要求恢复原组上限；8191 是允许的最大值，并非巡航占空比。
+ * 巡航、PID、避障等参数均保留原组值。首次验证请架空车轮。 */
+#define PID_MAX_SPEED 8191          // 原组电机绝对功率上限（13 位满量程）
 #define PID_HW_FULL_SCALE 8191      // 13 位 PWM 满量程，仅作参考
 
 /* 本车实测起转值：A/D 约 11% 占空比（901 counts）、B 约 13%（1065 counts）。
@@ -53,8 +52,8 @@
  *
  * 用 TEST_MODE 7 测（main.c 末尾），落地带负载测，不能垫起来空转。
  * 错在哪个方向都会坏事：
- *   偏大 → 目标转速永远追不上，闭环每周期补 +500 顶到 PID_MAX_SPEED，
- *          车以 44% 占空比冲出去，而不是巡航的 22%
+ *   偏大 → 目标转速偏高，闭环在本周期的基础功率上增加修正（限 ±500）；
+ *          这里不是把上周期输出不断累加到上限。
  *   偏小 → 目标低于实际，speed_diff 变负，闭环反过来减功率，车比设定的还慢 */
 #define POWER_TO_SPEED_A 12.0f       // A 轮：待实测
 #define POWER_TO_SPEED_B 12.0f       // B 轮：待实测（辅助轮）
