@@ -20,8 +20,24 @@
 #include "soc/usb_dwc_struct.h"
 #include "usb_stream.h"
 #include "board_pins.h"
+#include "endpoint_ball.h"
 
 static const char *TAG = "cam";
+
+static const char *reset_reason_name(esp_reset_reason_t reason)
+{
+    switch (reason) {
+    case ESP_RST_POWERON: return "POWERON";
+    case ESP_RST_SW: return "SOFTWARE";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_PWR_GLITCH: return "POWER_GLITCH";
+    default: return "OTHER";
+    }
+}
 
 // ==================== LCD 屏幕 (ST7735, 128x160) ====================
 // 本车接线集中在 board_pins.h。
@@ -36,6 +52,7 @@ static const char *TAG = "cam";
 // ==================== 超声波模块 ====================
 #define SOUND_SPEED_CM_PER_US  0.0343f
 #define MAX_RANGE_US           60000
+static volatile float lcd_ultrasonic_cm = -1.0f;
 
 // ==================== USB 摄像头缓冲 ====================
 #define XFER_BUF_SIZE   (160 * 1024)
@@ -126,6 +143,131 @@ static void lcd_blit_cam(const uint8_t *rgb565, int w, int h)
         ESP_ERROR_CHECK(spi_device_polling_transmit(lcd_spi, &t));
         off += n;
     }
+}
+
+#define LCD_STATUS_HEIGHT 24
+
+static const char lcd_font_chars[] = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-/=%:.";
+static const uint8_t lcd_font[][5] = {
+    {0x00,0x00,0x00,0x00,0x00},
+    {0x3e,0x51,0x49,0x45,0x3e}, {0x00,0x42,0x7f,0x40,0x00},
+    {0x42,0x61,0x51,0x49,0x46}, {0x21,0x41,0x45,0x4b,0x31},
+    {0x18,0x14,0x12,0x7f,0x10}, {0x27,0x45,0x45,0x45,0x39},
+    {0x3c,0x4a,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03},
+    {0x36,0x49,0x49,0x49,0x36}, {0x06,0x49,0x49,0x29,0x1e},
+    {0x7e,0x11,0x11,0x11,0x7e}, {0x7f,0x49,0x49,0x49,0x36},
+    {0x3e,0x41,0x41,0x41,0x22}, {0x7f,0x41,0x41,0x22,0x1c},
+    {0x7f,0x49,0x49,0x49,0x41}, {0x7f,0x09,0x09,0x09,0x01},
+    {0x3e,0x41,0x49,0x49,0x7a}, {0x7f,0x08,0x08,0x08,0x7f},
+    {0x00,0x41,0x7f,0x41,0x00}, {0x20,0x40,0x41,0x3f,0x01},
+    {0x7f,0x08,0x14,0x22,0x41}, {0x7f,0x40,0x40,0x40,0x40},
+    {0x7f,0x02,0x0c,0x02,0x7f}, {0x7f,0x04,0x08,0x10,0x7f},
+    {0x3e,0x41,0x41,0x41,0x3e}, {0x7f,0x09,0x09,0x09,0x06},
+    {0x3e,0x41,0x51,0x21,0x5e}, {0x7f,0x09,0x19,0x29,0x46},
+    {0x46,0x49,0x49,0x49,0x31}, {0x01,0x01,0x7f,0x01,0x01},
+    {0x3f,0x40,0x40,0x40,0x3f}, {0x1f,0x20,0x40,0x20,0x1f},
+    {0x3f,0x40,0x38,0x40,0x3f}, {0x63,0x14,0x08,0x14,0x63},
+    {0x07,0x08,0x70,0x08,0x07}, {0x61,0x51,0x49,0x45,0x43},
+    {0x08,0x08,0x3e,0x08,0x08}, {0x08,0x08,0x08,0x08,0x08},
+    {0x20,0x10,0x08,0x04,0x02}, {0x14,0x14,0x14,0x14,0x14},
+    {0x62,0x64,0x08,0x13,0x23}, {0x00,0x36,0x36,0x00,0x00},
+    {0x00,0x60,0x60,0x00,0x00},
+};
+
+typedef struct {
+    const char *state;
+    bool armed;
+    bool stby;
+    int motor_a;
+    int motor_b;
+    int motor_d;
+    float ultrasonic_cm;
+    bool candidate;
+    int threshold;
+    int seed_x;
+    int valid_rows;
+    int confidence;
+    const char *ball_phase;
+} lcd_status_t;
+
+static void lcd_status_char(uint8_t *buffer, int x, int y,
+                            char character, uint16_t color)
+{
+    const char *found = strchr(lcd_font_chars, character);
+    if (found == NULL) found = lcd_font_chars;
+    const uint8_t *glyph = lcd_font[found - lcd_font_chars];
+    for (int column = 0; column < 5; column++) {
+        for (int row = 0; row < 7; row++) {
+            if ((glyph[column] & (1U << row)) == 0) continue;
+            int pixel_x = x + column;
+            int pixel_y = y + row;
+            if (pixel_x < 0 || pixel_x >= LCD_WIDTH ||
+                pixel_y < 0 || pixel_y >= LCD_STATUS_HEIGHT) continue;
+            size_t offset = ((size_t)pixel_y * LCD_WIDTH + pixel_x) * 2;
+            buffer[offset] = (uint8_t)(color >> 8);
+            buffer[offset + 1] = (uint8_t)color;
+        }
+    }
+}
+
+static void lcd_status_line(uint8_t *buffer, int row, const char *text)
+{
+    int x = 1;
+    for (const char *cursor = text; *cursor != '\0' && x + 5 < LCD_WIDTH; cursor++) {
+        lcd_status_char(buffer, x, row * 8, *cursor, 0xffff);
+        x += 6;
+    }
+}
+
+static void lcd_write_status_zone(int y, const uint8_t *buffer)
+{
+    const size_t buffer_size = LCD_WIDTH * LCD_STATUS_HEIGHT * 2;
+    lcd_set_window(0, y, LCD_WIDTH - 1, y + LCD_STATUS_HEIGHT - 1);
+    gpio_set_level(LCD_DC_GPIO, 1);
+    for (size_t offset = 0; offset < buffer_size; offset += 1024) {
+        size_t length = buffer_size - offset;
+        if (length > 1024) length = 1024;
+        spi_transaction_t transaction = {0};
+        transaction.length = length * 8;
+        transaction.tx_buffer = buffer + offset;
+        ESP_ERROR_CHECK(spi_device_polling_transmit(lcd_spi, &transaction));
+    }
+}
+
+static void lcd_show_status(const lcd_status_t *status)
+{
+    static uint8_t top[LCD_WIDTH * LCD_STATUS_HEIGHT * 2];
+    static uint8_t bottom[LCD_WIDTH * LCD_STATUS_HEIGHT * 2];
+    char line[32];
+    memset(top, 0, sizeof(top));
+    memset(bottom, 0, sizeof(bottom));
+
+    snprintf(line, sizeof(line), "STATE %s", status->state);
+    lcd_status_line(top, 0, line);
+    snprintf(line, sizeof(line), "ARM %d STBY %d",
+             status->armed ? 1 : 0, status->stby ? 1 : 0);
+    lcd_status_line(top, 1, line);
+    snprintf(line, sizeof(line), "M A%+03d B%+03d D%+03d",
+             status->motor_a, status->motor_b, status->motor_d);
+    lcd_status_line(top, 2, line);
+
+    if (status->ultrasonic_cm >= 0.0f) {
+        int distance_x10 = (int)(status->ultrasonic_cm * 10.0f + 0.5f);
+        snprintf(line, sizeof(line), "US %d.%d C%d T%d", distance_x10 / 10,
+                 distance_x10 % 10, status->candidate ? 1 : 0, status->threshold);
+    } else {
+        snprintf(line, sizeof(line), "US -- C%d T%d",
+                 status->candidate ? 1 : 0, status->threshold);
+    }
+    lcd_status_line(bottom, 0, line);
+    snprintf(line, sizeof(line), "SEED %d V%02d Q%03d", status->seed_x,
+             status->valid_rows, status->confidence);
+    lcd_status_line(bottom, 1, line);
+    snprintf(line, sizeof(line), "BALL %s", status->ball_phase);
+    lcd_status_line(bottom, 2, line);
+
+    lcd_write_status_zone(0, top);
+    lcd_write_status_zone(CAM_DISP_Y + CAM_DISP_H, bottom);
 }
 
 /**
@@ -236,6 +378,7 @@ static float measure_distance_cm(void)
 {
     // 空闲时回波线应为低电平；若一直为高说明接线/模块异常
     if (gpio_get_level(ECHO_GPIO) != 0) {
+        lcd_ultrasonic_cm = -2.0f;
         return -2.0f;
     }
 
@@ -246,16 +389,27 @@ static float measure_distance_cm(void)
     // 等待回波变高（没有脉冲 -> -1，说明模块没响应/没触发）
     int64_t wait_start = esp_timer_get_time();
     while (gpio_get_level(ECHO_GPIO) == 0) {
-        if (esp_timer_get_time() - wait_start > MAX_RANGE_US) return -1.0f;
+        if (esp_timer_get_time() - wait_start > MAX_RANGE_US) {
+            lcd_ultrasonic_cm = -1.0f;
+            return -1.0f;
+        }
     }
     // 回波变高，等待变低，计算持续时间
     int64_t echo_start = esp_timer_get_time();
     while (gpio_get_level(ECHO_GPIO) == 1) {
-        if (esp_timer_get_time() - echo_start > MAX_RANGE_US) return -1.0f;
+        if (esp_timer_get_time() - echo_start > MAX_RANGE_US) {
+            lcd_ultrasonic_cm = -1.0f;
+            return -1.0f;
+        }
     }
     int64_t duration_us = esp_timer_get_time() - echo_start;
-    if (duration_us <= 0) return -1.0f;
-    return duration_us * SOUND_SPEED_CM_PER_US / 2.0f;
+    if (duration_us <= 0) {
+        lcd_ultrasonic_cm = -1.0f;
+        return -1.0f;
+    }
+    float distance_cm = duration_us * SOUND_SPEED_CM_PER_US / 2.0f;
+    lcd_ultrasonic_cm = distance_cm;
+    return distance_cm;
 }
 
 // ==================== 三个电机接线（麦克纳姆轮） ====================
@@ -279,6 +433,7 @@ static const motor_t motors[] = {
     { .enc_a = M3_ENC_A, .enc_b = M3_ENC_B, .ina = M3_INA, .inb = M3_INB, .pwm = M3_PWM },
 };
 #define MOTOR_COUNT (sizeof(motors) / sizeof(motors[0]))
+static volatile int lcd_motor_percent[3];
 
 /**
  * @brief 初始化三个电机：编码器引脚配为输入、方向引脚配为输出，每路 PWM 建一个 LEDC 通道
@@ -348,6 +503,7 @@ static void motor_init(void)
  */
 static void set_motor_speed(int idx, float speed)
 {
+    lcd_motor_percent[idx] = (int)lroundf(speed * 100.0f);
     float eff = motor_dir[idx] * speed;
     if (eff > -0.001f && eff < 0.001f) {
         gpio_set_level(motors[idx].ina, 0);
@@ -367,6 +523,28 @@ static void set_motor_speed(int idx, float speed)
     }
     ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)idx, duty));
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)idx));
+}
+
+static TaskHandle_t line_follow_task_handle = NULL;
+
+static void endpoint_ball_drive(float a, float b, float d)
+{
+    ESP_ERROR_CHECK(gpio_set_level(MOTOR_STBY_GPIO, 1));
+    set_motor_speed(0, -d);
+    set_motor_speed(1, b);
+    set_motor_speed(2, -a);
+}
+
+static void endpoint_ball_stop(void)
+{
+    for (int i = 0; i < MOTOR_COUNT; i++) set_motor_speed(i, 0.0f);
+    ESP_ERROR_CHECK(gpio_set_level(MOTOR_STBY_GPIO, 0));
+}
+
+static void endpoint_ball_pause_controllers(void)
+{
+    if (line_follow_task_handle != NULL) vTaskSuspend(line_follow_task_handle);
+    endpoint_ball_stop();
 }
 
 // ==================== 摄像头循迹（动态检测窗 + 固定转向基准） ====================
@@ -1219,6 +1397,38 @@ static void draw_marker_px(uint8_t *buf, int x, int y, uint16_t color_be)
     p[1] = color_be & 0xFF;
 }
 
+static void overlay_ball_target(uint8_t *scaled,
+                                const endpoint_ball_status_t *status)
+{
+    if (!status->target_valid || status->target_frame_width <= 0 ||
+        status->target_frame_height <= 0) return;
+
+    int center_x = status->target_x * CAM_DISP_W / status->target_frame_width;
+    int center_y = status->target_y * CAM_DISP_H / status->target_frame_height;
+    int half_width = status->target_width * CAM_DISP_W /
+                     status->target_frame_width / 2 + 2;
+    int half_height = status->target_height * CAM_DISP_H /
+                      status->target_frame_height / 2 + 2;
+    int left = center_x - half_width;
+    int right = center_x + half_width;
+    int top = center_y - half_height;
+    int bottom = center_y + half_height;
+    uint16_t color = status->target_is_red ? MARKER_RED_BE : MARKER_GREEN_BE;
+
+    for (int x = left; x <= right; x++) {
+        draw_marker_px(scaled, x, top, color);
+        draw_marker_px(scaled, x, bottom, color);
+    }
+    for (int y = top; y <= bottom; y++) {
+        draw_marker_px(scaled, left, y, color);
+        draw_marker_px(scaled, right, y, color);
+    }
+    for (int offset = -3; offset <= 3; offset++) {
+        draw_marker_px(scaled, center_x + offset, center_y, color);
+        draw_marker_px(scaled, center_x, center_y + offset, color);
+    }
+}
+
 /**
  * @brief 画出本帧的动态检测窗（蓝色矩形）和固定转向基准线（青色竖线）
  * @param scaled 128x96 的 RGB565 大端显示缓冲，原地修改
@@ -1383,16 +1593,15 @@ static void overlay_detected_ball(uint8_t *scaled, uint32_t img_w, uint32_t img_
 #define PID_KD              0.30f
 #define PID_OMEGA_MAX       0.08f   // 转向输出上限
 #define PID_INTEGRAL_MAX    0.40f
-#define TURN_PULSE_MS       80     // 每次短促转向的最长持续时间（减小单次转向幅度）
+#define TURN_PULSE_MS       140     // 每次短促转向的最长持续时间（减小单次转向幅度）
 #define TURN_PULSE_SPEED    0.20f  // 短促转向速度
-#define OBSERVE_HOLD_MS     120    // 一次转向后原地停住的观察时间（0.1s）
-#define SEARCH_TURN_SPEED   0.20f  // 丢线时搜索转向速度
-#define STEER_DEADBAND      0.27f   // 回差退出阈值：|err|<此值停止转向
-#define STEER_TRIGGER_ERR   0.35f   // 回差触发阈值：|err|>=此值才开始转向
+#define OBSERVE_HOLD_MS     180    // 一次转向后原地停住的观察时间（0.1s）
+#define SEARCH_TURN_SPEED   0.18f  // 丢线时搜索转向速度
+#define STEER_DEADBAND      0.22f   // 回差退出阈值：|err|<此值停止转向
+#define STEER_TRIGGER_ERR   0.40f   // 回差触发阈值：|err|>=此值才开始转向
 #define ERR_SMOOTH_K        0.40f   // 误差平滑系数（0~1，越小越平滑）
 
 static volatile int avoid_active = 0;       // 1=避障任务接管电机（循迹任务暂停）
-static volatile int avoid_stop_armed = 0;   // 避障结束后的一次性“全黑停车”武装
 
 /**
  * @brief 循迹控制任务：把视觉误差变成三个轮子的速度 —— 循迹的“决策 + 执行”环节
@@ -1534,29 +1743,38 @@ static void line_follow_task(void *arg)
 
 // ==================== 超声波避障（参考之前红外版逻辑，条件一致） ====================
 // 流程：连续两次距离 < 触发值 -> 制动 -> 定时左平移 -> 定时前进 -> 定时右平移 -> 恢复循迹；
-// 避障完成后武装一次“全黑停车”：一旦全黑立即停车，只有居中持续 2s 才解锁
+// 硬编码避障路线结束后再固定前进 1s，随后直接进入找球程序。
 #define ULTRASONIC_MIN_CM              2.0f
 #define ULTRASONIC_MAX_CM            400.0f
 #define ULTRASONIC_PERIOD_MS          20U
-#define AVOID_TRIGGER_CM              11.0f   // 距离小于此值触发避障
+#define AVOID_TRIGGER_CM              6.0f   // 距离小于此值触发避障
 #define AVOID_CLOSE_CONFIRM_SAMPLES    2U
 #define AVOID_BRAKE_MS               500U
-#define AVOID_LEFT_MS               1500U
+#define AVOID_LEFT_MS               1600U
 #define AVOID_FWD_MS                1800U
-#define AVOID_RIGHT_MS              1500U
+#define AVOID_RIGHT_MS              1100U
 
 // 原测试参数按百分比归一化；A/B/D 分轮设置，避免统一系数破坏实测比例。
-#define AVOID_LEFT_A_SPEED            0.24f
+#define AVOID_LEFT_A_SPEED            0.22f
 #define AVOID_LEFT_B_SPEED            0.35f
-#define AVOID_LEFT_D_SPEED            0.18f
+#define AVOID_LEFT_D_SPEED            0.24f
 #define AVOID_RIGHT_A_SPEED           0.18f
-#define AVOID_RIGHT_B_SPEED           0.38f
+#define AVOID_RIGHT_B_SPEED           0.35f
 #define AVOID_RIGHT_D_SPEED           0.24f
 #define AVOID_FWD_A_SPEED             0.24f
 #define AVOID_FWD_D_SPEED             0.27f
-#define POST_AVOID_UNLOCK_MS    2000    // 全黑停车后，居中持续多久才解锁
+#define POST_AVOID_FORWARD_MS        1000U
+#define POST_AVOID_FORWARD_COEF       0.8660254f
+#define BALL_POWER_RECOVERY_MS       1000U
 
-typedef enum { AV_NORMAL, AV_BRAKE, AV_LEFT, AV_FWD, AV_RIGHT } avoid_state_t;
+typedef enum {
+    AV_NORMAL,
+    AV_BRAKE,
+    AV_LEFT,
+    AV_FWD,
+    AV_RIGHT,
+    AV_POST_FWD,
+} avoid_state_t;
 
 /**
  * @brief 按物理轮 A/B/D 的独立速度驱动避障动作
@@ -1572,7 +1790,7 @@ static void set_avoid_wheel_speed(float a, float b, float d)
 }
 
 /**
- * @brief 超声波避障任务：用状态机绕开障碍，绕回线上后再管一次“全黑停车”
+ * @brief 超声波避障任务：按固定时序绕开障碍并直接切换到找球程序
  *
  * @param arg 未使用
  * @return 不返回；死循环，每 50ms 测一次距离
@@ -1580,15 +1798,11 @@ static void set_avoid_wheel_speed(float a, float b, float d)
  * 状态流转：
  *   AV_NORMAL --连续 AVOID_CLOSE_CONFIRM_SAMPLES 次 dist<AVOID_TRIGGER_CM--> AV_BRAKE
  *   --> AV_LEFT（固定左平移 AVOID_LEFT_MS）--> AV_FWD（固定前进 AVOID_FWD_MS）
- *   --> AV_RIGHT（固定右平移 AVOID_RIGHT_MS）--> AV_NORMAL。
+ *   --> AV_RIGHT（固定右平移 AVOID_RIGHT_MS）
+ *   --> AV_POST_FWD（固定前进 POST_AVOID_FORWARD_MS）--> 找球程序。
  *
  * 和循迹的分工：一进 AV_BRAKE 就置 avoid_active=1，line_follow_task 立刻松手，整个避障过程
- * 由本任务独占电机；AV_RIGHT 定时结束后清零 avoid_active 交还控制权，同时置
- * avoid_stop_armed=1 —— 回到线上后第一次遇到“几乎全黑”就锁定停车，之后需要黑线重新居中
- * （|line_err| < STEER_DEADBAND）并持续 POST_AVOID_UNLOCK_MS 才解锁继续跑。
- *
- * @note 全黑锁定用的是内嵌 while 循环：期间只反复停电机，不测距、不响应新障碍，
- *       唯一出口是居中计时到点后 break。测距是忙等，所以本任务优先级最低（3）
+ * 由本任务独占电机；最后固定前进结束后直接启动找球程序，不恢复巡线。
  */
 static void avoid_task(void *arg)
 {
@@ -1604,34 +1818,15 @@ static void avoid_task(void *arg)
 
         switch (st) {
         case AV_NORMAL:
-            // 避障后的“全黑停车”锁定：全黑 -> 停车，居中持续解锁
-            if (avoid_stop_armed && has_line && line_black_ratio >= ALL_BLACK_RATIO) {
-                ESP_LOGI(TAG, "avoid: all-black stop armed, locking");
-                avoid_active = 1;
-                int64_t unlock_ms = 0;
-                while (avoid_active) {
-                    for (int i = 0; i < MOTOR_COUNT; i++) set_motor_speed(i, 0.0f);
-                    vTaskDelay(pdMS_TO_TICKS(20));
-                    bool centered = line_found && line_black_ratio < ALL_BLACK_RATIO
-                                    && fabsf(line_err) < STEER_DEADBAND;
-                    if (centered) {
-                        unlock_ms += 20;
-                        if (unlock_ms >= POST_AVOID_UNLOCK_MS) break;
-                    } else {
-                        unlock_ms = 0;
-                    }
-                }
-                ESP_LOGI(TAG, "avoid: all-black unlock, resume line follow");
-                avoid_stop_armed = 0;
-                avoid_active = 0;
-            }
-
-            // 正常循迹：关闭寻线控制，直到右平移找回线后才恢复
             if (!avoid_active) {
                 if (valid_dist && dist < AVOID_TRIGGER_CM) {
                     if (++trig_cnt >= AVOID_CLOSE_CONFIRM_SAMPLES) {
                         ESP_LOGI(TAG, "avoid: trigger d=%.1fcm -> brake", dist);
                         avoid_active = 1;      // 立即关闭摄像头寻线控制
+                        if (line_follow_task_handle != NULL) {
+                            vTaskSuspend(line_follow_task_handle);
+                            ESP_LOGI(TAG, "avoid: line-follow task permanently suspended");
+                        }
                         trig_cnt = 0;
                         st = AV_BRAKE;
                         phase_start = esp_timer_get_time();
@@ -1665,25 +1860,39 @@ static void avoid_task(void *arg)
             // 前冲：直行一段固定时间（寻线仍关闭）
             set_avoid_wheel_speed(AVOID_FWD_A_SPEED, 0.0f, -AVOID_FWD_D_SPEED);
             if (esp_timer_get_time() - phase_start >= AVOID_FWD_MS * 1000) {
-                ESP_LOGI(TAG, "avoid: forward done -> right translate, line-follow ON");
+                ESP_LOGI(TAG, "avoid: forward done -> right translate");
                 st = AV_RIGHT;
                 phase_start = esp_timer_get_time();
             }
             break;
 
         case AV_RIGHT:
-            // 右平移固定时间，结束后再交回巡线
+            // 右平移固定时间，结束后直接进入最后固定前进
             set_avoid_wheel_speed(-AVOID_RIGHT_A_SPEED, AVOID_RIGHT_B_SPEED,
                                   -AVOID_RIGHT_D_SPEED);
             if (esp_timer_get_time() - phase_start >= AVOID_RIGHT_MS * 1000) {
-                ESP_LOGI(TAG, "avoid: right fixed-time done -> resume line follow (line=%d)",
-                         has_line ? 1 : 0);
-                for (int i = 0; i < MOTOR_COUNT; i++) set_motor_speed(i, 0.0f);
-                avoid_active = 0;
-                avoid_stop_armed = has_line ? 1 : 0;
-                st = AV_NORMAL;
+                ESP_LOGI(TAG, "avoid: right fixed-time done -> final forward %ums",
+                         (unsigned)POST_AVOID_FORWARD_MS);
+                st = AV_POST_FWD;
+                phase_start = esp_timer_get_time();
             }
             break;
+
+        case AV_POST_FWD: {
+            float wheel_speed = POST_AVOID_FORWARD_COEF * BASE_SPEED;
+            set_avoid_wheel_speed(wheel_speed, 0.0f, -wheel_speed);
+            if (esp_timer_get_time() - phase_start >= POST_AVOID_FORWARD_MS * 1000) {
+                ESP_LOGI(TAG, "avoid: final forward done -> power recovery %ums",
+                         (unsigned)BALL_POWER_RECOVERY_MS);
+                endpoint_ball_stop();
+                vTaskDelay(pdMS_TO_TICKS(BALL_POWER_RECOVERY_MS));
+                ESP_LOGI(TAG, "avoid: power recovered -> start ball program");
+                endpoint_ball_start();
+                vTaskDelete(NULL);
+                return;
+            }
+            break;
+        }
         }
 
         if (++dbg_cnt >= 3) {
@@ -1724,6 +1933,7 @@ static void camera_display_task(void *arg)
     size_t dec_cap = 0;
     static uint8_t scaled[CAM_DISP_W * CAM_DISP_H * 2];
     int64_t last_stat = 0;
+    int64_t last_status_lcd = 0;
     uint32_t decode_ok = 0, decode_fail = 0;
 
     for (;;) {
@@ -1731,11 +1941,12 @@ static void camera_display_task(void *arg)
         size_t len = jpeg_len;
         if (len == 0) continue;
 
+        bool ball_mode = endpoint_ball_active();
         esp_jpeg_image_cfg_t cfg = {0};
         cfg.indata = jpeg_buf;
         cfg.indata_size = len;
         cfg.out_format = JPEG_IMAGE_FORMAT_RGB565;
-        cfg.out_scale = JPEG_IMAGE_SCALE_1_2;
+        cfg.out_scale = ball_mode ? JPEG_IMAGE_SCALE_1_4 : JPEG_IMAGE_SCALE_1_2;
         cfg.flags.swap_color_bytes = 1;
 
         esp_jpeg_image_output_t info;
@@ -1760,8 +1971,12 @@ static void camera_display_task(void *arg)
         if (w == 0 || h == 0) continue;
 
         // 只运行原组黑线检测，供巡线和避障找回线使用。
-        detect_line_from_rgb565(dec_buf, w, h);
-        vision_ready = 1;
+        if (ball_mode) {
+            endpoint_ball_process_frame(dec_buf, w, h);
+        } else {
+            detect_line_from_rgb565(dec_buf, w, h);
+            vision_ready = 1;
+        }
 
         // 最近邻缩放到屏幕显示区大小（只影响显示，循迹判定用的是上面的原始分辨率）
         for (int dy = 0; dy < CAM_DISP_H; dy++) {
@@ -1775,17 +1990,54 @@ static void camera_display_task(void *arg)
                 dst[dx * 2 + 1] = p[1];
             }
         }
+        endpoint_ball_status_t endpoint_status;
+        endpoint_ball_get_status(&endpoint_status);
+        bool ball_active = endpoint_ball_active();
         // 在画面上标注识别到的黑线
-        overlay_detected_line(scaled, w, h);
+        if (ball_active) {
+            overlay_ball_target(scaled, &endpoint_status);
+        } else {
+            overlay_detected_line(scaled, w, h);
+        }
         lcd_blit_cam(scaled, CAM_DISP_W, CAM_DISP_H);
 
         int64_t now = esp_timer_get_time();
+        if (now - last_status_lcd >= 200000) {
+            const char *state = ball_active ? "BALL" :
+                                endpoint_status.paused ? "STOP" :
+                                avoid_active ? "AVOID" :
+                                !vision_ready ? "WAIT" :
+                                !line_found ? "LOST" :
+                                line_black_ratio >= ALL_BLACK_RATIO ? "STOP" : "NORMAL";
+            int motor_a = ball_active ? endpoint_status.motor_a : lcd_motor_percent[2];
+            int motor_b = ball_active ? endpoint_status.motor_b : lcd_motor_percent[1];
+            int motor_d = ball_active ? endpoint_status.motor_d : lcd_motor_percent[0];
+            int black_percent = (int)(line_black_ratio * 100.0f + 0.5f);
+            lcd_status_t status = {
+                .state = state,
+                .armed = vision_ready != 0,
+                .stby = gpio_get_level(MOTOR_STBY_GPIO) != 0,
+                .motor_a = motor_a,
+                .motor_b = motor_b,
+                .motor_d = motor_d,
+                .ultrasonic_cm = lcd_ultrasonic_cm,
+                .candidate = line_found != 0,
+                .threshold = (int)line_luma_thr,
+                .seed_x = (int)line_cx,
+                .valid_rows = line_found ? 1 : 0,
+                .confidence = black_percent,
+                .ball_phase = endpoint_status.phase,
+            };
+            lcd_show_status(&status);
+            last_status_lcd = now;
+        }
         if (now - last_stat > 2000000) {
             last_stat = now;
             ESP_LOGI(TAG, "decode ok=%lu fail=%lu dim=%lux%lu",
                      (unsigned long)decode_ok, (unsigned long)decode_fail,
                      (unsigned long)w, (unsigned long)h);
         }
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -1875,6 +2127,9 @@ static void stream_state_cb(usb_stream_state_t state, void *user_ptr)
  */
 void app_main(void)
 {
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    ESP_LOGW(TAG, "boot reset reason=%s (%d)",
+             reset_reason_name(reset_reason), (int)reset_reason);
     lcd_init();
     lcd_fill(0x0000);
     ultrasonic_init();
@@ -1886,8 +2141,10 @@ void app_main(void)
     xTaskCreate(camera_display_task, "cam_lcd", 8192, NULL, 5, NULL);
 
     motor_init();
-    // 只启动原组巡线和超声波避障，不创建找球任务。
-    xTaskCreate(line_follow_task, "line_follow", 4096, NULL, 6, NULL);
+    ESP_ERROR_CHECK(endpoint_ball_init(endpoint_ball_drive, endpoint_ball_stop,
+                                       endpoint_ball_pause_controllers));
+    // 原巡线和避障任务保持独立；终点确认后由找球模块暂停并接管。
+    xTaskCreate(line_follow_task, "line_follow", 4096, NULL, 6, &line_follow_task_handle);
     xTaskCreate(avoid_task, "avoid", 4096, NULL, 3, NULL);
 
     uint8_t *xfer_a = heap_caps_malloc(XFER_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
