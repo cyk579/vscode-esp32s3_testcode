@@ -130,12 +130,14 @@ static void lcd_blit_cam(const uint8_t *rgb565, int w, int h)
 
 /**
  * @brief 初始化 LCD：GPIO、SPI2 总线与设备、ST7735 上电序列，最后清屏为黑
- * @note  独占 SPI2_HOST，SPI 时钟 26MHz，像素格式 RGB565；MADCTL=0x08 只设 BGR、不做镜像，
+ * @note  独占 SPI2_HOST，SPI 时钟 10MHz，像素格式 RGB565；MADCTL=0x08 只设 BGR、不做镜像，
  *        因此屏幕上显示的是摄像头原始画面，左右与实际相反（循迹误差另做镜像修正，
  *        见 CAM_IMAGE_MIRROR）
  */
 static void lcd_init(void)
 {
+    ESP_LOGI(TAG, "LCD init: CS=%d SCK=%d MOSI=%d DC=%d RST=%d",
+             LCD_CS_GPIO, LCD_SCK_GPIO, LCD_MOSI_GPIO, LCD_DC_GPIO, LCD_RST_GPIO);
     gpio_config_t cfg = {
         .pin_bit_mask = (1ULL << LCD_RST_GPIO) | (1ULL << LCD_DC_GPIO),
         .mode = GPIO_MODE_OUTPUT,
@@ -158,8 +160,7 @@ static void lcd_init(void)
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
 
     spi_device_interface_config_t dev = {
-        /* 10 MHz matches the known-good ST7735 configuration and leaves
-         * margin for jumper wires and GPIO-matrix routing on this board. */
+        /* Match camera-claude's 10 MHz setting for the wiring check. */
         .clock_speed_hz = 10 * 1000 * 1000,
         .mode = 0,
         .spics_io_num = LCD_CS_GPIO,
@@ -194,6 +195,7 @@ static void lcd_init(void)
     lcd_cmd(0x29); vTaskDelay(pdMS_TO_TICKS(100));
 
     lcd_fill(0x0000);
+    ESP_LOGI(TAG, "LCD init commands and black frame sent (no LCD readback)");
 }
 
 // ==================== 超声波 ====================

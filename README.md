@@ -16,6 +16,8 @@
 
 2026-09-06：上述两份移植工程及 `引脚对应表2.xlsx` 已将 LCD CS 从 GPIO47 改为 GPIO0，
 实物也需同步改线。GPIO0 的复位电平要求、完整映射和验证范围见 [引脚核查与复现说明](引脚核查与复现说明.md)。
+
+白屏排查更新：**VScode ESP 暂把 LCD CS 改为 GPIO1，须先拔掉 GPIO1 原有的水平舵机信号线。** Excel 与 camera-claude 仍保留 CS=GPIO0，切换工程时须恢复对应接线。当前接线和 Monitor 排查步骤见 [VScode ESP 说明](esp-projects/VScode%20ESP/VScode%20ESP/README.md)。
 `car-spin` / `camera-test` 保留原版本，切回它们时需另行核对其接线，不能直接套用此次接线。
 
 ## 开发环境

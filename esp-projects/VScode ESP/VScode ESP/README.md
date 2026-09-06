@@ -16,7 +16,7 @@
 
 | 外设 | 本车 GPIO |
 | --- | --- |
-| LCD CS / SCK / MOSI / DC / RST | **0** / 13 / 14 / 21 / 38 |
+| LCD CS / SCK / MOSI / DC / RST | **1（临时排查）** / 13 / 14 / 21 / 38 |
 | 超声 TRIG / ECHO | 18 / 11 |
 | TB6612 STBY | 8 |
 | M1 左前 = 本车 D：PWM / INA / INB | 16 / 7 / 15 |
@@ -28,11 +28,13 @@
 | USB D- / D+ | 19 / 20，固定 |
 | UART0 TX / RX | 43 / 44 |
 
-**LCD CS 实物必须从 GPIO47 移到 GPIO0。** WROOM-2 的 GPIO47/48 是 1.8V 域。GPIO0 是 BOOT 脚，正常复位时必须保持高电平；屏幕 CS 不得接下拉或主动拉低，可以用约 10kΩ 上拉到 3.3V。BOOT 下载时被主动拉低是正常现象。
+**白屏排查：先断电，拔掉 GPIO1 的水平舵机信号线，再把 LCD CS 从 GPIO0 移到 GPIO1。** GPIO1 是普通 GPIO，可避开 GPIO0 的 BOOT 复用；屏幕 CS 只能接 GPIO1，不能同时连 GPIO0、GND 或舵机信号。WROOM-2 的 GPIO47/48 是 1.8V 域，不要接回那里。
 
-GPIO13/14 是 SPI2 通过 GPIO Matrix 路由的时钟/MOSI，并非原生 IO_MUX 时钟/MOSI。保留原程序 26MHz，不需要为了“硬件 SPI”再挪到已被 AIN1/ECHO 占用的 GPIO12/11。
+本次只是 VScode ESP 的临时测试接线。Excel 和 camera-claude 仍按 LCD CS=GPIO0、水平舵机=GPIO1；切回该方案前恢复接线。GPIO0 方案要求正常复位时 CS 不把 GPIO0 拉低。
 
-本组代码没有云台舵机驱动，GPIO1/2 不由它配置；试验前把摄像头固定到能看清地面的俯视位置。编码器六个脚只配置成输入，原组没有读取计数或速度闭环。
+GPIO13/14 是 SPI2 通过 GPIO Matrix 路由的时钟/MOSI，并非原生 IO_MUX 时钟/MOSI。当前 SPI 已降至 10MHz 供接线排查，不需要再挪到已被 AIN1/ECHO 占用的 GPIO12/11。
+
+本组代码没有云台舵机驱动，GPIO1 临时给 LCD CS，GPIO2 不配置；试验前把摄像头固定到能看清地面的俯视位置。编码器六个脚只配置成输入，原组没有读取计数或速度闭环。
 
 轮子位置依据 `car-spin/README.md` 的 A右前、D左前、B后轮。保留 `motor_dir={1,1,-1}`：原算法直行给 M1负、M3正，映射后 D/A 的方向电平均为 IN1低、IN2高，与本仓库原接线说明一致；电机接头极性仍需架空实测。
 
@@ -61,6 +63,19 @@ idf.py -B build-local -p COM5 flash monitor
 构建后核对：`CONFIG_IDF_TARGET="esp32s3"`、`CONFIG_ESPTOOLPY_OCT_FLASH=y`、`CONFIG_ESPTOOLPY_FLASHMODE_OPI=y`、32MB 和 Octal PSRAM。OPI 时内部 `CONFIG_ESPTOOLPY_FLASHMODE="dout"` 是 IDF 对烧录镜像头的表示，不是错误配置。
 
 摄像头用 GPIO19/20 的 USB PHY；持续日志使用 GPIO43/44 对应的 UART 口。屏幕先看能否显示画面及黑线标记，再看串口 `line:` 和 `us dist=`，最后架空检查轮向后落地。
+
+## 白屏排查
+
+改 CS 后必须重新编译并烧录本工程。打开 ESP-IDF Monitor，按一下开发板 RESET/EN（不要按住 BOOT），核对启动日志：
+
+```text
+LCD init: CS=1 SCK=13 MOSI=14 DC=21 RST=38
+LCD init commands and black frame sent (no LCD readback)
+```
+
+第一行确认固件使用的新引脚；第二行只表示 ESP32 完成发送，本接线没有读回信号，不能证明屏幕接收成功。若没有第一行，先检查完整启动日志、是否反复重启以及实际烧录工程。若只有第一行，查看其后的 SPI 错误或复位日志。
+
+正常初始化在启动摄像头前就会把屏幕填黑，因此未接摄像头也应变黑。两行都有但仍白屏时，断电后核对 LCD RST/RES=GPIO38、DC/A0=GPIO21、SCK=GPIO13、SDI/MOSI=GPIO14、CS=GPIO1、VCC=3V3、GND=开发板 GND；屏幕 RST 不是开发板 EN。换一根短的 CS 线再试。GPIO0 的复用问题只是候选原因，换脚测试不能替代接线与启动日志核查。
 
 ## 验证范围
 

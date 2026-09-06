@@ -2,19 +2,20 @@
 
 #include "driver/gpio.h"
 
-/* 接线依据：仓库根目录 引脚对应表2.xlsx / Sheet1。
+/* 接线依据：仓库根目录 引脚对应表2.xlsx / Sheet1，LCD CS 临时排查改线见下。
  * 按 car-spin/README.md 的车体位置映射：M1=左前D，M2=后B，M3=右前A。
  * 这里的数字都是 GPIO 号，不是 WROOM-2 模组焊盘序号。
  */
 
 /* ST7735，SPI2 通过 GPIO matrix 路由到 13/14。 */
 /* 注意：WROOM-2 的 GPIO47/48 是 1.8V 域，不能默认直连 3.3V 屏幕。
- * 已按确认方案把 CS 从 GPIO47 改到 GPIO0，实物线也必须同步移动。
- * GPIO0 在复位时须保持高电平，LCD CS 不能有下拉或主动拉低。
+ * 白屏排查：本工程暂将 CS 从 GPIO0 移到普通 GPIO1，避开 BOOT 复用。
+ * 必须先拔掉 GPIO1 原有的水平舵机信号线，再把屏幕 CS 接到 GPIO1。
+ * Excel 与 camera-claude 仍为 CS=0、水平舵机=1；切回时须恢复接线。
  * 单屏独占 SPI 时也可将屏幕 CS 接 GND，并把此宏设为 (-1)。
  * 详见仓库根目录 引脚核查与复现说明.md。
  */
-#define LCD_CS_GPIO    GPIO_NUM_0
+#define LCD_CS_GPIO    GPIO_NUM_1
 #define LCD_SCK_GPIO   GPIO_NUM_13
 #define LCD_MOSI_GPIO  GPIO_NUM_14
 #define LCD_DC_GPIO    GPIO_NUM_21
@@ -46,6 +47,6 @@
 #define M3_PWM         GPIO_NUM_9
 
 /* USB 摄像头固定 D-=GPIO19、D+=GPIO20，由 usb_stream 驱动配置。
- * GPIO1/2 是表中的云台舵机，本组原程序没有舵机控制，不配置这两个脚。
+ * 本组没有舵机控制：GPIO1 临时借给 LCD CS，GPIO2 不配置。
  * 编码器仍只配置输入，原程序没有 PCNT 计数或速度闭环。
  */
