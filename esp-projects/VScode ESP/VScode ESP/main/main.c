@@ -565,7 +565,7 @@ static void endpoint_ball_pause_controllers(void)
 #define LINE_LOST_RATIO         0.01f   // 框内黑像素占比低于此值视为丢线
 #define CAM_IMAGE_MIRROR        1       // 1=画面水平翻转（实测左右反了）
 #define LINE_MIN_BLACK_PIXELS   4       // 框内至少多少个黑像素才算找到线
-#define BASE_SPEED              0.28f   // 循迹前进速度（0~1）
+#define BASE_SPEED              0.32f   // 循迹前进速度（0~1）
 #define CTRL_PERIOD_MS          50      // 控制周期
 
 static volatile int vision_ready = 0;        // 处理过第一帧后才允许出车
@@ -1594,9 +1594,9 @@ static void overlay_detected_ball(uint8_t *scaled, uint32_t img_w, uint32_t img_
 #define PID_OMEGA_MAX       0.08f   // 转向输出上限
 #define PID_INTEGRAL_MAX    0.40f
 #define TURN_PULSE_MS       140     // 每次短促转向的最长持续时间（减小单次转向幅度）
-#define TURN_PULSE_SPEED    0.20f  // 短促转向速度
+#define TURN_PULSE_SPEED    0.21f  // 短促转向速度
 #define OBSERVE_HOLD_MS     180    // 一次转向后原地停住的观察时间（0.1s）
-#define SEARCH_TURN_SPEED   0.18f  // 丢线时搜索转向速度
+#define SEARCH_TURN_SPEED   0.20f  // 丢线时搜索转向速度
 #define STEER_DEADBAND      0.22f   // 回差退出阈值：|err|<此值停止转向
 #define STEER_TRIGGER_ERR   0.40f   // 回差触发阈值：|err|>=此值才开始转向
 #define ERR_SMOOTH_K        0.40f   // 误差平滑系数（0~1，越小越平滑）
@@ -1747,16 +1747,16 @@ static void line_follow_task(void *arg)
 #define ULTRASONIC_MIN_CM              2.0f
 #define ULTRASONIC_MAX_CM            400.0f
 #define ULTRASONIC_PERIOD_MS          20U
-#define AVOID_TRIGGER_CM              6.0f   // 距离小于此值触发避障
+#define AVOID_TRIGGER_CM              8.0f   // 距离小于此值触发避障
 #define AVOID_CLOSE_CONFIRM_SAMPLES    2U
 #define AVOID_BRAKE_MS               500U
-#define AVOID_LEFT_MS               1600U
-#define AVOID_FWD_MS                1800U
-#define AVOID_RIGHT_MS              1100U
+#define AVOID_LEFT_MS               1250U
+#define AVOID_FWD_MS                1500U
+#define AVOID_RIGHT_MS              1300U
 
 // 原测试参数按百分比归一化；A/B/D 分轮设置，避免统一系数破坏实测比例。
 #define AVOID_LEFT_A_SPEED            0.22f
-#define AVOID_LEFT_B_SPEED            0.35f
+#define AVOID_LEFT_B_SPEED            0.38f
 #define AVOID_LEFT_D_SPEED            0.24f
 #define AVOID_RIGHT_A_SPEED           0.18f
 #define AVOID_RIGHT_B_SPEED           0.35f
