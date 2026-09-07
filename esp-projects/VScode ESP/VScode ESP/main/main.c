@@ -552,20 +552,20 @@ static void endpoint_ball_pause_controllers(void)
 //         帮助大弯/突然偏移时更快锁定，同时减少其它区域干扰；
 // 转向误差：始终以固定的“车头参考点”为基准（不随窗口移动），
 //         否则线永远在窗口中心、误差恒为 0 就不会转向
-#define BOX_Y0_FRAC             0.79f   // 扫描带上边界（相对高度）
-#define BOX_Y1_FRAC             0.94f   // 扫描带下边界（相对高度）
-#define TRACK_WIN_W_FRAC        0.50f   // 动态检测窗宽度（相对画面宽）
+#define BOX_Y0_FRAC             0.65f   // 扫描带上边界（减小可更早看到前方弯道）
+#define BOX_Y1_FRAC             0.95f   // 扫描带下边界（相对高度）
+#define TRACK_WIN_W_FRAC        0.40f   // 动态检测窗宽度（相对画面宽）
 #define TRACK_CENTER_MIN_FRAC   0.30f   // 窗口中心允许的最小 x
 #define TRACK_CENTER_MAX_FRAC   0.70f   // 窗口中心允许的最大 x
 #define STEER_REF_FRAC          0.53f   // 固定转向基准点 x（车头参考）
 #define ERR_SCALE_FRAC          0.30f   // 误差归一化尺度（约等于原框半宽）
-#define RECOVERY_X_MARGIN       0.12f   // 主窗左右扩展的“找回带”宽度
+#define RECOVERY_X_MARGIN       0.08f   // 主窗左右扩展的“找回带”宽度
 #define LINE_LUMA_MAX_CAP       170     // 自适应阈值上限（防过曝误判）
 #define ALL_BLACK_RATIO         0.90f   // 黑像素占比达到此值视为“全黑停车”
-#define LINE_LOST_RATIO         0.01f   // 框内黑像素占比低于此值视为丢线
+#define LINE_LOST_RATIO         0.02f   // 框内黑像素占比低于此值视为丢线
 #define CAM_IMAGE_MIRROR        1       // 1=画面水平翻转（实测左右反了）
-#define LINE_MIN_BLACK_PIXELS   4       // 框内至少多少个黑像素才算找到线
-#define BASE_SPEED              0.32f   // 循迹前进速度（0~1）
+#define LINE_MIN_BLACK_PIXELS   8       // 框内至少多少个黑像素才算找到线
+#define BASE_SPEED              0.30f   // 循迹前进速度（0~1）
 #define CTRL_PERIOD_MS          50      // 控制周期
 
 static volatile int vision_ready = 0;        // 处理过第一帧后才允许出车
@@ -577,6 +577,7 @@ static volatile float line_angle_deg = 0.0f; // 偏转角（度），OpenMV 风�
 static volatile float line_row_top_img = -1.0f;    // 黑线簇顶部行（图像坐标，用于描线）
 static volatile float line_row_bottom_img = -1.0f; // 黑线簇底部行（图像坐标，用于描线）
 static volatile uint32_t line_luma_thr = 150;      // 本帧判定黑线用的亮度阈值
+static volatile uint32_t line_frame_seq = 0;       // 每完成一帧巡线识别递增，避免重复确认同一帧
 static float track_cx = -1.0f;                     // 上一帧线位置（原始坐标，用于生成检测窗）
 static volatile float track_win_x0f = 0.30f;       // 当前检测窗左边界（相对宽度，供画框）
 static volatile float track_win_x1f = 0.70f;       // 当前检测窗右边界（相对宽度，供画框）
@@ -1593,13 +1594,14 @@ static void overlay_detected_ball(uint8_t *scaled, uint32_t img_w, uint32_t img_
 #define PID_KD              0.30f
 #define PID_OMEGA_MAX       0.08f   // 转向输出上限
 #define PID_INTEGRAL_MAX    0.40f
-#define TURN_PULSE_MS       140     // 每次短促转向的最长持续时间（减小单次转向幅度）
+#define TURN_PULSE_MS       100     // 每次短促转向的最长持续时间（减小单次转向幅度）
 #define TURN_PULSE_SPEED    0.21f  // 短促转向速度
 #define OBSERVE_HOLD_MS     180    // 一次转向后原地停住的观察时间（0.1s）
 #define SEARCH_TURN_SPEED   0.20f  // 丢线时搜索转向速度
-#define STEER_DEADBAND      0.22f   // 回差退出阈值：|err|<此值停止转向
+#define STEER_DEADBAND      0.25f   // 回差退出阈值：|err|<此值停止转向
 #define STEER_TRIGGER_ERR   0.40f   // 回差触发阈值：|err|>=此值才开始转向
 #define ERR_SMOOTH_K        0.40f   // 误差平滑系数（0~1，越小越平滑）
+#define TURN_CONFIRM_FRAMES 2U      // 连续多少张不同摄像头帧同向，才开始转向
 
 static volatile int avoid_active = 0;       // 1=避障任务接管电机（循迹任务暂停）
 
@@ -1626,8 +1628,8 @@ static volatile int avoid_active = 0;       // 1=避障任务接管电机（循�
  *  - 回差（施密特）：|smooth_err| ≥ STEER_TRIGGER_ERR 且已过观察期才进入转向；转向中一旦
  *    |line_err| < STEER_DEADBAND，或本次已转满 TURN_PULSE_MS，就退出。触发阈值大于退出死区，
  *    所以不会在阈值附近反复进出转向；
- *  - 转向段：vx=0 原地转，速度 TURN_PULSE_SPEED，方向取平滑误差的符号并记进 last_omega_dir
- *    （丢线搜索要复用这个方向）；
+ *  - 转向段：vx=0 原地转，连续两张新帧确认方向后，在本次脉冲内锁定方向，
+ *    并把确认方向记进 last_omega_dir（丢线搜索复用）；
  *  - 转完先原地停 OBSERVE_HOLD_MS 看清新画面，观察期结束才以 BASE_SPEED 继续直行。
  *
  * 轮速解算（M1 左前 +60°、M2 后轮 180°、M3 右前 -60°）：
@@ -1644,6 +1646,10 @@ static void line_follow_task(void *arg)
     float smooth_err = 0.0f; // 平滑后的误差
     int smooth_init = 0;     // 平滑器是否已初始化
     int in_turn = 0;         // 是否处于“转向修正”中（配合回差）
+    int active_turn_dir = 1; // 一次转向脉冲内锁定的方向
+    int pending_turn_dir = 0;
+    uint32_t pending_turn_frames = 0;
+    uint32_t last_turn_frame_seq = 0;
     int log_cnt = 0;
 
     for (;;) {
@@ -1667,15 +1673,22 @@ static void line_follow_task(void *arg)
             omega = last_omega_dir * SEARCH_TURN_SPEED;
             smooth_init = 0;
             in_turn = 0;
+            pending_turn_dir = 0;
+            pending_turn_frames = 0;
         } else if (line_black_ratio >= ALL_BLACK_RATIO) {
             // 全黑停车
             vx = 0.0f;
             omega = 0.0f;
             smooth_init = 0;
             in_turn = 0;
+            pending_turn_dir = 0;
+            pending_turn_frames = 0;
         } else {
             float err = line_err;
             int64_t now = esp_timer_get_time();
+            uint32_t frame_seq = line_frame_seq;
+            bool new_frame = frame_seq != last_turn_frame_seq;
+            if (new_frame) last_turn_frame_seq = frame_seq;
 
             // 误差平滑：抑制单帧抖动导致的方向反复
             if (!smooth_init) {
@@ -1686,11 +1699,33 @@ static void line_follow_task(void *arg)
             }
             float serr = smooth_err;
 
-            // 进入转向：平滑误差超阈值，且已过原地观察期
+            // 进入转向：连续两张不同摄像头帧方向一致，避免单帧阴影触发误转。
             if (!in_turn && fabsf(serr) >= STEER_TRIGGER_ERR &&
+                fabsf(err) >= STEER_TRIGGER_ERR &&
                 now >= hold_end) {
-                in_turn = 1;
-                pulse_start = now;
+                int candidate_dir = (err >= 0.0f) ? 1 : -1;
+                if (new_frame) {
+                    if (candidate_dir == pending_turn_dir) {
+                        if (pending_turn_frames < TURN_CONFIRM_FRAMES) {
+                            pending_turn_frames++;
+                        }
+                    } else {
+                        pending_turn_dir = candidate_dir;
+                        pending_turn_frames = 1;
+                    }
+                }
+                if (pending_turn_frames >= TURN_CONFIRM_FRAMES) {
+                    active_turn_dir = pending_turn_dir;
+                    last_omega_dir = active_turn_dir;
+                    pending_turn_dir = 0;
+                    pending_turn_frames = 0;
+                    in_turn = 1;
+                    pulse_start = now;
+                }
+            } else if (!in_turn && (fabsf(serr) < STEER_TRIGGER_ERR ||
+                                    fabsf(err) < STEER_TRIGGER_ERR)) {
+                pending_turn_dir = 0;
+                pending_turn_frames = 0;
             }
             // 退出转向：原始误差回到死区，或本次短促转向达到最大时长
             if (in_turn && (fabsf(err) < STEER_DEADBAND ||
@@ -1700,8 +1735,9 @@ static void line_follow_task(void *arg)
             }
 
             if (!in_turn) {
-                if (now < hold_end) {
-                    // 转向后原地停住观察 0.1s，避免惯性连续转向
+                if (now < hold_end || fabsf(serr) >= STEER_TRIGGER_ERR ||
+                    pending_turn_frames > 0) {
+                    // 观察或等待方向确认期间保持停车，禁止夹杂一次前进。
                     vx = 0.0f;
                     omega = 0.0f;
                 } else {
@@ -1710,10 +1746,8 @@ static void line_follow_task(void *arg)
                     omega = 0.0f;
                 }
             } else {
-                // 短促转向：固定方向、固定时长的一小段修正
-                int dir = (serr >= 0.0f) ? 1 : -1;
-                last_omega_dir = dir;
-                omega = dir * TURN_PULSE_SPEED;
+                // 短促转向：脉冲期间锁定已连续确认的方向，不被单帧误差反转。
+                omega = active_turn_dir * TURN_PULSE_SPEED;
                 vx = 0.0f;
             }
         }
@@ -1747,17 +1781,17 @@ static void line_follow_task(void *arg)
 #define ULTRASONIC_MIN_CM              2.0f
 #define ULTRASONIC_MAX_CM            400.0f
 #define ULTRASONIC_PERIOD_MS          20U
-#define AVOID_TRIGGER_CM              8.0f   // 距离小于此值触发避障
+#define AVOID_TRIGGER_CM              13.0f   // 距离小于此值触发避障
 #define AVOID_CLOSE_CONFIRM_SAMPLES    2U
 #define AVOID_BRAKE_MS               500U
 #define AVOID_LEFT_MS               1250U
-#define AVOID_FWD_MS                1500U
+#define AVOID_FWD_MS                1700U
 #define AVOID_RIGHT_MS              1300U
 
 // 原测试参数按百分比归一化；A/B/D 分轮设置，避免统一系数破坏实测比例。
-#define AVOID_LEFT_A_SPEED            0.22f
+#define AVOID_LEFT_A_SPEED            0.23f
 #define AVOID_LEFT_B_SPEED            0.38f
-#define AVOID_LEFT_D_SPEED            0.24f
+#define AVOID_LEFT_D_SPEED            0.22f
 #define AVOID_RIGHT_A_SPEED           0.18f
 #define AVOID_RIGHT_B_SPEED           0.35f
 #define AVOID_RIGHT_D_SPEED           0.24f
@@ -1975,6 +2009,7 @@ static void camera_display_task(void *arg)
             endpoint_ball_process_frame(dec_buf, w, h);
         } else {
             detect_line_from_rgb565(dec_buf, w, h);
+            line_frame_seq++;
             vision_ready = 1;
         }
 
