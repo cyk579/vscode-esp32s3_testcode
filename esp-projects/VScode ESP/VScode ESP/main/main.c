@@ -1998,13 +1998,13 @@ static void line_follow_task(void *arg)
 #define ULTRASONIC_MIN_CM              2.0f
 #define ULTRASONIC_MAX_CM            400.0f
 #define ULTRASONIC_PERIOD_MS          20U
-#define AVOID_TRIGGER_CM              12.0f   // 距离小于此值触发避障
+#define AVOID_TRIGGER_CM              11.0f   // 距离小于此值触发避障
 #define AVOID_CLOSE_CONFIRM_SAMPLES    2U
 #define AVOID_BRAKE_MS               800U
 #define AVOID_STAGE_BRAKE_MS         800U
 #define POST_AVOID_BRAKE_MS          800U
-#define AVOID_LEFT_MS               1200U
-#define AVOID_FWD_MS                1600U
+#define AVOID_LEFT_MS               1100U
+#define AVOID_FWD_MS                1400U
 #define AVOID_RIGHT_MS              750U
 #define AVOID_BACK_MS               0U
 
