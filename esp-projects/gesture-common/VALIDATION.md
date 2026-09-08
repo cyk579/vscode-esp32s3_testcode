@@ -4,11 +4,11 @@
 
 ## 已完成
 
-- 分支：`codex/gesture-car`
+- 分支：`subject3`
 - 日期：2026-09-08
 - 目标芯片：ESP32-S3，ESP-IDF 5.5.4（commit `735507283d5b2f9fb363a1901172dbd9e847945d`）
 - 主机测试：`python esp-projects/gesture-common/test/run_tests.py`，通过协议编解码、状态机恢复/超时/急停、姿态超限、断连、换向、序号回绕、混控和 Fusion 姿态检查。
-- 车端默认配置：`python esp-projects/gesture-common/build.py car`，已通过 936 个 Ninja 步骤；应用镜像约 `0x80b10` 字节，产物在 `esp-projects/gesture-car/build-local/verified/default/`。当前源码引脚与创新实验表一致：GPIO1/2 为 MPU6500 I2C。
+- 车端默认配置：`python esp-projects/gesture-common/build.py car`，当前源码应使用 GPIO17=SDA、GPIO3=SCL，GPIO1/2 仅保留为舵机物理接线。构建通过与实际接线、烧录和实车通过必须分开记录；产物目录中的 `source-manifest.json` 是确认固件来源的依据。
 - 安卓端：`python esp-projects/gesture-common/build.py android`，APK、JUnit 单元测试和 lint 均通过；APK 在 `esp-projects/gesture-android/build-local/verified/default/app-debug.apk`。
 - 车端显示变体：`python esp-projects/gesture-common/build.py car --car-imu 0 --tft 1` 构建通过，用于确认可选 TFT 编译路径；本次实际方案仍使用默认 `ENABLE_CAR_IMU=1`。
 - 构建使用内容哈希 ASCII 快照，源码清单位于每个验证产物目录的 `source-manifest.json`，避免 Windows 中文路径工具链兼容性问题。

@@ -8,209 +8,70 @@ import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.hardware.*
+import android.graphics.Color
+import android.graphics.Typeface
 import android.os.*
 import android.view.*
 import android.widget.*
+import android.graphics.drawable.GradientDrawable
 
 @SuppressLint("MissingPermission", "SetTextI18n", "ClickableViewAccessibility")
-class MainActivity : Activity(), SensorEventListener {
+class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
-    private lateinit var sensors: SensorManager
-    private var rotation: Sensor? = null
-    private var sensorAvailable = false
-    private var current = FloatArray(9)
-    private var reference: FloatArray? = null
-    private var sampleMs = 0L
-    private var foreground = false
-    private var held = false
-    private var estop = false
-    private var pitch = 0f
-    private var roll = 0f
-    private var seq = 0
-    private var gatt: BluetoothGatt? = null
-    private var control: BluetoothGattCharacteristic? = null
-    private var ready = false
-    private var pending = false
-    private var pendingSince = 0L
-    private var connectingSince = 0L
-    private var scanner: BluetoothLeScanner? = null
-    private var scanCallback: ScanCallback? = null
-    private var scanDeadline = 0L
+    private var foreground = false; private var held = false; private var estop = false
+    private var pitch = 0f; private var roll = 0f; private var seq = 0
+    private var gatt: BluetoothGatt? = null; private var control: BluetoothGattCharacteristic? = null
+    private var ready = false; private var pending = false; private var pendingSince = 0L; private var connectingSince = 0L
+    private var scanner: BluetoothLeScanner? = null; private var scanCallback: ScanCallback? = null; private var scanDeadline = 0L
     private val found = mutableSetOf<String>()
-    private lateinit var devices: LinearLayout
-    private lateinit var connectionLabel: TextView
-    private lateinit var anglesLabel: TextView
-    private lateinit var carLabel: TextView
-    private lateinit var holdButton: Button
+    private lateinit var devices: LinearLayout; private lateinit var connectionLabel: TextView; private lateinit var telemetryLabel: TextView; private lateinit var carLabel: TextView; private lateinit var joystick: JoystickView; private lateinit var unlockLabel: TextView
     private fun now() = SystemClock.elapsedRealtime()
     private fun adapter(): BluetoothAdapter? = getSystemService(BluetoothManager::class.java)?.adapter
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun c(v: String) = Color.parseColor(v)
+    private fun bg(fill: Int, radius: Int = 16, stroke: Int? = null) = GradientDrawable().apply { setColor(fill); cornerRadius = dp(radius).toFloat(); if (stroke != null) setStroke(dp(1), stroke) }
+    private fun label(value: String, size: Float, tint: Int, bold: Boolean = false) = TextView(this).apply { text = value; textSize = size; setTextColor(tint); typeface = if (bold) Typeface.DEFAULT_BOLD else Typeface.DEFAULT }
+    private fun button(value: String, action: () -> Unit) = Button(this).apply { text = value; textSize = 14f; isAllCaps = false; setTextColor(Color.WHITE); background = bg(c("#172A4A"), 14, c("#2E4D78")); setOnClickListener { action() } }
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        val scroll = ScrollView(this)
-        val page = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 60, 24, 48) }
-        scroll.addView(page); setContentView(scroll)
-        fun label(text: String, size: Float = 18f) = TextView(this).apply { this.text = text; textSize = size; setPadding(0, 12, 0, 12); page.addView(this) }
-        fun button(text: String, action: () -> Unit) = Button(this).apply { this.text = text; page.addView(this); setOnClickListener { action() } }
-        label("体感推球遥控", 28f)
-        label("屏幕向上、手机顶端朝前。校准后松手回正，看到车端就绪再按住使能。")
-        connectionLabel = label("未连接 · 组号 ${Protocol.GROUP_ID}")
-        button("扫描小车") { scan() }
-        devices = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; page.addView(this) }
-        button("断开连接") { disconnect("已断开") }
-        anglesLabel = label("等待姿态传感器")
-        button("水平校准 / 解除急停") {
-            held = false
-            if (sensorAvailable && now() - sampleMs < 100 && current[8] > 0.94f) {
-                reference = current.copyOf(); pitch = 0f; roll = 0f; estop = false
-                carLabel.text = "校准完成，请松手回正至少 0.3 秒"
-            } else carLabel.text = "请将手机屏幕朝上、接近水平，等待读数后重试"
-            sendLatest()
-        }
-        holdButton = button("按住使能 · 松手停车") {}
-        holdButton.setOnTouchListener { _, e ->
-            when (e.actionMasked) {
-                MotionEvent.ACTION_DOWN -> { held = ready && reference != null && !estop; sendLatest() }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> { held = false; sendLatest() }
-                MotionEvent.ACTION_MOVE -> if (e.x < 0 || e.y < 0 || e.x >= holdButton.width || e.y >= holdButton.height) { held = false; sendLatest() }
-            }
-            true
-        }
-        button("急停") { held = false; estop = true; sendLatest(); carLabel.text = "急停已锁定；回正后点击水平校准解除" }
-        carLabel = label("请连接小车")
-        sensors = getSystemService(SENSOR_SERVICE) as SensorManager
-        rotation = sensors.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR) ?: sensors.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-        if (rotation == null) anglesLabel.text = "手机没有可用的旋转矢量传感器，禁止控制"
+    override fun onCreate(state: Bundle?) {
+        super.onCreate(state); window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); window.statusBarColor = c("#0A1326"); window.navigationBarColor = c("#0A1326")
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(c("#081224")); setPadding(dp(20), dp(22), dp(20), dp(14)) }
+        setContentView(ScrollView(this).apply { addView(root) })
+        val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val title = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; layoutParams = LinearLayout.LayoutParams(0, -2, 1f) }
+        title.addView(label("GESTURE CAR", 24f, Color.WHITE, true)); title.addView(label("手机遥控驾驶台", 13f, c("#8FA8C8"))); header.addView(title)
+        val badge = label("● 未连接", 13f, c("#FFB4A8"), true).apply { setPadding(dp(12), dp(8), dp(12), dp(8)); background = bg(c("#301D2B"), 20) }; header.addView(badge); root.addView(header)
+        connectionLabel = label("等待连接 · 组号 " + Protocol.GROUP_ID, 13f, c("#9DB1CB")); root.addView(connectionLabel, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }; val scan = button("扫描小车") { scan() }; val cut = button("断开") { disconnect("已断开") }; actions.addView(scan, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(6) }); actions.addView(cut, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(6) }); root.addView(actions, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
+        devices = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }; root.addView(devices)
+        val card = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL; setPadding(dp(14), dp(18), dp(14), dp(18)); background = bg(c("#101F38"), 24, c("#203A5E")) }
+        card.addView(label("双轴虚拟摇杆", 17f, Color.WHITE, true)); card.addView(label("上推前进 · 下推后退 · 左右转向 · 松手停车", 12f, c("#8FA8C8")))
+        joystick = JoystickView(this).apply { listener = object : JoystickView.Listener {
+            override fun onMove(x: Float, y: Float) { roll = -x * 25f; pitch = -y * 25f; updateTelemetry() }
+            override fun onStart() { held = ready && !estop; unlockLabel.text = if (held) "控制中 · 松手立即停车" else "请先连接并解除急停"; sendLatest() }
+            override fun onEnd() { held = false; pitch = 0f; roll = 0f; unlockLabel.text = "摇杆已回中 · 电机停止"; sendLatest(); updateTelemetry() }
+        }; background = bg(c("#0B172C"), 22) }
+        card.addView(joystick, LinearLayout.LayoutParams(-1, dp(300)).apply { topMargin = dp(16) }); telemetryLabel = label("前进 0%    转向 0%", 13f, c("#B9CBE1")); telemetryLabel.gravity = Gravity.CENTER; card.addView(telemetryLabel, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) }); unlockLabel = label("连接后触摸摇杆开始控制", 13f, c("#6DE3FF")); unlockLabel.gravity = Gravity.CENTER; card.addView(unlockLabel, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }); root.addView(card, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(18) })
+        carLabel = label("车辆状态：等待连接", 14f, c("#C6D4E7")); carLabel.setPadding(dp(4), dp(14), dp(4), dp(4)); root.addView(carLabel)
+        val controls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }; val stop = button("急停") { held = false; estop = true; sendLatest(); unlockLabel.text = "急停已锁定 · 点击解除急停后再控制" }; val reset = button("解除急停") { estop = false; held = false; sendLatest(); unlockLabel.text = "急停已解除 · 触摸摇杆开始控制" }; controls.addView(stop, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(6) }); controls.addView(reset, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(6) }); root.addView(controls, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
     }
-    private val ticker = object : Runnable {
-        override fun run() {
-            if (!foreground) return
-            if (scanCallback != null && now() >= scanDeadline) stopScan()
-            if (gatt != null && !ready && now() - connectingSince > 10000) disconnect("连接或服务发现超时，请重试")
-            if (pending && now() - pendingSince >= 200) disconnect("控制写入超时，已断开")
-            sendLatest()
-            holdButton.isEnabled = ready && reference != null && !estop && sensorAvailable && now() - sampleMs < 100
-            anglesLabel.text = "前后倾：%.1f°    左右倾：%.1f°\n%s".format(pitch, roll, if (now()-sampleMs<100 && sensorAvailable) "姿态数据正常" else "姿态数据无效")
-            handler.postDelayed(this, 50)
-        }
-    }
-    override fun onResume() {
-        super.onResume(); foreground = true; held = false; reference = null; sampleMs = 0
-        sensorAvailable = rotation?.let { sensors.registerListener(this, it, 10000) } ?: false
-        handler.post(ticker)
-    }
-    override fun onPause() {
-        foreground = false; held = false; sendLatest(); disconnect("应用暂停，已停车并断开")
-        sensors.unregisterListener(this); sensorAvailable = false; handler.removeCallbacks(ticker)
-        super.onPause()
-    }
-    override fun onSensorChanged(event: SensorEvent) {
-        if (!foreground) return
-        val next = FloatArray(9)
-        SensorManager.getRotationMatrixFromVector(next, event.values)
-        if (next.any { !it.isFinite() }) { sensorAvailable = false; held = false; return }
-        current = next; sampleMs = event.timestamp / 1000000L; sensorAvailable = true
-        reference?.let { val angles = Tilt.relative(it, current); pitch = angles.first; roll = angles.second }
-    }
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) { }
-    private fun permissions(): Boolean {
-        val required = if (Build.VERSION.SDK_INT >= 31) arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
-            else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
-        val missing = required.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-        if (missing.isNotEmpty()) { requestPermissions(missing.toTypedArray(), 10); connectionLabel.text = "授权后再次点击扫描"; return false }
-        return true
-    }
-    private fun scan() {
-        if (!permissions()) return
-        disconnect("扫描中…")
-        val adapter = adapter()
-        if (adapter == null) { connectionLabel.text = "设备不支持蓝牙"; return }
-        if (!adapter.isEnabled) { startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)); return }
-        devices.removeAllViews(); found.clear()
-        val callback = object : ScanCallback() {
-            override fun onScanResult(type: Int, result: ScanResult) {
-                handler.post {
-                    if (scanCallback !== this || !foreground) return@post
-                    val group = result.scanRecord?.getManufacturerSpecificData(0xffff)
-                    if (group == null || group.size != 2 || ((group[0].toInt() and 255) or ((group[1].toInt() and 255) shl 8)) != Protocol.GROUP_ID) return@post
-                    if (found.add(result.device.address)) devices.addView(Button(this@MainActivity).apply {
-                        text = "连接 ${result.device.name ?: "GestureCar"} · ${result.device.address}"
-                        setOnClickListener { connect(result.device) }
-                    })
-                }
-            }
-            override fun onScanFailed(code: Int) { handler.post { if (scanCallback === this) { stopScan(); connectionLabel.text = "扫描失败：$code（旧版安卓请检查定位开关）" } } }
-        }
-        scanner = adapter.bluetoothLeScanner; scanCallback = callback; scanDeadline = now()+10000
-        try {
-            scanner?.startScan(listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(Protocol.SERVICE)).build()),
-                ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), callback)
-        } catch (e: RuntimeException) { stopScan(); connectionLabel.text = "无法扫描：${e.message}" }
-    }
-    private fun stopScan() {
-        val callback = scanCallback; scanCallback = null
-        try { if (callback != null) scanner?.stopScan(callback) } catch (_: RuntimeException) { }
-        scanner = null
-    }
-    private fun connect(device: BluetoothDevice) {
-        disconnect("正在连接 ${device.address}"); connectingSince = now()
-        try { gatt = device.connectGatt(this, false, callbacks, BluetoothDevice.TRANSPORT_LE) }
-        catch (e: RuntimeException) { disconnect("连接失败：${e.message}") }
-    }
-    private fun disconnect(message: String) {
-        stopScan(); held = false; ready = false; pending = false; control = null
-        val old = gatt; gatt = null
-        try { old?.disconnect(); old?.close() } catch (_: RuntimeException) { }
-        connectionLabel.text = message
-    }
+    private val ticker = object : Runnable { override fun run() { if (!foreground) return; if (scanCallback != null && now() >= scanDeadline) stopScan(); if (gatt != null && !ready && now() - connectingSince > 10000) disconnect("连接或服务发现超时，请重试"); if (pending && now() - pendingSince >= 200) disconnect("控制写入超时，已断开"); sendLatest(); updateTelemetry(); handler.postDelayed(this, 50) } }
+    private fun updateTelemetry() { if (::telemetryLabel.isInitialized) telemetryLabel.text = "前进 " + (-pitch / 25f * 100).toInt() + "%    转向 " + (roll / 25f * 100).toInt() + "%" }
+    override fun onResume() { super.onResume(); foreground = true; held = false; handler.post(ticker) }
+    override fun onPause() { foreground = false; held = false; sendLatest(); disconnect("应用暂停，已停车并断开"); handler.removeCallbacks(ticker); super.onPause() }
+    private fun permissions(): Boolean { val required = if (Build.VERSION.SDK_INT >= 31) arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT) else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION); val missing = required.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }; if (missing.isNotEmpty()) { requestPermissions(missing.toTypedArray(), 10); connectionLabel.text = "请先授予蓝牙权限，再点击扫描"; return false }; return true }
+    private fun scan() { if (!permissions()) return; disconnect("扫描中…"); val a = adapter(); if (a == null) { connectionLabel.text = "设备不支持蓝牙"; return }; if (!a.isEnabled) { startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)); return }; devices.removeAllViews(); found.clear(); val callback = object : ScanCallback() { override fun onScanResult(type: Int, result: ScanResult) { handler.post { if (scanCallback !== this || !foreground) return@post; val group = result.scanRecord?.getManufacturerSpecificData(0xffff); if (group == null || group.size != 2 || ((group[0].toInt() and 255) or ((group[1].toInt() and 255) shl 8)) != Protocol.GROUP_ID) return@post; if (found.add(result.device.address)) devices.addView(button("连接 " + (result.device.name ?: "GestureCar") + " · " + result.device.address) { connect(result.device) }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(6) }) } }; override fun onScanFailed(code: Int) { handler.post { if (scanCallback === this) { stopScan(); connectionLabel.text = "扫描失败：" + code } } } }; scanner = a.bluetoothLeScanner; scanCallback = callback; scanDeadline = now() + 10000; try { scanner?.startScan(listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(Protocol.SERVICE)).build()), ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), callback) } catch (e: RuntimeException) { stopScan(); connectionLabel.text = "无法扫描：" + e.message }; connectionLabel.text = "正在扫描 GestureCar…" }
+    private fun stopScan() { val callback = scanCallback; scanCallback = null; try { if (callback != null) scanner?.stopScan(callback) } catch (_: RuntimeException) {}; scanner = null }
+    private fun connect(device: BluetoothDevice) { disconnect("正在连接 " + device.address); connectingSince = now(); try { gatt = device.connectGatt(this, false, callbacks, BluetoothDevice.TRANSPORT_LE) } catch (e: RuntimeException) { disconnect("连接失败：" + e.message) } }
+    private fun disconnect(message: String) { stopScan(); held = false; ready = false; pending = false; control = null; val old = gatt; gatt = null; try { old?.disconnect(); old?.close() } catch (_: RuntimeException) {}; if (::connectionLabel.isInitialized) connectionLabel.text = message; if (::unlockLabel.isInitialized) unlockLabel.text = "连接后触摸摇杆开始控制" }
     private fun withGatt(g: BluetoothGatt, action: () -> Unit) { handler.post { if (gatt === g && foreground) action() } }
     private val callbacks = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(g: BluetoothGatt, status: Int, state: Int) = withGatt(g) {
-            if (status != BluetoothGatt.GATT_SUCCESS || state == BluetoothProfile.STATE_DISCONNECTED) disconnect("蓝牙断开（$status），请重新连接")
-            else if (state == BluetoothProfile.STATE_CONNECTED) {
-                connectingSince = now(); g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                if (!g.discoverServices()) disconnect("服务发现启动失败")
-            }
-        }
-        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) = withGatt(g) {
-            val service = g.getService(Protocol.SERVICE)
-            val c = service?.getCharacteristic(Protocol.CONTROL)
-            val s = service?.getCharacteristic(Protocol.STATUS)
-            val descriptor = s?.getDescriptor(Protocol.CCCD)
-            if (status != BluetoothGatt.GATT_SUCCESS || c == null || s == null || descriptor == null ||
-                (c.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) == 0) { disconnect("车端服务不兼容"); return@withGatt }
-            control = c
-            if (!g.setCharacteristicNotification(s, true)) { disconnect("状态通知启用失败"); return@withGatt }
-            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            if (!g.writeDescriptor(descriptor)) disconnect("订阅状态失败")
-        }
-        override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) = withGatt(g) {
-            if (status != BluetoothGatt.GATT_SUCCESS) disconnect("状态订阅失败：$status")
-            else { ready = true; held = false; connectionLabel.text = "已连接；请水平校准并等待车端就绪" }
-        }
-        override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) = withGatt(g) {
-            if (c.uuid == Protocol.CONTROL) { pending = false; if (status != BluetoothGatt.GATT_SUCCESS) disconnect("控制写入失败：$status") }
-        }
-        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
-            val bytes = c.value?.copyOf() ?: return
-            withGatt(g) { if (c.uuid == Protocol.STATUS) carLabel.text = Protocol.statusText(bytes) }
-        }
-        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
-            val bytes = value.copyOf()
-            withGatt(g) { if (c.uuid == Protocol.STATUS) carLabel.text = Protocol.statusText(bytes) }
-        }
+        override fun onConnectionStateChange(g: BluetoothGatt, status: Int, state: Int) = withGatt(g) { if (status != BluetoothGatt.GATT_SUCCESS || state == BluetoothProfile.STATE_DISCONNECTED) disconnect("蓝牙断开（" + status + "），请重新连接") else if (state == BluetoothProfile.STATE_CONNECTED) { connectingSince = now(); g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH); if (!g.discoverServices()) disconnect("服务发现启动失败") } }
+        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) = withGatt(g) { val service = g.getService(Protocol.SERVICE); val chr = service?.getCharacteristic(Protocol.CONTROL); val stat = service?.getCharacteristic(Protocol.STATUS); val descriptor = stat?.getDescriptor(Protocol.CCCD); if (status != BluetoothGatt.GATT_SUCCESS || chr == null || stat == null || descriptor == null || (chr.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) == 0) { disconnect("车端服务不兼容"); return@withGatt }; control = chr; if (!g.setCharacteristicNotification(stat, true)) { disconnect("状态通知启用失败"); return@withGatt }; descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE; if (!g.writeDescriptor(descriptor)) disconnect("订阅状态失败") }
+        override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) = withGatt(g) { if (status != BluetoothGatt.GATT_SUCCESS) disconnect("状态订阅失败：" + status) else { ready = true; held = false; connectionLabel.text = "已连接 · 等待车端就绪"; unlockLabel.text = "触摸摇杆开始控制" } }
+        override fun onCharacteristicWrite(g: BluetoothGatt, chr: BluetoothGattCharacteristic, status: Int) = withGatt(g) { if (chr.uuid == Protocol.CONTROL) { pending = false; if (status != BluetoothGatt.GATT_SUCCESS) disconnect("控制写入失败：" + status) } }
+        override fun onCharacteristicChanged(g: BluetoothGatt, chr: BluetoothGattCharacteristic) { val bytes = chr.value?.copyOf() ?: return; withGatt(g) { if (chr.uuid == Protocol.STATUS) carLabel.text = "车辆状态：" + Protocol.statusText(bytes) } }
+        override fun onCharacteristicChanged(g: BluetoothGatt, chr: BluetoothGattCharacteristic, value: ByteArray) { val bytes = value.copyOf(); withGatt(g) { if (chr.uuid == Protocol.STATUS) carLabel.text = "车辆状态：" + Protocol.statusText(bytes) } }
     }
-    private fun sendLatest() {
-        val g = gatt ?: return; val c = control ?: return
-        if (!ready || pending) return
-        val valid = foreground && sensorAvailable && reference != null && now() - sampleMs < 100
-        if (!valid) held = false
-        val bytes = Protocol.encode(++seq, now(), pitch, roll, valid, held, estop)
-        c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT; c.value = bytes
-        pending = true; pendingSince = now()
-        try { if (!g.writeCharacteristic(c)) disconnect("发送失败，已断开") }
-        catch (e: RuntimeException) { disconnect("发送异常：${e.message}") }
-    }
+    private fun sendLatest() { val g = gatt ?: return; val chr = control ?: return; if (!ready || pending) return; if (!foreground) held = false; val bytes = Protocol.encode(++seq, now(), pitch, roll, foreground, held, estop); chr.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT; chr.value = bytes; pending = true; pendingSince = now(); try { if (!g.writeCharacteristic(chr)) disconnect("发送失败，已断开") } catch (e: RuntimeException) { disconnect("发送异常：" + e.message) } }
 }

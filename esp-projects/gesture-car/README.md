@@ -18,4 +18,4 @@ COM6 仅作仓库现有串口示例，实际以设备管理器为准。构建目
 
 首次构建生成本机 `sdkconfig`。更改 `sdkconfig.defaults` 后，已有配置不自动被覆盖；用 `idf.py menuconfig` 同步修改，或保留备份后重新生成配置。不要烧写旧工程的二进制文件。
 
-正确日志标签为 `car`、`imu`、`ble`。GPIO 留空时会打印 `CONFIG MISSING`，这是预期行为。完成 MPU 校准、BLE 连接和松手回正后，状态才会进入 READY。
+正确日志标签为 `car`、`imu`、`ble`。GPIO 留空时会打印 `CONFIG MISSING`，这是预期行为。完成 MPU 校准、BLE 连接和松手回正后，车端状态才会进入 READY；安卓端的 `ready` 只表示 GATT 通知订阅完成，不是车端 READY。
