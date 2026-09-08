@@ -23,13 +23,13 @@
 #define BALL_TILT_HIGH_US 1750U
 #define BALL_SERVO_SETTLE_MS 700U
 #define BALL_SERVO_STAGGER_MS 700U
-#define BALL_SEARCH_TURN_SPEED 0.13f
-#define BALL_ALIGN_TURN_SPEED 0.12f
+#define BALL_SEARCH_TURN_SPEED 0.15f
+#define BALL_ALIGN_TURN_SPEED 0.13f
 #define BALL_MIN_RUN_SPEED 0.11f
 #define BALL_B_MIN_RUN_SPEED 0.13f
-#define BALL_CHARGE_A_SPEED 0.35f
-#define BALL_CHARGE_D_SPEED 0.38f
-#define BALL_CHARGE_MS 1200U
+#define BALL_CHARGE_A_SPEED 0.375f
+#define BALL_CHARGE_D_SPEED 0.385f
+#define BALL_CHARGE_MS 1500U
 #define BALL_SEARCH_TIMEOUT_MS 14000U
 #define BALL_ALIGN_TIMEOUT_MS 5000U
 #define BALL_ALIGN_TOLERANCE_PX 7
@@ -455,10 +455,10 @@ static void ball_next_search(int64_t now)
     ball_width = 0;
     ball_height = 0;
     ball_target_is_red = false;
-    ball_search_direction = 1;
+    ball_search_direction = -1;
     ball_target_miss_frames = 0;
     ball_drive_stop();
-    ESP_LOGI(TAG, "red complete; searching GREEN");
+    ESP_LOGI(TAG, "red complete; searching GREEN to the right first");
 }
 
 static void ball_begin_charge(int64_t now, ball_colour_t colour)
@@ -549,9 +549,10 @@ static void ball_process_frame(const uint8_t *frame, uint16_t width,
             ball_phase = BALL_DONE;
             ball_drive_stop();
         } else {
+            int fallback_direction = red_target ? -1 : 1;
             if (elapsed > (int64_t)BALL_SEARCH_TIMEOUT_MS * 500 &&
-                ball_search_direction > 0) {
-                ball_search_direction = -1;
+                ball_search_direction != fallback_direction) {
+                ball_search_direction = fallback_direction;
             }
             ball_drive_spin(ball_search_direction, BALL_SEARCH_TURN_SPEED);
         }

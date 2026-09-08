@@ -552,21 +552,24 @@ static void endpoint_ball_pause_controllers(void)
 //         帮助大弯/突然偏移时更快锁定，同时减少其它区域干扰；
 // 转向误差：始终以固定的“车头参考点”为基准（不随窗口移动），
 //         否则线永远在窗口中心、误差恒为 0 就不会转向
-#define BOX_Y0_FRAC             0.65f   // 扫描带上边界（减小可更早看到前方弯道）
+#define BOX_Y0_FRAC             0.55f   // 扫描带上边界（减小可更早看到前方弯道）
 #define BOX_Y1_FRAC             0.95f   // 扫描带下边界（相对高度）
-#define TRACK_WIN_W_FRAC        0.40f   // 动态检测窗宽度（相对画面宽）
+#define TRACK_WIN_W_FRAC        0.50f   // 动态检测窗宽度（相对画面宽）
 #define TRACK_CENTER_MIN_FRAC   0.30f   // 窗口中心允许的最小 x
 #define TRACK_CENTER_MAX_FRAC   0.70f   // 窗口中心允许的最大 x
 #define STEER_REF_FRAC          0.53f   // 固定转向基准点 x（车头参考）
 #define ERR_SCALE_FRAC          0.30f   // 误差归一化尺度（约等于原框半宽）
 #define RECOVERY_X_MARGIN       0.08f   // 主窗左右扩展的“找回带”宽度
-#define LINE_LUMA_MAX_CAP       170     // 自适应阈值上限（防过曝误判）
+#define LINE_LUMA_MAX_CAP       110     // 自适应阈值上限（防过曝误判）
 #define ALL_BLACK_RATIO         0.90f   // 黑像素占比达到此值视为“全黑停车”
 #define LINE_LOST_RATIO         0.02f   // 框内黑像素占比低于此值视为丢线
 #define CAM_IMAGE_MIRROR        1       // 1=画面水平翻转（实测左右反了）
 #define LINE_MIN_BLACK_PIXELS   8       // 框内至少多少个黑像素才算找到线
-#define BASE_SPEED              0.32f   // 循迹前进速度（0~1）
+#define BASE_SPEED              0.30f   // 循迹前进速度（0~1）
 #define POST_AVOID_LINE_SPEED   0.26f   // 避障后巡向 END 的专用低速
+#define NORMAL_TRACTION_BOOST_SPEED     0.60f
+#define NORMAL_TRACTION_BOOST_MS        50U
+#define NORMAL_TRACTION_BOOST_PERIOD_MS 500U
 #define CTRL_PERIOD_MS          50      // 控制周期
 
 static volatile int vision_ready = 0;        // 处理过第一帧后才允许出车
@@ -1259,13 +1262,15 @@ static void ball_approach_task(void *arg)
  *       混合结果；控制周期(50ms)远慢于帧抖动且误差另有平滑，实测可以接受
  */
 #define END_BLACK_RATIO       0.08f  // END 判定：动态巡线框内黑色像素占比阈值
-#define END_ROW_SPAN_RATIO    0.50f  // T 横杆连续黑段至少横跨动态巡线框的 50%
+#define END_ROW_SPAN_RATIO    0.35f  // T 横杆连续黑段至少横跨动态巡线框的 35%
+#define END_DIAGONAL_SPAN_RATIO 0.45f
 #define END_WIDE_ROWS_MIN        2U  // 横杆至少持续两行，排除单行噪点
 #define END_CONFIRM_FRAMES       1U  // 行驶中 T 口只短暂出现，首张有效帧立即确认
 
 static volatile int line_end_armed = 0;
 static volatile int line_end_candidate = 0;
 static volatile uint16_t line_end_wide_rows = 0;
+static volatile uint16_t line_end_black_span = 0;
 static volatile uint32_t line_follow_reset_seq = 0;
 
 static void detect_line_from_rgb565(const uint8_t *buf, uint32_t w, uint32_t h)
@@ -1316,7 +1321,11 @@ static void detect_line_from_rgb565(const uint8_t *buf, uint32_t w, uint32_t h)
     int64_t sum_x = 0;
     uint32_t black_cnt = 0, sample_cnt = 0;
     uint32_t end_wide_rows = 0;
+    int end_black_min_x = x1;
+    int end_black_max_x = x0 - 1;
     int end_min_row_span = (int)((x1 - x0) * END_ROW_SPAN_RATIO);
+    int end_min_diagonal_span =
+        (int)((x1 - x0) * END_DIAGONAL_SPAN_RATIO);
     for (int y = y0; y < y1; y++) {
         const uint8_t *row = buf + (size_t)y * w * 2;
         int black_run = 0, max_black_run = 0;
@@ -1326,6 +1335,8 @@ static void detect_line_from_rgb565(const uint8_t *buf, uint32_t w, uint32_t h)
             if (luma < thr) {
                 sum_x += x;
                 black_cnt++;
+                if (x < end_black_min_x) end_black_min_x = x;
+                if (x > end_black_max_x) end_black_max_x = x;
                 black_run++;
                 if (black_run > max_black_run) max_black_run = black_run;
             } else {
@@ -1336,10 +1347,14 @@ static void detect_line_from_rgb565(const uint8_t *buf, uint32_t w, uint32_t h)
     }
     line_black_ratio = sample_cnt ? (float)black_cnt / (float)sample_cnt : 0.0f;
     line_end_wide_rows = (uint16_t)end_wide_rows;
+    int end_black_span = end_black_max_x >= end_black_min_x ?
+                         end_black_max_x - end_black_min_x + 1 : 0;
+    line_end_black_span = (uint16_t)end_black_span;
     if (!line_end_armed) {
         line_end_candidate = 0;
     } else if (line_black_ratio >= END_BLACK_RATIO &&
-               end_wide_rows >= END_WIDE_ROWS_MIN) {
+               (end_wide_rows >= END_WIDE_ROWS_MIN ||
+                end_black_span >= end_min_diagonal_span)) {
         // 单帧命中后锁存，避免较慢的超声波任务尚未读取就被下一帧覆盖。
         line_end_candidate = 1;
     }
@@ -1624,11 +1639,18 @@ static void overlay_detected_ball(uint8_t *scaled, uint32_t img_w, uint32_t img_
 #define TURN_PULSE_MS       100     // 每次短促转向的最长持续时间（减小单次转向幅度）
 #define TURN_PULSE_SPEED    0.21f  // 短促转向速度
 #define OBSERVE_HOLD_MS     180    // 一次转向后原地停住的观察时间（0.1s）
+#define POST_TURN_SLOW_SPEED 0.18f // 转弯后短距离低速，给下一个近距离弯道留出识别时间
+#define POST_TURN_SLOW_MS   1500U
 #define SEARCH_TURN_SPEED   0.20f  // 丢线时搜索转向速度
 #define STEER_DEADBAND      0.25f   // 回差退出阈值：|err|<此值停止转向
-#define STEER_TRIGGER_ERR   0.40f   // 回差触发阈值：|err|>=此值才开始转向
+#define STEER_TRIGGER_ERR   0.30f   // 回差触发阈值：|err|>=此值才开始转向
 #define ERR_SMOOTH_K        0.40f   // 误差平滑系数（0~1，越小越平滑）
 #define TURN_CONFIRM_FRAMES 2U      // 连续多少张不同摄像头帧同向，才开始转向
+#define START_LINE_CONFIRM_FRAMES 3U
+#define ENABLE_LINE_LOST_SEARCH 1
+#define FIRST_LOST_RIGHT_MS 600U
+#define FIRST_LOST_RIGHT_SIGN (-1.0f)
+#define FIRST_LOST_FORWARD_MS 1200U
 
 static volatile int avoid_active = 0;       // 1=避障任务接管电机（循迹任务暂停）
 
@@ -1671,12 +1693,26 @@ static void line_follow_task(void *arg)
     int last_omega_dir = 1;  // 最近一次转向输出的方向（+1/-1），丢线时保持该方向
     int64_t pulse_start = 0; // 本次短促转向开始时刻
     int64_t hold_end = 0;    // 转向结束后的原地观察截止时刻
+    int64_t post_turn_slow_end = 0;
     float smooth_err = 0.0f; // 平滑后的误差
     int smooth_init = 0;     // 平滑器是否已初始化
     int in_turn = 0;         // 是否处于“转向修正”中（配合回差）
     int active_turn_dir = 1; // 一次转向脉冲内锁定的方向
     int pending_turn_dir = 0;
     uint32_t pending_turn_frames = 0;
+    int tracking_started = 0;
+    uint32_t start_line_confirm_frames = 0;
+    uint32_t start_line_frame_seq = line_frame_seq;
+    int first_lost_pending = 1;
+    int first_lost_turning = 0;
+    int64_t first_lost_turn_end = 0;
+    int first_lost_forwarding = 0;
+    int64_t first_lost_forward_end = 0;
+    int first_lost_waiting_line = 0;
+    uint32_t first_lost_wait_frames = 0;
+    uint32_t first_lost_wait_frame_seq = line_frame_seq;
+    int normal_forwarding = 0;
+    int64_t normal_boost_cycle_start = 0;
     uint32_t last_turn_frame_seq = 0;
     uint32_t last_reset_seq = line_follow_reset_seq;
     int log_cnt = 0;
@@ -1687,11 +1723,19 @@ static void line_follow_task(void *arg)
             last_reset_seq = reset_seq;
             pulse_start = 0;
             hold_end = 0;
+            post_turn_slow_end = 0;
             smooth_err = 0.0f;
             smooth_init = 0;
             in_turn = 0;
             pending_turn_dir = 0;
             pending_turn_frames = 0;
+            first_lost_forwarding = 0;
+            first_lost_forward_end = 0;
+            first_lost_waiting_line = 0;
+            first_lost_wait_frames = 0;
+            first_lost_wait_frame_seq = line_frame_seq;
+            normal_forwarding = 0;
+            normal_boost_cycle_start = 0;
             last_turn_frame_seq = line_frame_seq;
             ESP_LOGI(TAG, "line: controller state reset after obstacle");
         }
@@ -1708,6 +1752,28 @@ static void line_follow_task(void *arg)
             continue;
         }
 
+        if (!tracking_started) {
+            uint32_t frame_seq = line_frame_seq;
+            if (frame_seq != start_line_frame_seq) {
+                start_line_frame_seq = frame_seq;
+                if (line_found) {
+                    if (start_line_confirm_frames < START_LINE_CONFIRM_FRAMES) {
+                        start_line_confirm_frames++;
+                    }
+                } else {
+                    start_line_confirm_frames = 0;
+                }
+            }
+            for (int i = 0; i < MOTOR_COUNT; i++) set_motor_speed(i, 0.0f);
+            if (start_line_confirm_frames >= START_LINE_CONFIRM_FRAMES) {
+                tracking_started = 1;
+                last_turn_frame_seq = line_frame_seq;
+                ESP_LOGI(TAG, "line: startup line confirmed -> enable motion");
+            }
+            vTaskDelay(pdMS_TO_TICKS(CTRL_PERIOD_MS));
+            continue;
+        }
+
         float vx, omega;
 
         if (line_end_armed && line_end_candidate) {
@@ -1718,14 +1784,88 @@ static void line_follow_task(void *arg)
             in_turn = 0;
             pending_turn_dir = 0;
             pending_turn_frames = 0;
-        } else if (!line_found) {
-            // 丢线：保持上一次转向方向原地搜索，直到找回黑线
+        } else if (first_lost_turning) {
             vx = 0.0f;
-            omega = last_omega_dir * SEARCH_TURN_SPEED;
             smooth_init = 0;
             in_turn = 0;
             pending_turn_dir = 0;
             pending_turn_frames = 0;
+            int64_t now = esp_timer_get_time();
+            bool line_reacquired_centered =
+                line_found && fabsf(line_err) < STEER_TRIGGER_ERR;
+            if (now < first_lost_turn_end && !line_reacquired_centered) {
+                omega = FIRST_LOST_RIGHT_SIGN * SEARCH_TURN_SPEED;
+            } else {
+                vx = BASE_SPEED;
+                omega = 0.0f;
+                first_lost_turning = 0;
+                first_lost_forwarding = 1;
+                first_lost_forward_end =
+                    now + (int64_t)FIRST_LOST_FORWARD_MS * 1000;
+                last_turn_frame_seq = line_frame_seq;
+                ESP_LOGI(TAG, "line: first LOST right turn done (%s) -> forward %ums",
+                         line_reacquired_centered ? "line centered" : "timeout",
+                         (unsigned)FIRST_LOST_FORWARD_MS);
+            }
+        } else if (first_lost_forwarding) {
+            smooth_init = 0;
+            in_turn = 0;
+            pending_turn_dir = 0;
+            pending_turn_frames = 0;
+            omega = 0.0f;
+            if (esp_timer_get_time() < first_lost_forward_end) {
+                vx = BASE_SPEED;
+            } else {
+                vx = 0.0f;
+                first_lost_forwarding = 0;
+                first_lost_waiting_line = 1;
+                first_lost_wait_frames = 0;
+                first_lost_wait_frame_seq = line_frame_seq;
+                last_turn_frame_seq = line_frame_seq;
+                ESP_LOGI(TAG, "line: first LOST forward done -> stop and wait for line");
+            }
+        } else if (first_lost_waiting_line) {
+            vx = 0.0f;
+            omega = 0.0f;
+            smooth_init = 0;
+            in_turn = 0;
+            pending_turn_dir = 0;
+            pending_turn_frames = 0;
+            uint32_t frame_seq = line_frame_seq;
+            if (frame_seq != first_lost_wait_frame_seq) {
+                first_lost_wait_frame_seq = frame_seq;
+                if (line_found && line_black_ratio < ALL_BLACK_RATIO) {
+                    if (first_lost_wait_frames < START_LINE_CONFIRM_FRAMES) {
+                        first_lost_wait_frames++;
+                    }
+                } else {
+                    first_lost_wait_frames = 0;
+                }
+            }
+            if (first_lost_wait_frames >= START_LINE_CONFIRM_FRAMES) {
+                first_lost_waiting_line = 0;
+                last_turn_frame_seq = line_frame_seq;
+                ESP_LOGI(TAG, "line: line confirmed after forced route -> resume NORMAL");
+            }
+        } else if (!line_found) {
+            vx = 0.0f;
+            smooth_init = 0;
+            in_turn = 0;
+            pending_turn_dir = 0;
+            pending_turn_frames = 0;
+            if (first_lost_pending && !line_end_armed) {
+                first_lost_pending = 0;
+                first_lost_turning = 1;
+                first_lost_turn_end =
+                    esp_timer_get_time() + (int64_t)FIRST_LOST_RIGHT_MS * 1000;
+                last_omega_dir = -1;
+                omega = FIRST_LOST_RIGHT_SIGN * SEARCH_TURN_SPEED;
+                ESP_LOGW(TAG, "line: first LOST -> force right for %ums",
+                         (unsigned)FIRST_LOST_RIGHT_MS);
+            } else {
+                omega = ENABLE_LINE_LOST_SEARCH ?
+                        last_omega_dir * SEARCH_TURN_SPEED : 0.0f;
+            }
         } else if (line_black_ratio >= ALL_BLACK_RATIO) {
             // 全黑停车
             vx = 0.0f;
@@ -1783,6 +1923,7 @@ static void line_follow_task(void *arg)
                             (now - pulse_start) >= (int64_t)TURN_PULSE_MS * 1000)) {
                 in_turn = 0;
                 hold_end = now + (int64_t)OBSERVE_HOLD_MS * 1000;   // 原地观察 0.1s
+                post_turn_slow_end = hold_end + (int64_t)POST_TURN_SLOW_MS * 1000;
             }
 
             if (!in_turn) {
@@ -1794,6 +1935,9 @@ static void line_follow_task(void *arg)
                 } else {
                     // 观察结束：正常直行
                     vx = line_end_armed ? POST_AVOID_LINE_SPEED : BASE_SPEED;
+                    if (now < post_turn_slow_end && vx > POST_TURN_SLOW_SPEED) {
+                        vx = POST_TURN_SLOW_SPEED;
+                    }
                     omega = 0.0f;
                 }
             } else {
@@ -1801,6 +1945,28 @@ static void line_follow_task(void *arg)
                 omega = active_turn_dir * TURN_PULSE_SPEED;
                 vx = 0.0f;
             }
+        }
+
+        int64_t drive_now = esp_timer_get_time();
+        if (vx > 0.0f && omega == 0.0f && !first_lost_forwarding &&
+            drive_now >= post_turn_slow_end) {
+            if (!normal_forwarding) {
+                normal_forwarding = 1;
+                normal_boost_cycle_start = drive_now;
+            }
+            int64_t boost_elapsed = drive_now - normal_boost_cycle_start;
+            if (boost_elapsed >=
+                (int64_t)NORMAL_TRACTION_BOOST_PERIOD_MS * 1000) {
+                normal_boost_cycle_start = drive_now;
+                boost_elapsed = 0;
+            }
+            if (boost_elapsed < (int64_t)NORMAL_TRACTION_BOOST_MS * 1000 &&
+                vx < NORMAL_TRACTION_BOOST_SPEED) {
+                vx = NORMAL_TRACTION_BOOST_SPEED;
+            }
+        } else {
+            normal_forwarding = 0;
+            normal_boost_cycle_start = 0;
         }
 
         // 轮速解算：原地旋转（vx=0且ω≠0）三轮同速同向；其它情况只用两个前轮
@@ -1832,33 +1998,41 @@ static void line_follow_task(void *arg)
 #define ULTRASONIC_MIN_CM              2.0f
 #define ULTRASONIC_MAX_CM            400.0f
 #define ULTRASONIC_PERIOD_MS          20U
-#define AVOID_TRIGGER_CM              13.0f   // 距离小于此值触发避障
+#define AVOID_TRIGGER_CM              11.0f   // 距离小于此值触发避障
 #define AVOID_CLOSE_CONFIRM_SAMPLES    2U
-#define AVOID_BRAKE_MS               500U
-#define AVOID_LEFT_MS               1000U
+#define AVOID_BRAKE_MS               800U
+#define AVOID_STAGE_BRAKE_MS         800U
+#define POST_AVOID_BRAKE_MS          800U
+#define AVOID_LEFT_MS               1200U
 #define AVOID_FWD_MS                1600U
-#define AVOID_RIGHT_MS              1350U
-#define AVOID_BACK_MS               1000U
+#define AVOID_RIGHT_MS              750U
+#define AVOID_BACK_MS               0U
 
 // 原测试参数按百分比归一化；A/B/D 分轮设置，避免统一系数破坏实测比例。
-#define AVOID_LEFT_A_SPEED            0.30f
-#define AVOID_LEFT_B_SPEED            0.43f
-#define AVOID_LEFT_D_SPEED            0.28f
-#define AVOID_RIGHT_A_SPEED           0.18f
-#define AVOID_RIGHT_B_SPEED           0.35f
-#define AVOID_RIGHT_D_SPEED           0.24f
-#define AVOID_FWD_A_SPEED             0.24f
-#define AVOID_FWD_D_SPEED             0.27f
+#define AVOID_LEFT_A_SPEED            0.0f
+#define AVOID_LEFT_B_SPEED            0.40f
+#define AVOID_LEFT_D_SPEED            0.40f
+#define AVOID_RIGHT_A_SPEED           0.40f
+#define AVOID_RIGHT_B_SPEED           0.40f
+#define AVOID_RIGHT_D_SPEED           0.0f
+#define AVOID_FWD_A_SPEED             0.358f
+#define AVOID_FWD_D_SPEED             0.36f
+#define END_FORWARD_A_SPEED           0.24f
+#define END_FORWARD_D_SPEED           0.27f
+#define END_FORWARD_MS               800U
 #define BALL_POWER_RECOVERY_MS       1000U
 
 typedef enum {
     AV_NORMAL,
     AV_BRAKE,
+    AV_STAGE_BRAKE,
     AV_LEFT,
     AV_FWD,
     AV_RIGHT,
     AV_BACK,
+    AV_POST_AVOID_BRAKE,
     AV_LINE_TO_END,
+    AV_END_FORWARD,
 } avoid_state_t;
 
 /**
@@ -1884,14 +2058,16 @@ static void set_avoid_wheel_speed(float a, float b, float d)
  *   AV_NORMAL --连续 AVOID_CLOSE_CONFIRM_SAMPLES 次 dist<AVOID_TRIGGER_CM--> AV_BRAKE
  *   --> AV_LEFT（固定左平移 AVOID_LEFT_MS）--> AV_FWD（固定前进 AVOID_FWD_MS）
  *   --> AV_RIGHT（固定右平移 AVOID_RIGHT_MS）--> AV_BACK（固定后退 AVOID_BACK_MS）
- *   --> AV_LINE_TO_END（恢复巡线，首张满足 T 横杆判据的有效帧）--> 找球程序。
+ *   --> AV_LINE_TO_END（恢复巡线，首张满足 T 横杆判据的有效帧）
+ *   --> AV_END_FORWARD（A=24%、D=27% 前进 1s）--> 停车并进入找球程序。
  *
  * 和循迹的分工：一进 AV_BRAKE 就置 avoid_active=1，line_follow_task 立刻松手，整个避障过程
- * 由本任务独占电机；右平移结束后清除旧控制状态并恢复巡线，只在 END 确认后再次接管。
+ * 由本任务独占电机；后退结束后清除旧控制状态并恢复巡线，END 确认后再次接管。
  */
 static void avoid_task(void *arg)
 {
     avoid_state_t st = AV_NORMAL;
+    avoid_state_t brake_next_state = AV_LEFT;
     int64_t phase_start = 0;
     uint32_t end_confirm_frames = 0;
     uint32_t last_end_frame_seq = 0;
@@ -1935,12 +2111,24 @@ static void avoid_task(void *arg)
             }
             break;
 
+        case AV_STAGE_BRAKE:
+            set_avoid_wheel_speed(0.0f, 0.0f, 0.0f);
+            if (esp_timer_get_time() - phase_start >= AVOID_STAGE_BRAKE_MS * 1000) {
+                st = brake_next_state;
+                phase_start = esp_timer_get_time();
+                ESP_LOGI(TAG, "avoid: stage brake done -> st=%d", (int)st);
+            }
+            break;
+
         case AV_LEFT:
             set_avoid_wheel_speed(AVOID_LEFT_A_SPEED, -AVOID_LEFT_B_SPEED,
                                   AVOID_LEFT_D_SPEED);
             if (esp_timer_get_time() - phase_start >= AVOID_LEFT_MS * 1000) {
-                ESP_LOGI(TAG, "avoid: left fixed-time done -> forward dash");
-                st = AV_FWD;
+                set_avoid_wheel_speed(0.0f, 0.0f, 0.0f);
+                ESP_LOGI(TAG, "avoid: left done -> brake %ums",
+                         (unsigned)AVOID_STAGE_BRAKE_MS);
+                brake_next_state = AV_FWD;
+                st = AV_STAGE_BRAKE;
                 phase_start = esp_timer_get_time();
             }
             break;
@@ -1949,29 +2137,44 @@ static void avoid_task(void *arg)
             // 前冲：直行一段固定时间（寻线仍关闭）
             set_avoid_wheel_speed(AVOID_FWD_A_SPEED, 0.0f, -AVOID_FWD_D_SPEED);
             if (esp_timer_get_time() - phase_start >= AVOID_FWD_MS * 1000) {
-                ESP_LOGI(TAG, "avoid: forward done -> right translate");
-                st = AV_RIGHT;
+                set_avoid_wheel_speed(0.0f, 0.0f, 0.0f);
+                ESP_LOGI(TAG, "avoid: forward done -> brake %ums",
+                         (unsigned)AVOID_STAGE_BRAKE_MS);
+                brake_next_state = AV_RIGHT;
+                st = AV_STAGE_BRAKE;
                 phase_start = esp_timer_get_time();
             }
             break;
 
         case AV_RIGHT:
-            // 右平移结束后先按避障前进轮速的反方向后退 0.8 秒。
+            // 右平移结束后按避障前进轮速的反方向后退 AVOID_BACK_MS。
             set_avoid_wheel_speed(-AVOID_RIGHT_A_SPEED, AVOID_RIGHT_B_SPEED,
                                   -AVOID_RIGHT_D_SPEED);
             if (esp_timer_get_time() - phase_start >= AVOID_RIGHT_MS * 1000) {
-                ESP_LOGI(TAG, "avoid: right done -> backward %ums",
-                         (unsigned)AVOID_BACK_MS);
-                st = AV_BACK;
+                set_avoid_wheel_speed(0.0f, 0.0f, 0.0f);
+                ESP_LOGI(TAG, "avoid: right done -> brake %ums",
+                         (unsigned)AVOID_STAGE_BRAKE_MS);
+                brake_next_state = AV_BACK;
+                st = AV_STAGE_BRAKE;
                 phase_start = esp_timer_get_time();
             }
             break;
 
         case AV_BACK:
-            // 避障前进为 A 正、D 负；后退必须整体反号：A=-0.24、D=+0.27。
+            // 避障前进为 A 正、D 负；后退必须整体反号。
             set_avoid_wheel_speed(-AVOID_FWD_A_SPEED, 0.0f, AVOID_FWD_D_SPEED);
             if (esp_timer_get_time() - phase_start >= AVOID_BACK_MS * 1000) {
                 set_avoid_wheel_speed(0.0f, 0.0f, 0.0f);
+                ESP_LOGI(TAG, "avoid: route done -> brake %ums",
+                         (unsigned)POST_AVOID_BRAKE_MS);
+                st = AV_POST_AVOID_BRAKE;
+                phase_start = esp_timer_get_time();
+            }
+            break;
+
+        case AV_POST_AVOID_BRAKE:
+            set_avoid_wheel_speed(0.0f, 0.0f, 0.0f);
+            if (esp_timer_get_time() - phase_start >= POST_AVOID_BRAKE_MS * 1000) {
                 track_cx = -1.0f;
                 line_end_candidate = 0;
                 line_end_armed = 1;
@@ -1982,7 +2185,7 @@ static void avoid_task(void *arg)
                 if (line_follow_task_handle != NULL) {
                     vTaskResume(line_follow_task_handle);
                 }
-                ESP_LOGI(TAG, "avoid: backward done -> resume camera line-follow to END");
+                ESP_LOGI(TAG, "avoid: post-route brake done -> resume camera line-follow to END");
                 st = AV_LINE_TO_END;
             }
             break;
@@ -1996,9 +2199,10 @@ static void avoid_task(void *arg)
                 } else {
                     end_confirm_frames = 0;
                 }
-                ESP_LOGI(TAG, "end: black=%.0f%% wide_rows=%u candidate=%d confirm=%u/%u",
+                ESP_LOGI(TAG, "end: black=%.0f%% wide_rows=%u span=%u candidate=%d confirm=%u/%u",
                          line_black_ratio * 100.0f, (unsigned)line_end_wide_rows,
-                         line_end_candidate, (unsigned)end_confirm_frames,
+                         (unsigned)line_end_black_span, line_end_candidate,
+                         (unsigned)end_confirm_frames,
                          (unsigned)END_CONFIRM_FRAMES);
             }
 
@@ -2009,8 +2213,20 @@ static void avoid_task(void *arg)
                 if (line_follow_task_handle != NULL) {
                     vTaskSuspend(line_follow_task_handle);
                 }
+                ESP_LOGI(TAG, "end: confirmed -> final forward A24 D27 for %ums",
+                         (unsigned)END_FORWARD_MS);
+                st = AV_END_FORWARD;
+                phase_start = esp_timer_get_time();
+            }
+            break;
+        }
+
+        case AV_END_FORWARD:
+            set_avoid_wheel_speed(END_FORWARD_A_SPEED, 0.0f,
+                                  -END_FORWARD_D_SPEED);
+            if (esp_timer_get_time() - phase_start >= END_FORWARD_MS * 1000) {
                 endpoint_ball_stop();
-                ESP_LOGI(TAG, "end: confirmed -> power recovery %ums",
+                ESP_LOGI(TAG, "end: final forward stopped -> power recovery %ums",
                          (unsigned)BALL_POWER_RECOVERY_MS);
                 vTaskDelay(pdMS_TO_TICKS(BALL_POWER_RECOVERY_MS));
                 ESP_LOGI(TAG, "end: power recovered -> start ball program");
@@ -2019,7 +2235,6 @@ static void avoid_task(void *arg)
                 return;
             }
             break;
-        }
         }
 
         if (++dbg_cnt >= 3) {
