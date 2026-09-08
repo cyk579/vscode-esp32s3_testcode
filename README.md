@@ -6,6 +6,8 @@
 
 ## 工程目录
 
+新增创新实验：[单 S3＋安卓手机体感推球小车](esp-projects/gesture-common/README.md)。车端打开 `Gesture-Car.code-workspace`；所有新实验外设 GPIO 留作待填，填写并核对接线后才能行驶。
+
 | 工程 | 功能 |
 | --- | --- |
 | `esp-projects/car-spin` | 三轮小车电机控制、四路红外检测与巡线 |

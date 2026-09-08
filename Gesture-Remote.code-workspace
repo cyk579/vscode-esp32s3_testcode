@@ -1,0 +1,8 @@
+{
+    "folders": [{"name": "Gesture Remote (ESP32-S3)", "path": "esp-projects/gesture-remote"}],
+    "settings": {
+        "idf.buildPath": "${workspaceFolder}/build-local",
+        "idf.buildPathWin": "${workspaceFolder}/build-local",
+        "idf.customExtraVars": {"PYTHONUTF8": "1"}
+    }
+}

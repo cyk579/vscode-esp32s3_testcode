@@ -1,0 +1,6 @@
+menu "Gesture experiment"
+config GESTURE_GROUP_ID
+    int "Car/remote group ID (same on both boards and Android)"
+    range 1 65535
+    default 1
+endmenu
