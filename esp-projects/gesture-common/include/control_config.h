@@ -7,9 +7,6 @@
 #define CONTROL_MAX_TILT_DEG 60.0f
 #define CONTROL_MAX_PWM 30.0f
 #define CONTROL_SLEW_PWM_PER_SECOND 60.0f
-/* Initial estimates from existing car documentation; measure again with payload. */
-#define CONTROL_FLOOR_AD 11.0f
-#define CONTROL_FLOOR_B 13.0f
 #define IMU_STALE_MS 100u
 #define CAR_TILT_LIMIT_DEG 30.0f
 #define CAR_TILT_HOLD_MS 200u

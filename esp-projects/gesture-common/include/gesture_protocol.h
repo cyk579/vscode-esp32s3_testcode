@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define GESTURE_FRAME_SIZE 12
+#define GESTURE_FRAME_SIZE 14
 #define GESTURE_VERSION 1
 #define GESTURE_VALID 1u
 #define GESTURE_HELD 2u
@@ -18,7 +18,8 @@ typedef struct {
     uint8_t flags;
     uint16_t sequence;
     int16_t pitch_cd; /* positive = forward tilt */
-    int16_t roll_cd;  /* positive = left tilt */
+    int16_t roll_cd;  /* positive = left translation */
+    int16_t yaw_cd;   /* positive = counter-clockwise rotation */
     uint32_t uptime_ms;
 } gesture_frame_t;
 void gesture_encode(const gesture_frame_t *frame, uint8_t out[GESTURE_FRAME_SIZE]);

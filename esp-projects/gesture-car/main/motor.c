@@ -47,7 +47,6 @@ esp_err_t motor_apply(const float pwm[3],bool enabled) {
     esp_err_t err;
     for(int i=0;i<3;++i) {
         float p=pwm[i]*signs[i];
-        if(fabsf(p)<(i==1?CONTROL_FLOOR_B:CONTROL_FLOOR_AD)) p=0;
         int direction=(p>0)-(p<0);
         if(direction!=directions[i]) {
             if((err=duty(i,0))!=ESP_OK) goto failed;

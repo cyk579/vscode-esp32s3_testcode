@@ -17,4 +17,4 @@ void gesture_control_fault(gesture_control_t *c, bool fault);
 bool gesture_control_receive(gesture_control_t *c, const gesture_frame_t *f, uint32_t now);
 void gesture_control_step(gesture_control_t *c, uint32_t now, float dt_seconds);
 float gesture_axis(float angle_deg);
-void gesture_mix(float forward, float turn, float out[3]);
+void gesture_mix(float forward, float lateral, float yaw, float out[3]);

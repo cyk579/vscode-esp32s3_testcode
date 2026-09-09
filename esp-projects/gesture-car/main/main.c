@@ -31,7 +31,7 @@ static void status(uint8_t out[12]) {
     out[4]=(uint8_t)c.frame.pitch_cd; out[5]=(uint8_t)((uint16_t)c.frame.pitch_cd>>8);
     out[6]=(uint8_t)c.frame.roll_cd; out[7]=(uint8_t)((uint16_t)c.frame.roll_cd>>8);
     for(int i=0;i<3;++i) out[8+i]=(uint8_t)(int8_t)lroundf(c.pwm[i]);
-    out[11]=0;
+    out[11]=(uint8_t)gesture_imu_health();
 }
 static void control_task(void *arg) {
     (void)arg; TickType_t wake=xTaskGetTickCount(); uint32_t previous=now_ms(), tilt_since=0;
@@ -68,7 +68,11 @@ static void display_task(void *arg) {
 #endif
     for(;;) {
         uint8_t s[12]; status(s);
-        ESP_LOGI("car","state=%u fault=%u pwm=%d,%d,%d",s[1],s[2],(int8_t)s[8],(int8_t)s[9],(int8_t)s[10]);
+        portENTER_CRITICAL(&lock); gesture_control_t snapshot=control; portEXIT_CRITICAL(&lock);
+        ESP_LOGI("car","omni2 state=%u fault=%u imu=%u seq=%u flags=%u cmd=%d,%d,%d age=%lu pwm=%d,%d,%d",
+            s[1],s[2],s[11],snapshot.frame.sequence,snapshot.frame.flags,
+            snapshot.frame.pitch_cd,snapshot.frame.roll_cd,snapshot.frame.yaw_cd,
+            (unsigned long)(now_ms()-snapshot.last_rx),(int8_t)s[8],(int8_t)s[9],(int8_t)s[10]);
 #if ENABLE_TFT
         if(screen) {
             char a[28],b[28],c[28];
@@ -103,12 +107,15 @@ void app_main(void) {
     esp_err_t err=motor_init();
     if(err!=ESP_OK) { motor_stop(); ESP_LOGE("car","Motor init: %s",esp_err_to_name(err)); return; }
 #if ENABLE_CAR_IMU
+    bool imu_init_ok = false;
     gesture_imu_config_t imu={ .sda=PIN_IMU_SDA,.scl=PIN_IMU_SCL,
         .axis={IMU_AXIS_X,IMU_AXIS_Y,IMU_AXIS_Z},.sign={IMU_SIGN_X,IMU_SIGN_Y,IMU_SIGN_Z} };
     err=gesture_imu_start(&imu);
-    if(err!=ESP_OK) { motor_stop(); ESP_LOGE("car","IMU init: %s",esp_err_to_name(err)); return; }
+    if(err!=ESP_OK) { hardware_fault=true; motor_stop(); ESP_LOGE("car","IMU init: %s; BLE remains available for diagnosis",esp_err_to_name(err)); } else { imu_init_ok = true; }
+#else
+    bool imu_init_ok = true;
 #endif
-    hardware_fault=false;
+    if (imu_init_ok) hardware_fault=false;
     if(xTaskCreate(control_task,"drive",4096,NULL,6,NULL)!=pdPASS) { motor_stop(); return; }
     err=gesture_ble_server_start(link_changed,received,status);
     if(err!=ESP_OK) { hardware_fault=true; motor_stop(); ESP_LOGE("car","BLE init: %s",esp_err_to_name(err)); return; }

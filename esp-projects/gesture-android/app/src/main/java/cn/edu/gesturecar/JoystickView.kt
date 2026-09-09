@@ -8,7 +8,6 @@ import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
-import kotlin.math.hypot
 
 class JoystickView @JvmOverloads constructor(
     context: Context,
@@ -21,6 +20,8 @@ class JoystickView @JvmOverloads constructor(
     }
 
     var listener: Listener? = null
+    var rotationOnly = false
+    private var pointerId = MotionEvent.INVALID_POINTER_ID
     var active = false
         private set
     var axisX = 0f
@@ -39,7 +40,7 @@ class JoystickView @JvmOverloads constructor(
         super.onDraw(canvas)
         val cx = width / 2f
         val cy = height / 2f
-        val radius = (minOf(width, height) * 0.38f).coerceAtLeast(80f)
+        val radius = JoystickInput.radius(width, height)
         val knobRadius = radius * 0.28f
         basePaint.shader = android.graphics.LinearGradient(0f, 0f, 0f, height.toFloat(), Color.rgb(29, 44, 74), Color.rgb(12, 20, 39), android.graphics.Shader.TileMode.CLAMP)
         canvas.drawCircle(cx, cy, radius, basePaint)
@@ -56,31 +57,56 @@ class JoystickView @JvmOverloads constructor(
         canvas.drawCircle(kx, ky, knobRadius, knobPaint)
         textPaint.textSize = radius * .15f
         textPaint.color = Color.argb(170, 220, 235, 255)
-        canvas.drawText("前", cx, cy - radius * .78f, textPaint)
-        canvas.drawText("后", cx, cy + radius * .91f, textPaint)
+        canvas.drawText(if (rotationOnly) "" else "前", cx, cy - radius * .78f, textPaint)
+        canvas.drawText(if (rotationOnly) "" else "后", cx, cy + radius * .91f, textPaint)
         canvas.drawText("左", cx - radius * .88f, cy + radius * .05f, textPaint)
         canvas.drawText("右", cx + radius * .88f, cy + radius * .05f, textPaint)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> { active = true; listener?.onStart(); update(event.x, event.y); return true }
-            MotionEvent.ACTION_MOVE -> { update(event.x, event.y); return true }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { active = false; axisX = 0f; axisY = 0f; listener?.onMove(0f, 0f); listener?.onEnd(); invalidate(); performClick(); return true }
+            MotionEvent.ACTION_DOWN -> {
+                parent?.requestDisallowInterceptTouchEvent(true)
+                pointerId = event.getPointerId(0); active = true
+                listener?.onStart(); update(event.x, event.y); return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!active) return true
+                val index = event.findPointerIndex(pointerId)
+                if (index < 0) finishTouch() else update(event.getX(index), event.getY(index))
+                return true
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                if (event.getPointerId(event.actionIndex) == pointerId) finishTouch()
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                finishTouch()
+                if (event.actionMasked == MotionEvent.ACTION_UP) performClick()
+                return true
+            }
         }
         return true
     }
 
     override fun performClick(): Boolean { super.performClick(); return true }
 
+    fun reset() {
+        active = false; pointerId = MotionEvent.INVALID_POINTER_ID; axisX = 0f; axisY = 0f
+        parent?.requestDisallowInterceptTouchEvent(false)
+        invalidate()
+    }
+
+    private fun finishTouch() {
+        val wasActive = active
+        reset()
+        if (wasActive) { listener?.onMove(0f, 0f); listener?.onEnd() }
+    }
+
     private fun update(x: Float, y: Float) {
-        val cx = width / 2f; val cy = height / 2f
-        val limit = (minOf(width, height) * .38f * .62f).coerceAtLeast(50f)
-        var dx = x - cx; var dy = y - cy
-        val length = hypot(dx.toDouble(), dy.toDouble()).toFloat()
-        if (length > limit) { dx *= limit / length; dy *= limit / length }
-        axisX = dx / limit
-        axisY = dy / limit
+        val axes = JoystickInput.axes(x, y, width, height)
+        axisX = axes.first
+        axisY = axes.second
         listener?.onMove(axisX, axisY)
         invalidate()
     }

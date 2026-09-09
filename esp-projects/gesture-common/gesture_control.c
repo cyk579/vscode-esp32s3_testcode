@@ -22,8 +22,10 @@ float gesture_axis(float a) {
     x = fminf(1.0f, fmaxf(0.0f, x));
     return copysignf(x, a);
 }
-void gesture_mix(float f, float t, float out[3]) {
-    out[0] = -f-t; out[1] = t; out[2] = f-t;
+void gesture_mix(float forward, float lateral, float yaw, float out[3]) {
+    out[0] = -0.8660254f*forward - 0.5f*lateral - yaw;
+    out[1] = -lateral + yaw;
+    out[2] = 0.8660254f*forward - 0.5f*lateral - yaw;
     float peak = fmaxf(fabsf(out[0]), fmaxf(fabsf(out[1]), fabsf(out[2])));
     float scale = peak > 1 ? CONTROL_MAX_PWM/peak : CONTROL_MAX_PWM;
     for (int i=0; i<3; ++i) out[i] *= scale;
@@ -35,15 +37,16 @@ bool gesture_control_receive(gesture_control_t *c, const gesture_frame_t *f, uin
         (uint32_t)(f->uptime_ms-c->frame.uptime_ms) >= 0x80000000u)) return false;
     if (c->have_frame && (uint32_t)(now-c->last_rx) >= CONTROL_TIMEOUT_MS) stop(c, DRIVE_FAULT);
     c->frame = *f; c->last_rx = now; c->have_frame = true;
-    float p = f->pitch_cd/100.0f, r = f->roll_cd/100.0f;
+    float p = f->pitch_cd/100.0f, r = f->roll_cd/100.0f, y = f->yaw_cd/100.0f;
     if (c->local_fault || !(f->flags & GESTURE_VALID) || (f->flags & GESTURE_ESTOP) ||
-        fabsf(p) > CONTROL_MAX_TILT_DEG || fabsf(r) > CONTROL_MAX_TILT_DEG) {
+        fabsf(p) > CONTROL_MAX_TILT_DEG || fabsf(r) > CONTROL_MAX_TILT_DEG || fabsf(y) > CONTROL_MAX_TILT_DEG) {
         stop(c, DRIVE_FAULT); return true;
     }
     if (!(f->flags & GESTURE_HELD)) {
         bool was_ready = c->state == DRIVE_READY;
         if (c->state == DRIVE_ACTIVE) stop(c, DRIVE_WAIT_NEUTRAL);
-        if (fabsf(p) <= CONTROL_DEADZONE_DEG && fabsf(r) <= CONTROL_DEADZONE_DEG) {
+        if (fabsf(p) <= CONTROL_DEADZONE_DEG && fabsf(r) <= CONTROL_DEADZONE_DEG &&
+            fabsf(y) <= CONTROL_DEADZONE_DEG) {
             if (!c->neutral_tracking) { c->neutral_tracking = true; c->neutral_since = now; }
             c->state = was_ready || (uint32_t)(now-c->neutral_since) >= CONTROL_NEUTRAL_MS ? DRIVE_READY : DRIVE_WAIT_NEUTRAL;
         } else { c->neutral_tracking = false; c->state = DRIVE_WAIT_NEUTRAL; }
@@ -59,19 +62,24 @@ void gesture_control_step(gesture_control_t *c, uint32_t now, float dt) {
         !isfinite(dt) || dt <= 0 || dt > 0.05f) { stop(c, DRIVE_FAULT); return; }
     if (c->state != DRIVE_ACTIVE) { memset(c->pwm, 0, sizeof(c->pwm)); return; }
     float target[3];
-    gesture_mix(gesture_axis(c->frame.pitch_cd/100.0f), gesture_axis(c->frame.roll_cd/100.0f), target);
-    for (int i=0; i<3; ++i) {
-        int sign = (target[i] > 0)-(target[i] < 0);
-        bool reverse = sign && c->last_direction[i] && sign != c->last_direction[i];
-        if (reverse && (!c->at_zero[i] || (uint32_t)(now-c->zero_since[i]) < CONTROL_REVERSE_MS)) target[i] = 0;
-        float d = CONTROL_SLEW_PWM_PER_SECOND*dt;
-        c->pwm[i] += fminf(d, fmaxf(-d, target[i]-c->pwm[i]));
-        if (fabsf(c->pwm[i]) < 0.0001f) {
-            c->pwm[i] = 0;
-            if (!c->at_zero[i]) { c->zero_since[i] = now; c->at_zero[i] = true; }
+    gesture_mix(gesture_axis(c->frame.pitch_cd/100.0f), gesture_axis(c->frame.roll_cd/100.0f), gesture_axis(c->frame.yaw_cd/100.0f), target);
+    float largest_change = 0;
+    for (int wheel=0; wheel<3; ++wheel) {
+        int direction = (target[wheel] > 0)-(target[wheel] < 0);
+        bool reverse = direction && c->last_direction[wheel] && direction != c->last_direction[wheel];
+        if (reverse && (!c->at_zero[wheel] || (uint32_t)(now-c->zero_since[wheel]) < CONTROL_REVERSE_MS)) target[wheel] = 0;
+        largest_change = fmaxf(largest_change, fabsf(target[wheel]-c->pwm[wheel]));
+    }
+    float step_limit = CONTROL_SLEW_PWM_PER_SECOND*dt;
+    float fraction = largest_change > step_limit ? step_limit/largest_change : 1;
+    for (int wheel=0; wheel<3; ++wheel) {
+        c->pwm[wheel] += fraction*(target[wheel]-c->pwm[wheel]);
+        if (fabsf(c->pwm[wheel]) < 0.0001f) {
+            c->pwm[wheel] = 0;
+            if (!c->at_zero[wheel]) { c->zero_since[wheel] = now; c->at_zero[wheel] = true; }
         } else {
-            c->last_direction[i] = (c->pwm[i] > 0) ? 1 : -1;
-            c->at_zero[i] = false;
+            c->last_direction[wheel] = (c->pwm[wheel] > 0) ? 1 : -1;
+            c->at_zero[wheel] = false;
         }
     }
 }
