@@ -13,7 +13,6 @@
  * 必须断电后换线：屏幕 CS 只接 GPIO0，不再连接 GPIO1 或 GND。
  * GPIO0 是 BOOT 启动绑带脚，正常上电/复位时不能被屏幕电路拉低。
  * 运行中不要按 BOOT；本工程不驱动舵机，不使用时断开舵机供电并固定摄像头。
- * 详见仓库根目录 引脚核查与复现说明.md。
  */
 #define LCD_CS_GPIO    GPIO_NUM_0
 #define LCD_SCK_GPIO   GPIO_NUM_13
