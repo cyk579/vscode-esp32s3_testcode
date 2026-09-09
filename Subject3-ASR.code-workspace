@@ -1,0 +1,8 @@
+{
+    "folders": [{"name": "Subject3 ASR (ESP32-S3)", "path": "esp-projects/subject3-ASR"}],
+    "settings": {
+        "idf.buildPath": "${workspaceFolder}/build-local",
+        "idf.buildPathWin": "${workspaceFolder}/build-local",
+        "idf.customExtraVars": {"PYTHONUTF8": "1"}
+    }
+}

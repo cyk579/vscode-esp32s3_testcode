@@ -19,6 +19,8 @@ static gesture_link_cb link_cb;
 static gesture_receive_cb receive_cb;
 static gesture_build_cb build_cb;
 static gesture_status_cb status_cb;
+static esp_err_t (*extra_register)(void);
+static void (*extra_tick)(void);
 static bool server, subscribed, write_pending, connecting;
 static uint16_t conn=BLE_HS_CONN_HANDLE_NONE, control_handle, status_handle;
 static uint16_t service_start, service_end;
@@ -103,6 +105,7 @@ static void scan(void) {
 }
 static void tick(struct ble_npl_event *event) {
     (void)event;
+    if(server && extra_tick) extra_tick();
     if(conn!=BLE_HS_CONN_HANDLE_NONE) {
         if(server && subscribed) {
             uint8_t status[12]={0}; status_cb(status);
@@ -181,11 +184,17 @@ static esp_err_t start(void) {
     ble_svc_gap_init(); ble_svc_gatt_init();
     ble_svc_gap_device_name_set(server?"GestureCar":"GestureRemote");
     if(server && (ble_gatts_count_cfg(services) || ble_gatts_add_svcs(services))) return ESP_FAIL;
+    if(server && extra_register && (err=extra_register())!=ESP_OK) return err;
     ble_npl_callout_init(&timer,nimble_port_get_dflt_eventq(),tick,NULL);
     nimble_port_freertos_init(host_task); return ESP_OK;
 }
 esp_err_t gesture_ble_server_start(gesture_link_cb link,gesture_receive_cb receive,gesture_status_cb status) {
-    server=true; link_cb=link; receive_cb=receive; status_cb=status; return start();
+    return gesture_ble_server_start_extended(link,receive,status,NULL,NULL);
+}
+esp_err_t gesture_ble_server_start_extended(gesture_link_cb link,gesture_receive_cb receive,
+    gesture_status_cb status,esp_err_t (*register_services)(void),void (*tick_services)(void)) {
+    server=true; link_cb=link; receive_cb=receive; status_cb=status;
+    extra_register=register_services; extra_tick=tick_services; return start();
 }
 esp_err_t gesture_ble_client_start(gesture_link_cb link,gesture_build_cb build) {
     server=false; link_cb=link; build_cb=build; return start();

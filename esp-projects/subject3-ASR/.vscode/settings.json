@@ -1,0 +1,6 @@
+{
+    "idf.buildPath": "${workspaceFolder}/build-local",
+    "idf.buildPathWin": "${workspaceFolder}/build-local",
+    "idf.customExtraVars": {"PYTHONUTF8": "1"},
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/build-local/compile_commands.json"
+}

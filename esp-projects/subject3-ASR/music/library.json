@@ -1,0 +1,6 @@
+{
+  "sample_rate": 16000,
+  "tracks": [
+    {"id": 1, "title": "测试音", "aliases": ["测试音乐"], "file": "@test-tone"}
+  ]
+}

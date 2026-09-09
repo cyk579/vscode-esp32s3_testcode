@@ -21,6 +21,8 @@ class JoystickView @JvmOverloads constructor(
 
     var listener: Listener? = null
     var rotationOnly = false
+    var accentColor: Int = Color.rgb(92, 228, 204)
+        set(value) { field = value; invalidate() }
     private var pointerId = MotionEvent.INVALID_POINTER_ID
     var active = false
         private set
@@ -44,7 +46,7 @@ class JoystickView @JvmOverloads constructor(
         val knobRadius = radius * 0.28f
         basePaint.shader = android.graphics.LinearGradient(0f, 0f, 0f, height.toFloat(), Color.rgb(29, 44, 74), Color.rgb(12, 20, 39), android.graphics.Shader.TileMode.CLAMP)
         canvas.drawCircle(cx, cy, radius, basePaint)
-        ringPaint.color = Color.argb(90, 130, 170, 220)
+        ringPaint.color = Color.argb(if (active) 220 else 110, Color.red(accentColor), Color.green(accentColor), Color.blue(accentColor))
         canvas.drawCircle(cx, cy, radius, ringPaint)
         ringPaint.color = Color.argb(50, 150, 190, 235)
         canvas.drawCircle(cx, cy, radius * .66f, ringPaint)
@@ -53,14 +55,14 @@ class JoystickView @JvmOverloads constructor(
         val maxOffset = radius * .62f
         val kx = cx + axisX * maxOffset
         val ky = cy + axisY * maxOffset
-        knobPaint.shader = android.graphics.RadialGradient(kx - knobRadius * .3f, ky - knobRadius * .35f, knobRadius, Color.rgb(105, 222, 255), Color.rgb(27, 121, 198), android.graphics.Shader.TileMode.CLAMP)
+        knobPaint.shader = android.graphics.RadialGradient(kx - knobRadius * .3f, ky - knobRadius * .35f, knobRadius, accentColor, Color.rgb(Color.red(accentColor)/3, Color.green(accentColor)/3, Color.blue(accentColor)/3), android.graphics.Shader.TileMode.CLAMP)
         canvas.drawCircle(kx, ky, knobRadius, knobPaint)
-        textPaint.textSize = radius * .15f
+        textPaint.textSize = radius * (if (rotationOnly) .12f else .15f)
         textPaint.color = Color.argb(170, 220, 235, 255)
         canvas.drawText(if (rotationOnly) "" else "前", cx, cy - radius * .78f, textPaint)
         canvas.drawText(if (rotationOnly) "" else "后", cx, cy + radius * .91f, textPaint)
-        canvas.drawText("左", cx - radius * .88f, cy + radius * .05f, textPaint)
-        canvas.drawText("右", cx + radius * .88f, cy + radius * .05f, textPaint)
+        canvas.drawText(if (rotationOnly) "左旋" else "左", cx - radius * .85f, cy + radius * .05f, textPaint)
+        canvas.drawText(if (rotationOnly) "右旋" else "右", cx + radius * .85f, cy + radius * .05f, textPaint)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
