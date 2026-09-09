@@ -6,8 +6,8 @@ android {
         applicationId = "cn.edu.gesturecar"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1-omni2"
+        versionCode = 4
+        versionName = "1.3-asr-music"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

@@ -1,0 +1,46 @@
+menu "Subject3 ASR preparation"
+choice SUBJECT3_MODE
+    prompt "Application mode (speech recognition runs on the phone)"
+    default SUBJECT3_BLE_BASELINE
+config SUBJECT3_USB_MIC_PROBE
+    bool "USB microphone diagnostics; motors disabled"
+config SUBJECT3_BLE_BASELINE
+    bool "BLE omni car; phone voice commands or joysticks"
+endchoice
+config SUBJECT3_MUSIC
+    bool "USB UAC speaker and music filesystem"
+    default y
+    depends on SUBJECT3_BLE_BASELINE
+    help
+        Runs an independent PCM WAV player. No song is played at startup.
+config SUBJECT3_SPEAKER_RATE
+    int "Speaker and prepared WAV sample rate"
+    range 8000 48000
+    default 16000
+config SUBJECT3_SPEAKER_GAIN
+    int "PCM playback level (percent)"
+    range 1 100
+    default 20
+
+config SUBJECT3_MIC_RATE
+    int "Requested microphone sample rate (0 = any advertised rate)"
+    range 0 48000
+    default 0
+    depends on SUBJECT3_USB_MIC_PROBE
+    help
+        First discover the device with 0. Then request 16000 to check
+        native ESP-SR input compatibility. No resampling is performed.
+config SUBJECT3_MIC_CHANNELS
+    int "Requested channels (0 = any, 1 = mono, 2 = stereo)"
+    range 0 2
+    default 0
+    depends on SUBJECT3_USB_MIC_PROBE
+config SUBJECT3_MIC_BITS
+    int "Requested bits per sample (0 = any; normally 16)"
+    range 0 24
+    default 0
+    depends on SUBJECT3_USB_MIC_PROBE
+    help
+        Meter readings are computed only for 16-bit PCM.
+        Values other than 0 must be between 8 and 24.
+endmenu

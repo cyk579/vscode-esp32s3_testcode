@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "catalog": 1223302566,
+  "sample_rate": 16000,
+  "tracks": [
+    {
+      "id": 1,
+      "title": "测试音",
+      "aliases": [
+        "测试音乐"
+      ],
+      "sha256": "95a1771f6e5e71480ace545ea4d6b9971618a6bcb50c5dd20c0465e079622c08"
+    }
+  ]
+}

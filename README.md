@@ -10,6 +10,7 @@
 
 | 工程 | 功能 |
 | --- | --- |
+| `esp-projects/subject3-ASR` | 同一 APP 手机语音控车、车端预存歌曲 USB 播放、独立手势接入；附硬件限制与 [方案及使用说明](esp-projects/subject3-ASR/README.md) |
 | `esp-projects/car-spin` | 三轮小车电机控制、四路红外检测与巡线 |
 | `esp-projects/camera-test` | USB 摄像头枚举、RGB565 黑线识别、三轮车巡线、ST7735 本地预览与可选 Wi-Fi 图像传输 |
 | `esp-projects/camera-claude` | 原组巡线/避障/推球移植，默认模式6，编码器与原组速度闭环启用 |
