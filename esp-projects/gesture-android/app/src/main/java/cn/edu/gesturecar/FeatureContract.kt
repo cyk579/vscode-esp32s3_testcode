@@ -49,6 +49,8 @@ interface GestureOutput {
     fun motion(forward: Float, lateral: Float, rotation: Float, capturedAtMs: Long)
     fun lost()
     fun fist() {}
+    fun status(message: String) {}
+    fun error(message: String) { lost() }
 }
 interface GestureFeature {
     fun start(output: GestureOutput)

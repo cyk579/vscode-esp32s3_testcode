@@ -24,7 +24,10 @@ class MainActivity : Activity(), BleCarTransport.Listener {
     private lateinit var music: MusicController
     private var gesture: GestureFeature? = null
     private var gestureEpoch = 0L
+    private var gestureMotionActive = false
+    private var pendingGesturePermission = false
     private var deviceDialog: android.app.AlertDialog? = null
+    private lateinit var gesturePreview: ImageView
     private var scanLabel: TextView? = null
     private var displayRotation = -1
     private lateinit var connectionBadge: TextView
@@ -33,9 +36,10 @@ class MainActivity : Activity(), BleCarTransport.Listener {
     private var foreground = false
     private var ready = false
     private var lastCarStatus = 0L
-    private var forceSystemSpeech = false
+    private var forceSystemSpeech = true
+    private var awaitingSpeechActivity = false
     private var manualHeld = false
-    private var forward = 0f; private var lateral = 0f; private var rotation = 0f
+    private var forward = 0f; private var lateral = 0f; private var manualRotation = 0f
     private lateinit var connectionLabel: TextView
     private lateinit var carLabel: TextView
     private lateinit var voiceLabel: TextView
@@ -50,6 +54,14 @@ class MainActivity : Activity(), BleCarTransport.Listener {
     private lateinit var voicePanel: LinearLayout
     private lateinit var gesturePanel: LinearLayout
     private fun now() = SystemClock.elapsedRealtime()
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
+        if (::speech.isInitialized && speech.acceptActivityResult(requestCode, resultCode, data)) {
+            awaitingSpeechActivity = false
+            return
+        }
+        super.onActivityResult(requestCode, resultCode, data)
+    }
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun color(s: String) = Color.parseColor(s)
     private fun surface(fill: String) = GradientDrawable().apply { setColor(color(fill)); cornerRadius = dp(16).toFloat(); setStroke(dp(1), color("#243B56")) }
@@ -86,7 +98,7 @@ class MainActivity : Activity(), BleCarTransport.Listener {
         }
         root.addView(row().apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(label("GESTURE / DRIVE · ASR", 17f, true), LinearLayout.LayoutParams(0, -2, 1f))
+            addView(label(getString(R.string.app_name), 17f, true), LinearLayout.LayoutParams(0, -2, 1f))
             addView(connectionBadge, LinearLayout.LayoutParams(-2, dp(32)).apply { marginEnd = dp(8) })
             addView(button("连接车辆") { showConnections() }, LinearLayout.LayoutParams(dp(88), dp(40)))
             addView(button("断开") { transport.disconnect("已断开，电机停车；车端音乐继续") },
@@ -106,7 +118,7 @@ class MainActivity : Activity(), BleCarTransport.Listener {
         }
         speech = PhoneSpeechInput(this, { voiceLabel.text = it }, ::voiceResult)
         voicePanel.addView(label("PHONE / 中文语音控车", 18f, true))
-        voicePanel.addView(label("前进、后退、左移、右移、左转、右转\n点一次听一次 · 单次运动 0.8 秒", 13f))
+        voicePanel.addView(label("前进、后退、左移、右移：3 秒；左转、右转：0.5 秒", 13f))
         voicePanel.addView(button("说运动指令") { listen() })
         voicePanel.addView(CheckBox(this).apply {
             text = "系统语音服务（可能联网）"; textSize = 13f
@@ -114,13 +126,21 @@ class MainActivity : Activity(), BleCarTransport.Listener {
                 stopInputs(); forceSystemSpeech = checked; transport.requestDrive()
             }
         })
-        gestureLabel = label("手势识别未接入")
-        gesturePanel.addView(label("GESTURE / 手势扩展", 18f, true))
-        gesturePanel.addView(gestureLabel)
-        gesturePanel.addView(row().apply {
-            equal(button("启用手势") { startGesture() })
-            equal(button("停止手势") { releaseControls() })
-        })
+        gesturePanel.orientation = LinearLayout.HORIZONTAL
+        gestureLabel = label("整只手入镜，张掌静止半秒定中", 12f).apply { maxLines = 6 }
+        gesturePreview = GesturePreviewView(this).apply {
+            contentDescription = "手势摄像头实时画面"
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setBackgroundColor(Color.BLACK)
+        }
+        gesturePanel.addView(gesturePreview, LinearLayout.LayoutParams(0, -1, 1f))
+        gesturePanel.addView(column().apply {
+            setPadding(dp(8), 0, 0, 0)
+            addView(label("摄像头手势", 14f, true))
+            addView(gestureLabel, LinearLayout.LayoutParams(-1, 0, 1f))
+            addView(button("启用 / 重新定中") { startGesture() }, LinearLayout.LayoutParams(-1, dp(48)))
+            addView(button("停止手势") { releaseControls() }, LinearLayout.LayoutParams(-1, dp(48)))
+        }, LinearLayout.LayoutParams(dp(176), -1))
         musicLabel = label("等待音乐服务", 13f)
         transport = BleCarTransport(this, drive::frame, this)
         music = loadMusic()
@@ -140,8 +160,10 @@ class MainActivity : Activity(), BleCarTransport.Listener {
         val panels = FrameLayout(this).apply {
             addView(manualPanel, FrameLayout.LayoutParams(-1, -1))
             for (panel in listOf(voicePanel, gesturePanel, musicPanel)) {
-                addView(ScrollView(this@MainActivity).apply { addView(panel); tag = panel },
-                    FrameLayout.LayoutParams(-1, -1))
+                val container = if (panel === gesturePanel) FrameLayout(this@MainActivity).apply {
+                    addView(panel, FrameLayout.LayoutParams(-1, -1))
+                } else ScrollView(this@MainActivity).apply { addView(panel); tag = panel }
+                addView(container, FrameLayout.LayoutParams(-1, -1))
             }
         }
         val center = column().apply {
@@ -183,8 +205,8 @@ class MainActivity : Activity(), BleCarTransport.Listener {
                 (panel.parent as View).visibility = if (id == 101 + index) View.VISIBLE else View.GONE
             }
             voiceLabel.text = when (id) {
-                101 -> "点击说运动指令 · 单次运动 0.8 秒"
-                102 -> "手势模块独立接入"
+                101 -> "点击说运动指令 · 平移 3 秒，旋转 0.5 秒"
+                102 -> "张掌：上前下后、左右平移 · 握拳：旋转"
                 103 -> "仅播放车端已导入曲库 · 不执行运动语音"
                 else -> "左手平移 · 右手旋转 · 任一松手停车"
             }
@@ -228,7 +250,7 @@ class MainActivity : Activity(), BleCarTransport.Listener {
             rotationOnly = true; accentColor = color("#85ACFF"); contentDescription = "右摇杆：横向旋转，松手停车"
             listener = object : JoystickView.Listener {
                 override fun onStart() { startManual() }
-                override fun onMove(x: Float, y: Float) { rotation = JoystickInput.rotation(x) }
+                override fun onMove(x: Float, y: Float) { manualRotation = JoystickInput.rotation(x) }
                 override fun onEnd() { releaseControls() }
             }
         }
@@ -297,8 +319,10 @@ class MainActivity : Activity(), BleCarTransport.Listener {
     }
     private fun stopGesture() {
         ++gestureEpoch
+        gestureMotionActive = false
         val old = gesture; gesture = null
         try { old?.stop() } catch (_: RuntimeException) { }
+        if (::gesturePreview.isInitialized) gesturePreview.setImageDrawable(null)
         if (::gestureLabel.isInitialized) gestureLabel.text = "手势已停止"
     }
     private fun stopInputs() {
@@ -307,39 +331,71 @@ class MainActivity : Activity(), BleCarTransport.Listener {
     }
     private fun stopMotion() {
         stopGesture(); drive.stop(now()); manualHeld = false
-        forward = 0f; lateral = 0f; rotation = 0f
+        forward = 0f; lateral = 0f; manualRotation = 0f
         if (::joystick.isInitialized) joystick.reset()
         if (::yawJoystick.isInitialized) yawJoystick.reset()
     }
     private fun startGesture() {
         stopInputs()
-        val feature = try { GestureSlot.create(this) } catch (_: RuntimeException) {
+        transport.requestDrive()
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            pendingGesturePermission = true
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), 12)
+            return
+        }
+        val feature = try { GestureSlot.create(this, gesturePreview) } catch (_: RuntimeException) {
             gestureLabel.text = "手势模块初始化失败"; return
         }
-        if (feature == null) { gestureLabel.text = "手势识别未接入"; return }
         val epoch = gestureEpoch
         handler.postDelayed({
             if (!foreground || epoch != gestureEpoch || drive.selected != ControlSource.GESTURE) return@postDelayed
-            if (!drive.begin(ControlSource.GESTURE, now())) { gestureLabel.text = "车辆尚未就绪"; return@postDelayed }
             gesture = feature
             try { feature.start(object : GestureOutput {
                 override fun motion(forward: Float, lateral: Float, rotation: Float, capturedAtMs: Long) { handler.post {
-                    if (epoch == gestureEpoch && foreground && gesture === feature)
-                        drive.submit(ControlSource.GESTURE, forward, lateral, rotation, capturedAtMs, now())
+                    if (epoch == gestureEpoch && foreground && gesture === feature) {
+                        if (!gestureMotionActive) gestureMotionActive = drive.begin(ControlSource.GESTURE, now())
+                        if (gestureMotionActive) gestureMotionActive = drive.submit(ControlSource.GESTURE, forward, lateral, rotation, capturedAtMs, now())
+                        if (!gestureMotionActive) gestureLabel.text = "识别中；等待车辆就绪或新鲜手势数据"
+                    }
                 } }
                 override fun fist() { handler.post {
-                    if (epoch == gestureEpoch && foreground && gesture === feature) {
+                    if (epoch == gestureEpoch && foreground && gesture === feature && gestureMotionActive) {
                         music.tracks.firstOrNull()?.let { music.submit(MediaCommand.PlayTitle(it.title)) }
                         gestureLabel.text = "握拳：原地旋转，已触发播放"
                     }
                 } }
                 override fun lost() { handler.post {
-                    if (epoch == gestureEpoch) { stopInputs(); transport.requestDrive(); gestureLabel.text = "手势丢失，已停车" }
+                    if (epoch == gestureEpoch && gesture === feature) {
+                        if (gestureMotionActive) drive.stop(now())
+                        gestureMotionActive = false
+                        transport.requestDrive(); gestureLabel.text = "未识别到张开手掌或拳头，已停车；摄像头继续识别"
+                    }
+                } }
+                override fun status(message: String) { handler.post {
+                    if (epoch == gestureEpoch && gesture === feature) gestureLabel.text =
+                        if (gestureMotionActive) message else "$message\n车辆尚未接受运动或正在定中（保持停车）"
+                } }
+                override fun error(message: String) { handler.post {
+                    if (epoch == gestureEpoch && gesture === feature) {
+                        stopInputs(); transport.requestDrive(); gestureLabel.text = message
+                    }
                 } }
             }) } catch (_: RuntimeException) {
                 stopMotion(); transport.requestDrive(); gestureLabel.text = "手势模块启动失败"; return@postDelayed
             }
             gestureLabel.text = "手势已启用"
+        }, 400)
+    }
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != 12 || !pendingGesturePermission) return
+        pendingGesturePermission = false
+        if (grantResults.firstOrNull() != PackageManager.PERMISSION_GRANTED) {
+            gestureLabel.text = "摄像头权限被拒绝，请在系统设置中允许"
+            return
+        }
+        handler.postDelayed({
+            if (foreground && hasWindowFocus() && modes.checkedRadioButtonId == 102) startGesture()
         }, 400)
     }
     private fun listen() {
@@ -348,6 +404,7 @@ class MainActivity : Activity(), BleCarTransport.Listener {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 11); return
         }
+        awaitingSpeechActivity = true
         speech.start(forceSystemSpeech)
     }
     private fun voiceResult(text: String) {
@@ -364,8 +421,9 @@ class MainActivity : Activity(), BleCarTransport.Listener {
                 else if (drive.selected != ControlSource.VOICE) voiceLabel.text = "运动语音只在语音模式启用"
                 else if (drive.begin(ControlSource.VOICE, now())) {
                     val command = intent.command
-                    drive.submit(ControlSource.VOICE, command.forward, command.lateral, command.rotation, now(), now())
-                    voiceLabel.text = "听到“$text” · 0.8 秒"
+                    val duration = if (command.rotation != 0f) 500L else 3000L
+                    drive.submit(ControlSource.VOICE, command.forward, command.lateral, command.rotation, now(), now(), duration)
+                    voiceLabel.text = "听到“$text” · ${if (duration == 500L) "0.5" else "3"} 秒"
                 } else voiceLabel.text = "车辆尚未就绪，本次指令不执行"
                 transport.requestDrive()
             }
@@ -411,7 +469,7 @@ class MainActivity : Activity(), BleCarTransport.Listener {
     override fun device(device: BluetoothDevice) { devices.addView(button("连接 ${device.name ?: "GestureCar"} · ${device.address}") { deviceDialog?.dismiss(); transport.connect(device) }) }
     override fun carStatus(bytes: ByteArray) {
         lastCarStatus = now(); drive.updateStatus(bytes, lastCarStatus); carLabel.text = Protocol.statusText(bytes)
-        if (bytes.size != 12 || bytes[0].toInt() != 1 || bytes[1].toInt() !in 2..3 ||
+        if (bytes.size != 12 || bytes[0].toInt() != 1 || bytes[1].toInt() !in 1..3 ||
             bytes[2].toInt() != 0 || bytes[11].toInt() != 0) stopMotion()
     }
     override fun musicStatus(bytes: ByteArray) { music.acceptStatus(bytes) }
@@ -422,15 +480,19 @@ class MainActivity : Activity(), BleCarTransport.Listener {
             val t = now()
             if (ready && lastCarStatus != 0L && t - lastCarStatus > 500) { stopMotion(); lastCarStatus = 0 }
             if (manualHeld && (joystick.active || yawJoystick.active)) {
-                if (!drive.submit(ControlSource.MANUAL, forward, lateral, rotation, t, t)) manualHeld = false
+                if (!drive.submit(ControlSource.MANUAL, forward, lateral, manualRotation, t, t)) manualHeld = false
             }
             val output = drive.output(t)
             telemetry.text = "前进 ${((output?.forward ?: 0f) * 4).toInt()}%\n横移 ${((output?.lateral ?: 0f) * 4).toInt()}%\n旋转 ${((output?.rotation ?: 0f) * 4).toInt()}%"
             transport.tick(); handler.postDelayed(this, 25)
         }
     }
-    override fun onResume() { super.onResume(); foreground = true; drive.foreground(true, now()); handler.post(ticker) }
+    override fun onResume() { super.onResume(); foreground = true; drive.foreground(true, now()); handler.removeCallbacks(ticker); handler.post(ticker) }
     override fun onPause() {
+        if (awaitingSpeechActivity) {
+            super.onPause()
+            return
+        }
         foreground = false; deviceDialog?.dismiss(); stopInputs(); drive.foreground(false, now()); transport.requestDrive()
         transport.disconnect("应用暂停，电机停车；车端音乐继续"); handler.removeCallbacks(ticker); super.onPause()
     }

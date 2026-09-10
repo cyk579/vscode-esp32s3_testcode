@@ -1,0 +1,38 @@
+dependencies:
+  espressif/cmake_utilities:
+    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 0.5.3
+  espressif/usb_stream:
+    component_hash: c7751c015606835c28a090726a954d99947bd50b29f5b74c8c2748ba6aea219e
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.5.*
+    - name: idf
+      require: private
+      version: '>=4.4.1,<=5.5'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    version: 1.5.2
+  idf:
+    source:
+      type: idf
+    version: 5.5.4
+direct_dependencies:
+- espressif/usb_stream
+- idf
+manifest_hash: 1e9e63594ac8681f0afa00b79c08acb2d16aa5d7a317768c819b842ebb9e4054
+target: esp32s3
+version: 2.0.0

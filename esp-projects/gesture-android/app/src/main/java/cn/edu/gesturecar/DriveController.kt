@@ -39,13 +39,15 @@ class DriveController {
         armed = true; return true
     }
 
-    fun submit(source: ControlSource, forward: Float, lateral: Float, yaw: Float, capturedAt: Long, now: Long): Boolean {
+    fun submit(source: ControlSource, forward: Float, lateral: Float, yaw: Float, capturedAt: Long, now: Long,
+               durationMs: Long? = null): Boolean {
         val maxAge = if (source == ControlSource.GESTURE) 150L else 100L
         if (!armed || source != selected || !available(now) || now < neutralUntil || now - capturedAt !in 0..maxAge) return false
         val active = arbiter.current(now)
         if (wasDriving && active == null) { stop(now); return false }
         if (active == null && state != 2) return false
-        val ttl = if (source == ControlSource.VOICE) 800L else 200L
+        val ttl = durationMs ?: if (source == ControlSource.VOICE) 800L else 200L
+        if (ttl <= 0L) return false
         val accepted = arbiter.submit(DriveRequest(source, forward, lateral, yaw, capturedAt + ttl), now)
         if (accepted) wasDriving = true
         return accepted
