@@ -327,6 +327,12 @@ class MainActivity : Activity(), BleCarTransport.Listener {
                     if (epoch == gestureEpoch && foreground && gesture === feature)
                         drive.submit(ControlSource.GESTURE, forward, lateral, rotation, capturedAtMs, now())
                 } }
+                override fun fist() { handler.post {
+                    if (epoch == gestureEpoch && foreground && gesture === feature) {
+                        music.tracks.firstOrNull()?.let { music.submit(MediaCommand.PlayTitle(it.title)) }
+                        gestureLabel.text = "握拳：原地旋转，已触发播放"
+                    }
+                } }
                 override fun lost() { handler.post {
                     if (epoch == gestureEpoch) { stopInputs(); transport.requestDrive(); gestureLabel.text = "手势丢失，已停车" }
                 } }

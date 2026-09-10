@@ -15,7 +15,11 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
 }
-dependencies { testImplementation("junit:junit:4.13.2") }
+dependencies {
+    implementation("androidx.annotation:annotation:1.8.2")
+    implementation("com.google.mediapipe:tasks-vision:0.10.14")
+    testImplementation("junit:junit:4.13.2")
+}
 tasks.withType<Test>().configureEach {
     defaultCharacterEncoding = "UTF-8"
 }

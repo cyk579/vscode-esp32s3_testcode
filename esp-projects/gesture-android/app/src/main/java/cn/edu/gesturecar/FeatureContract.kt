@@ -48,6 +48,7 @@ fun interface MediaSink { fun submit(command: MediaCommand): Boolean }
 interface GestureOutput {
     fun motion(forward: Float, lateral: Float, rotation: Float, capturedAtMs: Long)
     fun lost()
+    fun fist() {}
 }
 interface GestureFeature {
     fun start(output: GestureOutput)
