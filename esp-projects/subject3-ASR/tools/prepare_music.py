@@ -61,7 +61,10 @@ def prepare(manifest, output, app_asset):
             wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(rate); wav.writeframes(pcm)
         data = canonical.getvalue()
         files[f"{track_id}.wav"] = data
-        tracks.append({"id": track_id, "title": title, "aliases": aliases, "sha256": hashlib.sha256(data).hexdigest()})
+        track = {"id": track_id, "title": title, "aliases": aliases, "sha256": hashlib.sha256(data).hexdigest()}
+        if entry.get("dance_only", False):
+            track.update(dance_only=True, duration_ms=(len(pcm) * 1000 + rate * 2 - 1) // (rate * 2))
+        tracks.append(track)
     if not tracks:
         raise ValueError("Include at least one track")
     # SPIFFS overhead is significant. Keep content below 70% of the 24 MiB partition.

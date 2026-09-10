@@ -125,6 +125,8 @@ class BleCarTransport(private val context: Context, private val frame: (Long) ->
             if (status != BluetoothGatt.GATT_SUCCESS || state == BluetoothProfile.STATE_DISCONNECTED) disconnect("蓝牙断开：$status")
             else if (state == BluetoothProfile.STATE_CONNECTED) {
                 connectingSince = now(); g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                // Android may retain the pre-music service table after a firmware update.
+                try { g.javaClass.getMethod("refresh").invoke(g) } catch (_: Exception) { }
                 if (!g.discoverServices()) disconnect("服务发现失败")
             }
         }

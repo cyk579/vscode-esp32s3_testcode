@@ -4,6 +4,7 @@ sealed interface VoiceIntent {
     data class Drive(val command: VoiceCommand) : VoiceIntent
     data class Sequence(val commands: List<VoiceCommand>) : VoiceIntent
     data class Play(val title: String) : VoiceIntent
+    data object Dance : VoiceIntent
     data object PauseMusic : VoiceIntent
     data object ResumeMusic : VoiceIntent
     data object StopMusic : VoiceIntent
@@ -14,7 +15,14 @@ sealed interface VoiceIntent {
 object VoiceRouter {
     fun route(text: String): VoiceIntent {
         val normalized = text.trim().trimEnd('。', '！', '!', '.', '？', '?').trim()
+        val compact = normalized.replace(Regex("[\\s，,。！？!?.；;]"), "")
+        if ((compact.contains("伴奏") || compact.contains("音乐") || compact.contains("歌曲") || compact.contains("放歌")) &&
+            (compact.contains("旋") || compact.contains("转")) &&
+            !compact.contains("不要") && !compact.contains("别") && !compact.contains("停止") && !compact.contains("停下")) {
+            return VoiceIntent.Dance
+        }
         when (normalized) {
+            "伴奏旋转", "音乐旋转", "播放伴奏并旋转", "边放歌边旋转", "听歌旋转", "边播放音乐边旋转", "跟着伴奏旋转" -> return VoiceIntent.Dance
             "暂停音乐", "暂停播放" -> return VoiceIntent.PauseMusic
             "继续音乐", "继续播放" -> return VoiceIntent.ResumeMusic
             "停止音乐", "停止播放" -> return VoiceIntent.StopMusic

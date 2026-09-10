@@ -4,7 +4,8 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
 
-data class MusicTrack(val id: Int, val title: String, val aliases: List<String>)
+data class MusicTrack(val id: Int, val title: String, val aliases: List<String>,
+                      val danceOnly: Boolean = false, val durationMs: Long = 0)
 data class MusicStatus(val state: Int, val error: Int, val flags: Int, val sequence: Int,
                        val track: Int, val seconds: Long, val catalog: Long)
 object MusicProtocol {
@@ -27,10 +28,23 @@ object MusicProtocol {
 class MusicController(val tracks: List<MusicTrack>, val catalog: Long,
                       private val send: (ByteArray) -> Boolean, private val report: (String) -> Unit) : MediaSink {
     private var sequence = 0
+    var lastSentSequence = 0
+        private set
+    val selectableTracks: List<MusicTrack> get() = tracks.filterNot { it.danceOnly }
+    val danceTrack: MusicTrack? get() = tracks.singleOrNull { it.danceOnly && it.durationMs in 1..180000 }
+    fun danceAvailability(): String = when {
+        !supported -> "车端未提供音乐服务"
+        danceTrack == null -> "APK 未包含伴奏片段"
+        status == null -> "正在等待车端音乐状态"
+        status!!.catalog != catalog -> "手机与车端曲库编号不一致"
+        status!!.flags and 3 != 3 -> "USB 扬声器或车端曲库尚未就绪"
+        status!!.error != 0 -> "车端音乐错误 ${status!!.error}"
+        else -> ""
+    }
     private var supported = false
     private var status: MusicStatus? = null
     fun link(available: Boolean) { supported = available; status = null }
-    fun resolve(title: String): MusicTrack? = tracks.singleOrNull { it.title == title || title in it.aliases }
+    fun resolve(title: String): MusicTrack? = selectableTracks.singleOrNull { it.title == title || title in it.aliases }
     fun acceptStatus(bytes: ByteArray) {
         status = MusicProtocol.decode(bytes)
         val s = status ?: return report("音乐状态格式不兼容")
@@ -40,8 +54,14 @@ class MusicController(val tracks: List<MusicTrack>, val catalog: Long,
         report("$title · $state · ${s.seconds} 秒" + if (error.isNotEmpty()) "\n$error" else "")
     }
     override fun submit(command: MediaCommand): Boolean {
+        return submitTrack(command, if (command is MediaCommand.PlayTitle) resolve(command.title) else null)
+    }
+    fun playDance(): Boolean {
+        val track = danceTrack ?: return false
+        return submitTrack(MediaCommand.PlayTitle(track.title), track)
+    }
+    private fun submitTrack(command: MediaCommand, track: MusicTrack?): Boolean {
         if (!supported) { report("车端不支持音乐服务，请使用 subject3-ASR 音乐固件"); return false }
-        val track = if (command is MediaCommand.PlayTitle) resolve(command.title) else null
         if (command is MediaCommand.PlayTitle) {
             if (track == null) { report("曲库中没有“${command.title}”，当前播放保持不变"); return false }
             val s = status
@@ -50,7 +70,9 @@ class MusicController(val tracks: List<MusicTrack>, val catalog: Long,
             }
         }
         val op = when (command) { is MediaCommand.PlayTitle -> 1; MediaCommand.Pause -> 2; MediaCommand.Resume -> 3; MediaCommand.Stop -> 4 }
-        val sent = send(MusicProtocol.encode(op, ++sequence, track?.id ?: 0, catalog))
+        sequence = (sequence + 1) and 65535
+        val sent = send(MusicProtocol.encode(op, sequence, track?.id ?: 0, catalog))
+        if (sent) lastSentSequence = sequence
         report(if (sent) "音乐指令已排队，等待车端状态" else "音乐通道忙，本次未发送")
         return sent
     }

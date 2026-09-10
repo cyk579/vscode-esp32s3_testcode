@@ -17,6 +17,7 @@ static QueueHandle_t commands;
 static portMUX_TYPE lock=portMUX_INITIALIZER_UNLOCKED;
 static media_status_t published;
 static atomic_bool usb_ready;
+static atomic_bool usb_needs_resume;
 static atomic_uint usb_epoch;
 
 static void publish(media_status_t *s, bool mounted) {
@@ -51,6 +52,7 @@ static void usb_state(usb_stream_state_t event,void *arg) {
                 (f->samples_frequence_min<=CONFIG_SUBJECT3_SPEAKER_RATE &&
                  f->samples_frequence_max>=CONFIG_SUBJECT3_SPEAKER_RATE);
             atomic_store(&usb_ready,f->ch_num==1 && f->bit_resolution==16 && rate);
+            if(atomic_load(&usb_ready)) atomic_store(&usb_needs_resume,true);
         }
     }
     free(formats);
@@ -85,6 +87,10 @@ static void player_task(void *arg) {
     for(;;) {
         unsigned current_epoch=atomic_load(&usb_epoch);
         if(atomic_load(&usb_ready) && volume_epoch!=current_epoch) {
+            if(atomic_exchange(&usb_needs_resume,false)) {
+                esp_err_t resume_err=usb_streaming_control(STREAM_UAC_SPK,CTRL_RESUME,NULL);
+                if(resume_err!=ESP_OK) ESP_LOGW(TAG,"USB speaker resume: %s",esp_err_to_name(resume_err));
+            }
             esp_err_t volume_err=usb_streaming_control(STREAM_UAC_SPK,CTRL_UAC_VOLUME,(void *)100);
             volume_epoch=current_epoch;
             if(volume_err==ESP_OK) ESP_LOGI(TAG,"USB speaker volume control completed: 100%%");
@@ -115,15 +121,11 @@ static void player_task(void *arg) {
                 if(!error && (!wav_open_pcm(next,&next_wav) || next_wav.channels!=1 || next_wav.rate!=CONFIG_SUBJECT3_SPEAKER_RATE)) error=MEDIA_BAD_WAV;
                 if(error) { if(next) fclose(next); s.error=error; if(!song) s.state=MEDIA_ERROR; }
                 else {
-                    /* Flush the old track in the USB ring buffer only on an explicit new song. */
-                    err=usb_streaming_control(STREAM_UAC_SPK,CTRL_SUSPEND,NULL);
-                    if(err==ESP_OK) err=usb_streaming_control(STREAM_UAC_SPK,CTRL_RESUME,NULL);
-                    if(err!=ESP_OK) { fclose(next); fail(&s,&song,MEDIA_NO_USB); buffered=0; }
-                    else {
-                        close_song(&song); song=next; wav=next_wav; remaining=wav.data_bytes; buffered=0;
-                        play_epoch=atomic_load(&usb_epoch); s.state=MEDIA_PLAYING; s.error=MEDIA_OK;
-                        s.track=command.track; s.position_seconds=0;
-                    }
+                    /* The player task owns the ring buffer; replacing the file is enough.
+                     * Suspending/resuming the USB interface here can reset small UAC devices. */
+                    close_song(&song); song=next; wav=next_wav; remaining=wav.data_bytes; buffered=0;
+                    play_epoch=atomic_load(&usb_epoch); s.state=MEDIA_PLAYING; s.error=MEDIA_OK;
+                    s.track=command.track; s.position_seconds=0;
                 }
             }
         }

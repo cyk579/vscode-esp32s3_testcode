@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "catalog": 336511790,
+  "catalog": 492232735,
   "sample_rate": 16000,
   "tracks": [
     {
@@ -28,6 +28,14 @@
       "title": "海屿你",
       "aliases": [],
       "sha256": "84334cc30f17ecad33a49f3bbc792927b580bde491fd4347e84fc755e281597f"
+    },
+    {
+      "id": 5,
+      "title": "海屿你（片段）",
+      "aliases": [],
+      "sha256": "03f368c4a7a3afcb08a67f99a1a67741215c745aca55f2a792db72741669bfd3",
+      "dance_only": true,
+      "duration_ms": 81711
     }
   ]
 }

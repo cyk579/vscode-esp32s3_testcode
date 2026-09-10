@@ -1,0 +1,9 @@
+
+
+# Load bootloader symbols
+set confirm off
+    # Bootloader elf was not found
+set confirm on
+
+# Load application symbols
+file C:/Electronic_Design/vscode-esp32s3_testcode/esp-projects/subject3-ASR/build-dance/bootloader/bootloader.elf

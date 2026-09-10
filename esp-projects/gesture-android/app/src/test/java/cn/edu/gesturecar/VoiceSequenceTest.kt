@@ -24,6 +24,14 @@ class VoiceSequenceTest {
         assertEquals(VoiceIntent.Drive(VoiceCommand.ESTOP), VoiceRouter.route("急停"))
     }
 
+    @Test fun routesMusicRotationAliasesToTheImportedTrack() {
+        assertEquals(VoiceIntent.Dance, VoiceRouter.route("伴奏旋转"))
+        assertEquals(VoiceIntent.Dance, VoiceRouter.route("播放伴奏并旋转"))
+        assertEquals(VoiceIntent.Dance, VoiceRouter.route("请播放伴奏，跟着音乐转圈一下"))
+        assertEquals(VoiceIntent.Dance, VoiceRouter.route("帮我边放歌边原地转"))
+        assertEquals(VoiceIntent.Unknown, VoiceRouter.route("不要播放伴奏旋转"))
+    }
+
     @Test fun rejectsTheWholeUnsafeOrAmbiguousSequence() {
         for (text in listOf("不要前进再左移", "前进再不要左移", "前进再跳舞", "前进再", "再前进", "前进再再左移",
             "前进一米再左移", "前进同时左移", "前进再向左", "前进再急停再后退", "前进再停车再后退",

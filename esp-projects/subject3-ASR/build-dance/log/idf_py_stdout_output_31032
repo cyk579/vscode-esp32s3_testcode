@@ -1,0 +1,64 @@
+Command: cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=C:\Espressif\tools\python\v5.4.4\venv\Scripts\python.exe -DESP_PLATFORM=1 -DCCACHE_ENABLE=0 C:\Electronic_Design\vscode-esp32s3_testcode\esp-projects\subject3-ASR
+-- IDF_TARGET is not set, guessed 'esp32s3' from sdkconfig 'C:/Electronic_Design/vscode-esp32s3_testcode/esp-projects/subject3-ASR/sdkconfig'
+-- Found Git: C:/Program Files/Git/cmd/git.exe (found version "2.52.0.windows.1")
+-- git rev-parse returned 'fatal: not a git repository (or any of the parent directories): .git'
+-- Minimal build - ON
+-- The C compiler identification is GNU 14.2.0
+-- The CXX compiler identification is GNU 14.2.0
+-- The ASM compiler identification is GNU
+-- Found assembler: C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc.exe
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc.exe - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20260121/xtensa-esp-elf/bin/xtensa-esp32s3-elf-g++.exe - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Building ESP-IDF components for target esp32s3
+NOTICE: Processing 3 dependencies:
+NOTICE: [1/3] espressif/cmake_utilities (0.5.3)
+NOTICE: [2/3] espressif/usb_stream (1.5.2)
+NOTICE: [3/3] idf (5.5.4)
+-- ESP-TEE is currently supported only on the esp32c6;esp32h2;esp32c5 SoCs
+-- Project sdkconfig file C:/Electronic_Design/vscode-esp32s3_testcode/esp-projects/subject3-ASR/sdkconfig
+Loading defaults file C:/Electronic_Design/vscode-esp32s3_testcode/esp-projects/subject3-ASR/sdkconfig.defaults...
+C:/Electronic_Design/vscode-esp32s3_testcode/esp-projects/subject3-ASR/sdkconfig.defaults:18 CONFIG_SPI_FLASH_OCTAL_32BIT_ADDR_ENABLE was replaced with CONFIG_BOOTLOADER_CACHE_32BIT_ADDR_OCTAL_FLASH 
+-- Compiler supported targets: xtensa-esp-elf
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Found Python3: C:/Espressif/tools/python/v5.4.4/venv/Scripts/python.exe (found version "3.12.7") found components: Interpreter
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Performing Test C_COMPILER_SUPPORTS_WFORMAT_SIGNEDNESS
+-- Performing Test C_COMPILER_SUPPORTS_WFORMAT_SIGNEDNESS - Success
+-- USING O3
+-- App "subject3-ASR" version: f897c44-dirty
+-- Adding linker script C:/Electronic_Design/vscode-esp32s3_testcode/esp-projects/subject3-ASR/build-dance/esp-idf/esp_system/ld/memory.ld
+-- Adding linker script C:/Electronic_Design/vscode-esp32s3_testcode/esp-projects/subject3-ASR/build-dance/esp-idf/esp_system/ld/sections.ld.in
+-- Adding linker script C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.ld
+-- Adding linker script C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.api.ld
+-- Adding linker script C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.bt_funcs.ld
+-- Adding linker script C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.libgcc.ld
+-- Adding linker script C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.wdt.ld
+-- Adding linker script C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.version.ld
+-- Adding linker script C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.ble_cca.ld
+-- Adding linker script C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.ble_test.ld
+-- Adding linker script C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.libc.ld
+-- Adding linker script C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_rom/esp32s3/ld/esp32s3.rom.newlib.ld
+-- Adding linker script C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/soc/esp32s3/ld/esp32s3.peripherals.ld
+-- USB_STREAM: 1.5.2
+-- Components: app_update bootloader bootloader_support bt cxx efuse esp_app_format esp_bootloader_format esp_coex esp_common esp_driver_gpio esp_driver_i2c esp_driver_ledc esp_driver_spi esp_driver_uart esp_driver_usb_serial_jtag esp_event esp_gdbstub esp_hw_support esp_mm esp_netif esp_netif_stack esp_partition esp_phy esp_pm esp_psram esp_ringbuf esp_rom esp_security esp_system esp_timer esp_vfs_console esp_wifi espressif__cmake_utilities espressif__usb_stream esptool_py freertos gesture-common hal heap log lwip main mbedtls newlib nvs_flash partition_table pthread soc spi_flash spiffs usb vfs wpa_supplicant xtensa
+-- Component paths: C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/app_update C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/bootloader C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/bootloader_support C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/bt C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/cxx C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/efuse C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_app_format C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_bootloader_format C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_coex C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_common C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_driver_gpio C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_driver_i2c C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_driver_ledc C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_driver_spi C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_driver_uart C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_driver_usb_serial_jtag C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_event C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_gdbstub C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_hw_support C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_mm C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_netif C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_netif_stack C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_partition C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_phy C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_pm C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_psram C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_ringbuf C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_rom C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_security C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_system C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_timer C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_vfs_console C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esp_wifi C:/Electronic_Design/vscode-esp32s3_testcode/esp-projects/subject3-ASR/managed_components/espressif__cmake_utilities C:/Electronic_Design/vscode-esp32s3_testcode/esp-projects/subject3-ASR/managed_components/espressif__usb_stream C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/esptool_py C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/freertos C:/Electronic_Design/vscode-esp32s3_testcode/esp-projects/gesture-common C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/hal C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/heap C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/log C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/lwip C:/Electronic_Design/vscode-esp32s3_testcode/esp-projects/subject3-ASR/main C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/mbedtls C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/newlib C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/nvs_flash C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/partition_table C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/pthread C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/soc C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/spi_flash C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/spiffs C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/usb C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/vfs C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/wpa_supplicant C:/Espressif/frameworks/idf-extract/esp-idf-5.5.4/components/xtensa
+-- Configuring done (34.6s)
+-- Generating done (6.6s)
+-- Build files have been written to: C:/Electronic_Design/vscode-esp32s3_testcode/esp-projects/subject3-ASR/build-dance

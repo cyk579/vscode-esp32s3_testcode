@@ -36,8 +36,9 @@ class MainActivity : Activity(), BleCarTransport.Listener {
     private var foreground = false
     private var ready = false
     private var lastCarStatus = 0L
-    private var forceSystemSpeech = true
-    private var awaitingSpeechActivity = false
+    private var speechTestOnly = false
+    private var musicDance = false
+    private lateinit var dance: MusicDanceController
     private var lastSequenceStatus = ""
     private var manualHeld = false
     private var forward = 0f; private var lateral = 0f; private var manualRotation = 0f
@@ -56,13 +57,6 @@ class MainActivity : Activity(), BleCarTransport.Listener {
     private lateinit var gesturePanel: LinearLayout
     private fun now() = SystemClock.elapsedRealtime()
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
-        if (::speech.isInitialized && speech.acceptActivityResult(requestCode, resultCode, data)) {
-            awaitingSpeechActivity = false
-            return
-        }
-        super.onActivityResult(requestCode, resultCode, data)
-    }
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun color(s: String) = Color.parseColor(s)
     private fun surface(fill: String) = GradientDrawable().apply { setColor(color(fill)); cornerRadius = dp(16).toFloat(); setStroke(dp(1), color("#243B56")) }
@@ -118,15 +112,15 @@ class MainActivity : Activity(), BleCarTransport.Listener {
             maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
         }
         speech = PhoneSpeechInput(this, { voiceLabel.text = it }, ::voiceResult)
-        voicePanel.addView(label("PHONE / 中文语音控车", 18f, true))
+        voicePanel.addView(label("科大讯飞 / 中文在线语音控车", 18f, true))
         voicePanel.addView(label("平移 3 秒；左右转 0.5 秒；最多 6 步\n示例：先前进再左移再左转\n组合中只说“旋转”默认右转；步骤间停车", 13f))
         voicePanel.addView(button("说运动指令") { listen() })
-        voicePanel.addView(CheckBox(this).apply {
-            text = "系统语音服务（可能联网）"; textSize = 13f
-            setOnCheckedChangeListener { _, checked ->
-                stopInputs(); forceSystemSpeech = checked; transport.requestDrive()
-            }
+        voicePanel.addView(row().apply {
+            equal(button("说完了") { speech.finishInput() })
+            equal(button("仅测试识别") { listen(true) })
+            equal(button("讯飞配置") { configureXfyun() })
         })
+        voicePanel.addView(label("点击后将本次录音发送至科大讯飞，需联网；不再使用 Google。\n可说“向前走一下”“往左挪”，方向含糊或带否定不执行。", 12f))
         gesturePanel.orientation = LinearLayout.HORIZONTAL
         gestureLabel = label("整只手入镜，张掌静止半秒定中", 12f).apply { maxLines = 6 }
         gesturePreview = GesturePreviewView(this).apply {
@@ -145,12 +139,13 @@ class MainActivity : Activity(), BleCarTransport.Listener {
         musicLabel = label("等待音乐服务", 13f)
         transport = BleCarTransport(this, drive::frame, this)
         music = loadMusic()
+        dance = MusicDanceController(drive)
         musicPanel.addView(musicLabel)
         val tracks = Spinner(this)
-        tracks.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, music.tracks.map { it.title })
+        tracks.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, music.selectableTracks.map { it.title })
         musicPanel.addView(tracks)
         musicPanel.addView(row().apply {
-            equal(button("播放") { music.tracks.getOrNull(tracks.selectedItemPosition)?.let { music.submit(MediaCommand.PlayTitle(it.title)) } })
+            equal(button("播放") { music.selectableTracks.getOrNull(tracks.selectedItemPosition)?.let { music.submit(MediaCommand.PlayTitle(it.title)) } })
             equal(button("语音点歌") { listen() })
         })
         musicPanel.addView(row().apply {
@@ -331,6 +326,8 @@ class MainActivity : Activity(), BleCarTransport.Listener {
         stopMotion()
     }
     private fun stopMotion() {
+        if (::dance.isInitialized) dance.cancel(now())
+        musicDance = false
         stopGesture(); drive.stop(now()); manualHeld = false
         forward = 0f; lateral = 0f; manualRotation = 0f
         if (::joystick.isInitialized) joystick.reset()
@@ -361,7 +358,7 @@ class MainActivity : Activity(), BleCarTransport.Listener {
                 } }
                 override fun fist() { handler.post {
                     if (epoch == gestureEpoch && foreground && gesture === feature && gestureMotionActive) {
-                        music.tracks.firstOrNull()?.let { music.submit(MediaCommand.PlayTitle(it.title)) }
+                        music.selectableTracks.firstOrNull()?.let { music.submit(MediaCommand.PlayTitle(it.title)) }
                         gestureLabel.text = "握拳：原地旋转，已触发播放"
                     }
                 } }
@@ -399,20 +396,61 @@ class MainActivity : Activity(), BleCarTransport.Listener {
             if (foreground && hasWindowFocus() && modes.checkedRadioButtonId == 102) startGesture()
         }, 400)
     }
-    private fun listen() {
+    private fun configureXfyun() {
+        releaseControls()
+        val settings = XfyunSettings(this)
+        val content = column().apply { setPadding(dp(16), 0, dp(16), 0) }
+        content.addView(label("填写语音听写 WebSocket 凭据。仅在本机加密保存，不写入 APK。重新配置需填写全部三项。", 12f))
+        fun field(name: String) = EditText(this).apply {
+            hint = name
+            setSingleLine(true)
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            content.addView(this)
+        }
+        val appId = field("APPID")
+        val apiKey = field("APIKey")
+        val apiSecret = field("APISecret")
+        val dialog = android.app.AlertDialog.Builder(this).setTitle("讯飞配置")
+            .setView(ScrollView(this).apply { addView(content) })
+            .setPositiveButton("保存", null).setNegativeButton("取消", null).create()
+        dialog.setOnShowListener {
+            dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val credentials = XfyunCredentials(appId.text.toString().trim(), apiKey.text.toString().trim(), apiSecret.text.toString().trim())
+                if (!credentials.valid()) { apiSecret.error = "请检查三项是否完整且未互换"; return@setOnClickListener }
+                try {
+                    settings.save(credentials)
+                    voiceLabel.text = "讯飞配置已保存，可先点击“仅测试识别”"
+                    dialog.dismiss()
+                } catch (_: Exception) { apiSecret.error = "加密保存失败，请重试" }
+            }
+        }
+        dialog.show()
+    }
+    private fun listen(testOnly: Boolean = false) {
         stopInputs(); transport.requestDrive()
-        if (!foreground || !ready) { voiceLabel.text = "请先连接小车"; musicLabel.text = "请先连接小车"; return }
+        speechTestOnly = testOnly
+        if (!foreground || (!testOnly && !ready)) { voiceLabel.text = "请先连接小车"; musicLabel.text = "请先连接小车"; return }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 11); return
         }
-        awaitingSpeechActivity = true
-        speech.start(forceSystemSpeech)
+        speech.start()
     }
     private fun voiceResult(text: String) {
+        if (speechTestOnly) {
+            voiceLabel.text = "仅测试听到“$text” · 不执行运动或音乐"
+            return
+        }
         if (!foreground || !ready) return
         voiceLabel.text = "听到“$text”"
         when (val intent = VoiceRouter.route(text)) {
             is VoiceIntent.Play -> music.submit(MediaCommand.PlayTitle(intent.title))
+            VoiceIntent.Dance -> {
+                musicDance = dance.start(music, now())
+                voiceLabel.text = dance.message
+                transport.requestDrive()
+            }
             VoiceIntent.PauseMusic -> music.submit(MediaCommand.Pause)
             VoiceIntent.ResumeMusic -> music.submit(MediaCommand.Resume)
             VoiceIntent.StopMusic -> music.submit(MediaCommand.Stop)
@@ -446,7 +484,8 @@ class MainActivity : Activity(), BleCarTransport.Listener {
         val array = json.getJSONArray("tracks")
         val tracks = (0 until array.length()).map { i ->
             val item = array.getJSONObject(i); val aliases = item.getJSONArray("aliases")
-            MusicTrack(item.getInt("id"), item.getString("title"), (0 until aliases.length()).map { aliases.getString(it) })
+            MusicTrack(item.getInt("id"), item.getString("title"), (0 until aliases.length()).map { aliases.getString(it) },
+                item.optBoolean("dance_only", false), item.optLong("duration_ms", 0))
         }
         MusicController(tracks, json.getLong("catalog"), transport::enqueueMusic) { musicLabel.text = it }
     } catch (_: Exception) {
@@ -477,18 +516,27 @@ class MainActivity : Activity(), BleCarTransport.Listener {
     override fun carStatus(bytes: ByteArray) {
         lastCarStatus = now(); drive.updateStatus(bytes, lastCarStatus); carLabel.text = Protocol.statusText(bytes)
         if (bytes.size != 12 || bytes[0].toInt() != 1 || bytes[1].toInt() !in 1..3 ||
-            bytes[2].toInt() != 0 || bytes[11].toInt() != 0) stopMotion()
+            bytes[2].toInt() != 0 || bytes[11].toInt() != 0) stopInputs()
     }
-    override fun musicStatus(bytes: ByteArray) { music.acceptStatus(bytes) }
+    override fun musicStatus(bytes: ByteArray) {
+        music.acceptStatus(bytes)
+        if (musicDance) {
+            dance.accept(MusicProtocol.decode(bytes), now())
+            if (!dance.active) musicDance = false
+            if (dance.message.isNotEmpty()) voiceLabel.text = dance.message
+        }
+    }
     private val ticker = object : Runnable {
         override fun run() {
             if (!foreground) return
             checkDisplayRotation()
             val t = now()
-            if (ready && lastCarStatus != 0L && t - lastCarStatus > 500) { stopMotion(); lastCarStatus = 0 }
+            if (ready && lastCarStatus != 0L && t - lastCarStatus > 500) { stopInputs(); lastCarStatus = 0 }
             if (manualHeld && (joystick.active || yawJoystick.active)) {
                 if (!drive.submit(ControlSource.MANUAL, forward, lateral, manualRotation, t, t)) manualHeld = false
             }
+            if (musicDance) dance.tick(t)
+            if (musicDance && !dance.active) musicDance = false
             val output = drive.output(t)
             if (drive.voiceSequenceStatus != lastSequenceStatus) {
                 lastSequenceStatus = drive.voiceSequenceStatus
@@ -501,12 +549,14 @@ class MainActivity : Activity(), BleCarTransport.Listener {
     override fun onResume() { super.onResume(); foreground = true; drive.foreground(true, now()); handler.removeCallbacks(ticker); handler.post(ticker) }
     override fun onPause() {
         drive.stop(now())
+        if (::dance.isInitialized) dance.cancel(now())
+        musicDance = false
         transport.requestDrive()
-        if (awaitingSpeechActivity) {
-            super.onPause()
-            return
-        }
         foreground = false; deviceDialog?.dismiss(); stopInputs(); drive.foreground(false, now()); transport.requestDrive()
         transport.disconnect("应用暂停，电机停车；车端音乐继续"); handler.removeCallbacks(ticker); super.onPause()
+    }
+    override fun onDestroy() {
+        if (::speech.isInitialized) speech.close()
+        super.onDestroy()
     }
 }
