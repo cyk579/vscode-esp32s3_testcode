@@ -62,7 +62,7 @@ static void fail(media_status_t *s,FILE **file,uint8_t error) {
 static void player_task(void *arg) {
     (void)arg;
     media_status_t s={0}; FILE *song=NULL; wav_info_t wav={0};
-    uint32_t remaining=0; unsigned play_epoch=0;
+    uint32_t remaining=0; unsigned play_epoch=0,volume_epoch=0;
     const esp_vfs_spiffs_conf_t fs={.base_path="/music",.partition_label="music",
         .max_files=3,.format_if_mount_failed=false};
     bool mounted=esp_vfs_spiffs_register(&fs)==ESP_OK;
@@ -79,9 +79,18 @@ static void player_task(void *arg) {
     if(err==ESP_OK) err=usb_streaming_start();
     if(err!=ESP_OK) { s.state=MEDIA_ERROR; s.error=MEDIA_NO_USB; ESP_LOGE(TAG,"USB audio start: %s",esp_err_to_name(err)); }
     ESP_LOGI(TAG,"catalog=%08"PRIx32" rate=%d mono PCM16; no autoplay",s.catalog,CONFIG_SUBJECT3_SPEAKER_RATE);
+    ESP_LOGI(TAG,"PCM playback level=%d%%; USB speaker volume target=100%%",CONFIG_SUBJECT3_SPEAKER_GAIN);
     uint8_t pcm[640]; size_t buffered=0;
     int64_t write_started=0;
     for(;;) {
+        unsigned current_epoch=atomic_load(&usb_epoch);
+        if(atomic_load(&usb_ready) && volume_epoch!=current_epoch) {
+            esp_err_t volume_err=usb_streaming_control(STREAM_UAC_SPK,CTRL_UAC_VOLUME,(void *)100);
+            volume_epoch=current_epoch;
+            if(volume_err==ESP_OK) ESP_LOGI(TAG,"USB speaker volume control completed: 100%%");
+            else ESP_LOGW(TAG,"USB speaker volume control: %s; continuing with PCM level=%d%%",
+                esp_err_to_name(volume_err),CONFIG_SUBJECT3_SPEAKER_GAIN);
+        }
         if(song && (!atomic_load(&usb_ready) || play_epoch!=atomic_load(&usb_epoch))) {
             fail(&s,&song,MEDIA_NO_USB); buffered=0;
         }

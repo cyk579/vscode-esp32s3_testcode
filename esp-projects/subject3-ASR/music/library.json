@@ -1,6 +1,9 @@
 {
   "sample_rate": 16000,
   "tracks": [
-    {"id": 1, "title": "测试音", "aliases": ["测试音乐"], "file": "@test-tone"}
+    {"id": 1, "title": "测试音", "aliases": ["测试音乐"], "file": "@test-tone"},
+    {"id": 2, "title": "纯音乐", "aliases": [], "file": "instrumental.wav"},
+    {"id": 3, "title": "稻香", "aliases": [], "file": "daoxiang.wav"},
+    {"id": 4, "title": "海屿你", "aliases": [], "file": "haiyuni.wav"}
   ]
 }

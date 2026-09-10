@@ -6,6 +6,23 @@ enum class VoiceCommand(val forward: Float, val lateral: Float, val rotation: Fl
     TURN_LEFT(0f, 0f, 25f), TURN_RIGHT(0f, 0f, -25f),
     STOP(0f, 0f, 0f), ESTOP(0f, 0f, 0f);
 
+    val durationMs: Long get() = when (this) {
+        STOP, ESTOP -> 0L
+        TURN_LEFT, TURN_RIGHT -> 500L
+        else -> 3000L
+    }
+
+    val label: String get() = when (this) {
+        FORWARD -> "前进"
+        BACKWARD -> "后退"
+        LEFT -> "左移"
+        RIGHT -> "右移"
+        TURN_LEFT -> "左转"
+        TURN_RIGHT -> "右转"
+        STOP -> "停车"
+        ESTOP -> "急停"
+    }
+
     companion object {
         // Match a whole utterance. Never execute substrings in negations or sentences.
         fun parse(text: String): VoiceCommand? = when (

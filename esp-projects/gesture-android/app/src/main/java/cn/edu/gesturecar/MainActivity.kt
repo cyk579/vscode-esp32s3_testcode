@@ -38,6 +38,7 @@ class MainActivity : Activity(), BleCarTransport.Listener {
     private var lastCarStatus = 0L
     private var forceSystemSpeech = true
     private var awaitingSpeechActivity = false
+    private var lastSequenceStatus = ""
     private var manualHeld = false
     private var forward = 0f; private var lateral = 0f; private var manualRotation = 0f
     private lateinit var connectionLabel: TextView
@@ -118,7 +119,7 @@ class MainActivity : Activity(), BleCarTransport.Listener {
         }
         speech = PhoneSpeechInput(this, { voiceLabel.text = it }, ::voiceResult)
         voicePanel.addView(label("PHONE / 中文语音控车", 18f, true))
-        voicePanel.addView(label("前进、后退、左移、右移：3 秒；左转、右转：0.5 秒", 13f))
+        voicePanel.addView(label("平移 3 秒；左右转 0.5 秒；最多 6 步\n示例：先前进再左移再左转\n组合中只说“旋转”默认右转；步骤间停车", 13f))
         voicePanel.addView(button("说运动指令") { listen() })
         voicePanel.addView(CheckBox(this).apply {
             text = "系统语音服务（可能联网）"; textSize = 13f
@@ -415,13 +416,19 @@ class MainActivity : Activity(), BleCarTransport.Listener {
             VoiceIntent.PauseMusic -> music.submit(MediaCommand.Pause)
             VoiceIntent.ResumeMusic -> music.submit(MediaCommand.Resume)
             VoiceIntent.StopMusic -> music.submit(MediaCommand.Stop)
+            is VoiceIntent.Sequence -> {
+                if (drive.startVoiceSequence(intent.commands, now())) {
+                    voiceLabel.text = "组合：${intent.commands.joinToString(" → ") { it.label }}"
+                } else voiceLabel.text = "车辆或语音模式尚未就绪，整组指令未执行"
+                transport.requestDrive()
+            }
             is VoiceIntent.Drive -> {
                 if (intent.command == VoiceCommand.ESTOP) { stopInputs(); drive.emergency(true, now()) }
                 else if (intent.command == VoiceCommand.STOP) stopInputs()
                 else if (drive.selected != ControlSource.VOICE) voiceLabel.text = "运动语音只在语音模式启用"
                 else if (drive.begin(ControlSource.VOICE, now())) {
                     val command = intent.command
-                    val duration = if (command.rotation != 0f) 500L else 3000L
+                    val duration = command.durationMs
                     drive.submit(ControlSource.VOICE, command.forward, command.lateral, command.rotation, now(), now(), duration)
                     voiceLabel.text = "听到“$text” · ${if (duration == 500L) "0.5" else "3"} 秒"
                 } else voiceLabel.text = "车辆尚未就绪，本次指令不执行"
@@ -483,12 +490,18 @@ class MainActivity : Activity(), BleCarTransport.Listener {
                 if (!drive.submit(ControlSource.MANUAL, forward, lateral, manualRotation, t, t)) manualHeld = false
             }
             val output = drive.output(t)
+            if (drive.voiceSequenceStatus != lastSequenceStatus) {
+                lastSequenceStatus = drive.voiceSequenceStatus
+                voiceLabel.text = lastSequenceStatus
+            }
             telemetry.text = "前进 ${((output?.forward ?: 0f) * 4).toInt()}%\n横移 ${((output?.lateral ?: 0f) * 4).toInt()}%\n旋转 ${((output?.rotation ?: 0f) * 4).toInt()}%"
             transport.tick(); handler.postDelayed(this, 25)
         }
     }
     override fun onResume() { super.onResume(); foreground = true; drive.foreground(true, now()); handler.removeCallbacks(ticker); handler.post(ticker) }
     override fun onPause() {
+        drive.stop(now())
+        transport.requestDrive()
         if (awaitingSpeechActivity) {
             super.onPause()
             return

@@ -20,7 +20,7 @@ config SUBJECT3_SPEAKER_RATE
 config SUBJECT3_SPEAKER_GAIN
     int "PCM playback level (percent)"
     range 1 100
-    default 20
+    default 100
 
 config SUBJECT3_MIC_RATE
     int "Requested microphone sample rate (0 = any advertised rate)"

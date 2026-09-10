@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "catalog": 1223302566,
+  "catalog": 336511790,
   "sample_rate": 16000,
   "tracks": [
     {
@@ -10,6 +10,24 @@
         "测试音乐"
       ],
       "sha256": "95a1771f6e5e71480ace545ea4d6b9971618a6bcb50c5dd20c0465e079622c08"
+    },
+    {
+      "id": 2,
+      "title": "纯音乐",
+      "aliases": [],
+      "sha256": "446cc4142d1f32c963ff827ca26819a40c0a13d676b3df7efbef6692088bc2ed"
+    },
+    {
+      "id": 3,
+      "title": "稻香",
+      "aliases": [],
+      "sha256": "94d653e5c18d637c7e66d669bd027fb798dd64967147787721332dae069e8ae2"
+    },
+    {
+      "id": 4,
+      "title": "海屿你",
+      "aliases": [],
+      "sha256": "84334cc30f17ecad33a49f3bbc792927b580bde491fd4347e84fc755e281597f"
     }
   ]
 }
